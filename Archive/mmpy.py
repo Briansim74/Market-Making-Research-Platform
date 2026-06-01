@@ -618,10 +618,9 @@ class MarketMakingStrategy:
 
     #     return micro + alpha_imb * imbalance + alpha_flow * flow, micro
     
-    def compute_spread(self, features, policy):
+    def compute_spread(self, state, policy):
 
-        # sigma = state.get_vol()
-        sigma = features["volatility"]
+        sigma = state.get_vol()
 
         base = 0.03
         vol_component = 3 * sigma
@@ -993,13 +992,15 @@ class MarketMakingStrategy:
         # store prediction
         state.market_feature_state.ml_predictions.append(expected_return)
 
-        vol = features["volatility"]
+        vol = state.get_vol()
         
         k0 = features["k0_multiplier"] # features["k0_multiplier"] tune this later
         # regime_k0 = features["k0_multiplier"]
         # k0 = regime_k0 * signal_quality
 
         k = k0 / (vol + 1e-6)
+
+        print(k0)
 
         ml_delta = k * expected_return
 
@@ -1053,7 +1054,7 @@ class MarketMakingStrategy:
             "skew": skew,
             "microprice": microprice,
             "alpha": 0.3,
-            "k0_multiplier": 0.1, # policy["k0"]
+            "k0_multiplier": 0.1,
             "spread": best_ask - best_bid,
             "order_imbalance": state.order_imbalance,
             "trade_imbalance": state.trade_imbalance,
@@ -1083,7 +1084,7 @@ class MarketMakingStrategy:
         center = microprice + struct_delta + ml_delta
  
         # 3. Spread (your model or fallback to market spread)
-        spread = self.compute_spread(features, policy)
+        spread = self.compute_spread(state, policy)
 
         half = spread / 2
 
@@ -1118,14 +1119,14 @@ class MarketMakingStrategy:
             "best_ask": best_ask,
 
             # microstructure
-            "order_imbalance": features["order_imbalance"],
-            "trade_imbalance": features["trade_imbalance"],
-            "volatility": features["volatility"],
-            "queue_ahead_bid": features["queue_ahead_bid"],
-            "queue_ahead_ask": features["queue_ahead_ask"],
+            "order_imbalance": state.order_imbalance,
+            "trade_imbalance": state.trade_imbalance,
+            "volatility": state.get_vol(),
+            "queue_ahead_bid": state.compute_queue_ahead("bids", best_bid),
+            "queue_ahead_ask": state.compute_queue_ahead("asks", best_ask),
 
             # risk
-            "inventory": features["inventory"],
+            "inventory": state.inventory,
             "realized_pnl": state.realized_pnl,
             "unrealized_pnl": state.get_unrealized_pnl(mid),
             "total_pnl": state.get_pnl(),
@@ -1135,14 +1136,15 @@ class MarketMakingStrategy:
             "fair": fair,
             "skew": skew,
             "reservation": center,
+            #"alpha": 0.3, # regime_signal["alpha"] # to check how to get last_signal since we dont use this anymore
 
             # policy
             "regime": policy["regime"],
             "regime_id": policy["regime_id"],
             "regime_prob": policy["regime_prob"],  # optional if your model outputs probabilities
 
-            "alpha": features["alpha"], # policy["alpha"] # to check how to get last_signal since we dont use this anymore
-            "k0": 0.1,
+            "alpha": policy["alpha"], #testing regime
+            "k0": 0.0,
             "spread_multiplier": policy["spread_multiplier"],
             "inventory_target": policy["inventory_target"],
 
@@ -1262,64 +1264,64 @@ class DatasetRecorder:
     “I wanted to quote X at time t”
     """
 
-    def log_snapshot(self, ts, signal, symbol):
+    def log_snapshot(self, ts, features, symbol):
 
         self.rows.append({
             "ts": ts,
             "symbol": symbol,
 
             # market
-            "best_bid": signal["best_bid"],
-            "best_ask": signal["best_ask"],
-            "mid": signal["mid"],
-            "microprice": signal["microprice"],
+            "best_bid": features["best_bid"],
+            "best_ask": features["best_ask"],
+            "mid": features["mid"],
+            "microprice": features["microprice"],
             
-            "best_bid_tick": self.config.to_tick(signal["best_bid"]),
-            "best_ask_tick": self.config.to_tick(signal["best_ask"]),
-            "mid_tick": self.config.to_tick(signal["mid"]),
+            "best_bid_tick": self.config.to_tick(features["best_bid"]),
+            "best_ask_tick": self.config.to_tick(features["best_ask"]),
+            "mid_tick": self.config.to_tick(features["mid"]),
 
-            "spread": signal["best_ask"] - signal["best_bid"],
+            "spread": features["best_ask"] - features["best_bid"],
 
             # microstructure
-            "order_imbalance": signal["order_imbalance"],
-            "trade_imbalance": signal["trade_imbalance"],
-            "volatility": signal["volatility"],
-            "queue_ahead_bid": signal["queue_ahead_bid"],
-            "queue_ahead_ask": signal["queue_ahead_ask"],
+            "order_imbalance": features["order_imbalance"],
+            "trade_imbalance": features["trade_imbalance"],
+            "volatility": features["volatility"],
+            "queue_ahead_bid": features["queue_ahead_bid"],
+            "queue_ahead_ask": features["queue_ahead_ask"],
 
             # risk
-            "inventory": signal["inventory"],
-            "realized_pnl": signal["realized_pnl"],
-            "unrealized_pnl": signal["unrealized_pnl"],
-            "total_pnl": signal["total_pnl"],
-            "equity": signal["equity"],
+            "inventory": features["inventory"],
+            "realized_pnl": features["realized_pnl"],
+            "unrealized_pnl": features["unrealized_pnl"],
+            "total_pnl": features["total_pnl"],
+            "equity": features["equity"],
 
             # model internals
-            "fair": signal["fair"],
-            "skew": signal["skew"],
-            "reservation": signal["reservation"],
-            "alpha": signal["alpha"],
+            "fair": features["fair"],
+            "skew": features["skew"],
+            "reservation": features["reservation"],
+            "alpha": features["alpha"],
 
             # action
-            "my_bid": signal["my_bid"],
-            "my_ask": signal["my_ask"],
+            "my_bid": features["my_bid"],
+            "my_ask": features["my_ask"],
 
-            "my_bid_tick": self.config.to_tick(signal["my_bid"]),
-            "my_ask_tick": self.config.to_tick(signal["my_ask"]),
+            "my_bid_tick": self.config.to_tick(features["my_bid"]),
+            "my_ask_tick": self.config.to_tick(features["my_ask"]),
 
             # execution geometry
             # aggressiveness vs touch
-            "bid_distance_touch": signal["my_bid"] - signal["best_bid"],
-            "ask_distance_touch": signal["my_ask"] - signal["best_ask"],
+            "bid_distance_touch": features["my_bid"] - features["best_bid"],
+            "ask_distance_touch": features["my_ask"] - features["best_ask"],
 
             # position inside spread
-            "bid_distance_spread": signal["my_bid"] - signal["best_ask"],
-            "ask_distance_spread": signal["my_ask"] - signal["best_bid"],
+            "bid_distance_spread": features["my_bid"] - features["best_ask"],
+            "ask_distance_spread": features["my_ask"] - features["best_bid"],
 
             # quote churn
-            "bid_delta": signal["bid_delta"],
-            "ask_delta": signal["ask_delta"],
-            "quote_churn": signal["quote_churn"],
+            "bid_delta": features["bid_delta"],
+            "ask_delta": features["ask_delta"],
+            "quote_churn": features["quote_churn"],
         })
 
     """
@@ -1481,7 +1483,7 @@ class DatasetRecorder:
             ),
 
             # Execution / Microstructure
-            "queue_ahead_at_join": order.metadata["queue_ahead_at_join"],
+            "queue_ahead_at_join": order.queue_ahead_at_join,
 
             # Risk
             "inventory": signal["inventory"],
@@ -1516,7 +1518,7 @@ class DatasetRecorder:
 
     """
 
-    def log_fill(self, ts, qty, order, inventory, volatility, best_bid, best_ask, is_maker):
+    def log_fill(self, ts, qty, order, inventory, volatility, best_bid, best_ask, features, is_maker):
 
         my_bid = order.metadata["my_bid"]
         my_ask = order.metadata["my_ask"]
@@ -1555,6 +1557,12 @@ class DatasetRecorder:
 
             # microstructure
             "queue_ahead_at_join": order.metadata["queue_ahead_at_join"],
+
+            # model state
+            "fair": features["fair"],
+            "skew": features["skew"],
+            "reservation": features["fair"] + features["skew"],
+            "alpha": features["alpha"]
     })
 
     def finalize_returns(self, horizon=10):
@@ -2260,6 +2268,7 @@ class Execution:
                     volatility=self.state.get_vol(),
                     best_bid=best_bid,
                     best_ask=best_ask,
+                    features=self.state.last_signal,
                     is_maker=True
                 )
 
@@ -2310,8 +2319,9 @@ class Engine:
 
     #     self.recorder.log_snapshot(
     #         ts=self.state.last_depth_ts,
-    #         signal=signal,
-    #         symbol=self.instrument.upper()
+    #         features=signal,
+    #         execution=self.execution,
+    #         symbol="BTCUSDT"
     #     )
 
     def on_market_data(self): # ASYNC PUSH
@@ -2330,13 +2340,12 @@ class Engine:
     
         try:
             self.signal_queue.put_nowait(signal)
-        
         except queue.Full:
             pass  # drop stale signals (important in HFT)
 
         self.recorder.log_snapshot(
             ts=self.state.last_depth_ts,
-            signal=signal,
+            features=signal,
             symbol=self.instrument.upper()
         )
 
@@ -3456,7 +3465,7 @@ class TradingSystem:
         for t in self.threads:
             t.join(timeout=1)
 
-        self.recorder.export_run()
+        self.recorder.export_run()()
 
 
 def load_manifest(path):

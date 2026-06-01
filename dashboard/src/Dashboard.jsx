@@ -21,6 +21,7 @@ export default function Dashboard() {
   const t = snapshot.title;
   const m = snapshot.market;
   const s = snapshot.signals;
+  const re = snapshot.regime;
   const q = snapshot.quotes;
   const e = snapshot.execution;
   const r = snapshot.risk;
@@ -31,13 +32,15 @@ export default function Dashboard() {
 
       {/* TITLE */}
       <div style={styles.title}>
-        <span style={styles.italic}>{t.model}</span>
+        <span style={styles.italic}>{t.edge_model}</span>
         {" | "}
         <span style={styles.italic}>{t.mode}</span>
         {" | "}
         <span style={styles.italic}>{t.exchange}</span>
         {" | "}
         <span style={styles.italic}>{t.instrument}</span>
+        {" | "}
+        <span style={styles.italic}>{t.regime}</span>
         {" | "}
         <span style={styles.italic}>
           {"pnl="}
@@ -107,6 +110,19 @@ export default function Dashboard() {
             value={m.trade}
           />
 
+          {/* REGIME */}
+          <Section title="REGIME" />
+
+          <Row
+            label="Regime"
+            value={re.regime}
+          />
+
+          <Row
+            label="Confidence"
+            value={re.confidence.toFixed(2)}
+          />
+
           {/* SIGNALS */}
           <Section title="SIGNALS" />
 
@@ -127,7 +143,7 @@ export default function Dashboard() {
 
           <Row
             label="Alpha"
-            value={s.alpha.toFixed(4)}
+            value={s.alpha.toFixed(2)}
           />
 
           {/* QUOTES */}
