@@ -1,185 +1,311 @@
 # Market-Making-Research-Platform
-Designed for researching how alpha, execution quality, inventory risk, and market regime interact in electronic liquidity provision.
+A research framework for studying how alpha generation, execution quality, inventory risk, and market regime interact in electronic liquidity provision.
 
-## Trading Problem
-Passive market making is not purely an execution problem.
+The project combines live market data ingestion, deterministic replay simulation, market microstructure research, and event-driven execution modeling within a unified architecture.
 
-Profitability depends on balancing three competing objectives:
-- capturing spread
-- avoiding adverse selection
-- managing inventory risk
+## Motivation
+Passive market making is often presented as a spread-capture problem.
 
-The challenge is that market conditions evolve continuously.
+In practice, profitability emerges from the interaction of:
+- directional alpha
+- execution quality
+- inventory management
+- market regime
 
-Liquidity, volatility, queue dynamics, and directional pressure change the quality of passive quotes over time.
+A market maker can possess predictive signals but fail due to poor execution.
 
-## Core Idea
-This project studies market making as a real-time decision process driven by:
-- market microstructure signals
-- short-horizon alpha forecasts
-- regime-dependent behavior
-- execution and queue-position dynamics
+Likewise, a market maker can execute efficiently yet lose money through adverse selection.
 
-Rather than quoting fixed spreads, the system adapts quoting behavior based on current market state.
+The objective of this project is to understand how these components interact and contribute to realized PnL.
 
 ## System Architecture
-
-Market Data
-
-↓
-
+```
+Market Data Feed / Replay Feed
+        │
+        ▼
 Order Book State
-
-↓
-
-Alpha Model
-
-↓
-
-Regime Model
-
-↓
-
+        │
+        ▼
+Regime Detection
+        │
+        ▼
+Signal Generation
+ ├─ Microstructure Alpha
+ ├─ Structural Alpha
+ └─ ML Residual Alpha
+        │
+        ▼
 Quote Construction
-
-↓
-
-Execution Layer
-
-↓
-
+        │
+        ▼
+Execution Engine
+        │
+        ▼
 Inventory & Risk Management
+        │
+        ▼
+Dataset Generation & Research
+```
 
-↓
+The same architecture supports:
+- Live exchange connectivity
+- Deterministic historical replay
+- Dataset generation
+- Strategy research
+- Execution analysis
 
-Dataset Generation / Research
+## Alpha Research
+### Research Question
+Can future short-horizon price movement be predicted from order book state?
 
-The platform supports both:
-- live exchange feeds
-- deterministic replay simulation
+### Microprice Modeling
+Microprice is commonly used as a short-horizon estimate of fair value:
 
-allowing research and production logic to share the same architecture.
+Microprice is the weighted midpoint using top-of-book liquidity.
 
-## Alpha Modeling
-### Trading Problem
-Microprice is often treated as a short-horizon estimate of fair value.
+Research objective:
+```
+Is microprice a statistically and economically meaningful predictor of future mid-price movement?
+```
 
-However, microprice itself exhibits systematic prediction error.
+#### Findings
+Microprice consistently demonstrated:
+- Positive information coefficient (IC)
+- Positive rank IC
+- Directional hit rate above random
+- Positive economic value in market-making backtests
 
-The question becomes:
-- When does microprice fail, and can that failure be predicted from current market conditions?
+Replacing a mid-price reservation model with microprice-based reservation pricing transformed the strategy from loss-making to profitable.
 
-### Core Idea
-The alpha model learns the conditional forecast error of microprice.
+#### Backtest Results
+| Model	             | Total PnL |
+|--------------------|-----------|
+| Mid Only           | 	-305     |
+| Mid + Micro signal |  +1001    |
 
-Baseline prediction:
-future mid ≈ current microprice
+Microprice appears most effective at very short horizons:
+- 100ms
+- 500ms
+- 1000ms
 
-### Model objective:
-predict future deviation from current microprice using market state features.
+### Structural Alpha Modeling
+Microprice captures immediate order-book pressure but fails to explain all future price movement.
 
-### Features include:
+Structural alpha was developed using slower microstructure features such as:
+- volatility
+- microprice
+- order imbalance
+- inventory target
+
+#### Findings
+Structural signals produced stronger performance than microprice alone and captured a different component of future price formation.
+
+#### Backtest Results
+| Model	             | Total PnL |
+|--------------------|-----------|
+| Mid + Struct Delta |  +1489    |
+
+The combination of structural and microstructure alpha generated significantly larger gains than either signal individually.
+
+| Model	                            | Total PnL |
+|-----------------------------------|-----------|
+| Mid + Struct Delta + Micro signal | +3086     |
+
+This suggests both signals contain complementary information.
+
+### ML Residual Alpha Modeling
+Research objective:
+```
+Can machine learning predict the residual error remaining after structural and microprice adjustments?
+```
+
+The model attempts to forecast:
+Future Mid Price − Reservation Price (mid + struct_delta + micro_signal_delta)
+
+rather than forecasting future prices directly.
+
+Features include:
 - spread
 - order imbalance
 - trade imbalance
+- inventory
 - volatility
-- inventory state
 - queue position estimates
-- microprice
+- residual pricing errors
+- microprice deviations
 
-The resulting signal estimates short-horizon directional drift relative to current fair value.
+#### Findings
+Machine learning improved risk-adjusted performance but reduced raw profitability.
 
-## Regime Modeling
-### Trading Problem
-Market making performance is highly regime-dependent.
+| Model	                                 | Total PnL | Sharpe |
+|----------------------------------------|-----------|--------|
+| Mid + Struct_delta + Micro signal      | +3086     | 0.016  |
+| Mid + Struct_delta + Micro signal + ML | +1984	   | 0.024  |
 
-Strategies that perform well during stable liquidity conditions may underperform during trending or volatile periods.
+This suggests the ML layer primarily acts as a trade-quality filter:
+- fewer trades
+- lower turnover
+- improved timing
+- reduced inventory excursions
 
-### Core Idea
+rather than generating large additional directional edge, also more responsible for predicting longer drift horizons (5000ms).
 
-An unsupervised regime model clusters market states using:
+## Regime Research
+### Research Question
+Why does strategy performance vary dramatically across market conditions?
+
+### Methodology
+An unsupervised Gaussian Mixture Model (GMM) clusters market states using:
 - volatility
-- spread behavior
+- spread
 - order imbalance
 - trade imbalance
-- quote activity
-- inventory dynamics
-- microprice behavior
+- quote churn
+- inventory
+- inventory volatility
+- microprice error
 
-Each regime is evaluated against future outcomes such as:
+Future outcomes are evaluated separately using:
 - forward returns
 - realized volatility
 - directional persistence
 
-This allows the market maker to adapt quoting behavior according to observed market conditions.
+This prevents look-ahead bias while allowing regimes to be interpreted economically.
+
+### Findings
+Three recurring market states emerged.
+
+### Regime 0 - Balanced Market
+Characteristics:
+- Moderate volatility
+- Stable spreads
+- Low directional persistence
+
+Outcome:
+- Little directional edge
+- Baseline market-making environment
+
+### Regime 1 - Quiet Market
+Characteristics:
+- Low volatility
+- Low imbalance
+- Stable liquidity
+
+Outcome:
+- Mean-reverting behavior
+- Limited directional opportunity
+
+### Regime 2 - Liquidity Shock / Breakout
+Characteristics:
+- Extreme volatility
+- Wide spreads
+- Large microprice dislocations
+- Strong directional persistence
+
+Outcome:
+- Highest alpha concentration
+- Strongest future directional bias
+
+This regime generated the majority of predictive opportunity observed during research.
 
 ## Execution Modeling
-### Trading Problem
-Displayed liquidity is not executable liquidity.
+Market-making performance also comes from execution rather than alpha.
 
-Fill probability depends on queue position and future order flow.
+The execution simulator tracks:
+- queue position estimates
+- queue depletion
+- passive fill probability
+- fill candidates
+- order lifecycle events
 
-### Core Idea
-The execution layer estimates queue priority and liquidity consumption using order book updates.
+### Fill Modeling Matters
+A passive order at the best bid or ask is not automatically executable.
 
-Key components:
+Accurate simulation requires:
 - queue position tracking
-- queue depletion estimation
-- passive fill simulation
-- adverse selection measurement
-- fill markout analysis
+- queue depletion modeling
+- realistic fill assumptions
 
-Execution quality is evaluated independently from directional alpha.
+### Latency Matters
+Execution timing significantly affects realized outcomes.
+
+Future work includes:
+- order placement latency
+- cancellation latency
+- exchange acknowledgement delays
 
 ## Inventory & Risk Management
-Inventory is treated as a state variable rather than a hard constraint.
+Inventory is treated as a dynamic state variable rather than a hard constraint.
 
-The strategy dynamically adjusts reservation prices and quoting behavior according to:
+Reservation prices are adjusted according to:
 - current inventory
-- volatility conditions
 - alpha strength
-- detected regime
+- volatility
+- market regime
 
-This creates a feedback loop between market state, inventory exposure, and execution decisions.
+The objective is to balance:
+- spread capture
+- directional conviction
+- inventory risk
 
-## Research Infrastructure
+while maintaining competitive quotes.
+
+## Dataset Generation
 The platform automatically records:
 - order book snapshots
-- trades
+- trade events
 - quote updates
 - fills
-- execution events
+- execution decisions
+- queue state
+- regime state
+- signal values
 
-and generates datasets for:
-- alpha research
+This enables repeatable research workflows for:
+- alpha modeling
 - regime analysis
-- adverse selection studies
-- fill markout modeling
-- execution quality evaluation
-
-## Key Research Questions
-This project is designed to investigate:
-- When does microprice provide predictive value?
-- Which market states produce adverse selection?
-- How does queue position impact fill quality?
-- Which regimes favor passive liquidity provision?
-- How should inventory management adapt to changing conditions?
-- How much PnL comes from spread capture versus directional edge?
-
-## Key Insights
-Market making profitability emerges from the interaction of:
-- alpha quality
 - execution quality
-- inventory control
-- market regime
+- fill probability estimation
+- adverse selection studies
+
+## Key Lessons Learned
+### Alpha Alone Is Not Enough
+Predictive signals can be profitable in research while failing in execution.
+
+### Execution Dominates Realized Performance
+Queue position, fill quality, and latency frequently outweigh improvements in predictive accuracy.
+
+### Market Regimes Matter
+The same quoting strategy performs differently across liquidity and volatility states.
+
+Adaptive behavior is more effective than static quoting rules.
+
+### Market Making Is a Multi-Layer Problem
+Profitable liquidity provision emerges from the interaction of:
+- alpha forecasting
+- execution quality
+- inventory management
+- market regime awareness
 
 No individual component is sufficient in isolation.
 
-Execution without alpha becomes adverse selection.
-
-Alpha without execution becomes unrealized opportunity.
-
-Inventory control without regime awareness can dominate spread capture gains.
+## Current Research Directions
+- Regime-conditioned quoting
+- Fill probability modeling
+- Adverse selection attribution
+- Latency modeling
+- Adaptive spread construction
+- Regime-dependent inventory targets
+- Market-making attribution analysis
 
 ## Core Takeaway
-Profitable market making is an adaptive liquidity provision problem where alpha forecasting, execution quality, inventory management, and market regime jointly determine realized PnL.
+Market making is not simply capturing the bid-ask spread.
+
+It is an adaptive decision process where alpha forecasting, execution quality, inventory management, and market regime jointly determine realized profitability.
+
+## Example Output
+Below are sample outputs illustrating how the engine behaves.
+
+
+### Trading Terminal Dashboard with Market Data and Strategy Parameters
+<img width="700" height="1300" alt="React Trading Terminal" src="https://github.com/Briansim74/Market-Making-Research-Platform/blob/main/react.png"/>
