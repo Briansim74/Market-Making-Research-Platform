@@ -32,7 +32,7 @@ export default function Dashboard() {
 
       {/* TITLE */}
       <div style={styles.title}>
-        <span style={styles.italic}>{t.edge_model}</span>
+        <span style={styles.italic}>{t.struct_model}</span>
         {" | "}
         <span style={styles.italic}>{t.mode}</span>
         {" | "}
@@ -142,8 +142,23 @@ export default function Dashboard() {
           />
 
           <Row
-            label="Alpha"
-            value={s.alpha.toFixed(2)}
+            label="Alpha Imb"
+            value={s.alpha_imb.toFixed(2)}
+          />
+
+          <Row
+            label="Alpha FLow"
+            value={s.alpha_flow.toFixed(2)}
+          />
+
+          <Row
+            label="Alpha Struct"
+            value={s.alpha_struct.toFixed(2)}
+          />
+
+          <Row
+            label="Signal Quality"
+            value={s.signal_quality.toFixed(2)}
           />
 
           {/* QUOTES */}
