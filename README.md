@@ -11,7 +11,7 @@ It is a conditional execution problem under microstructure constraints:
 - regimes determine when edge is valid
 - toxicity determines whether liquidity should be provided
 - execution determines whether edge is realized
-- eees + queue dynamics determine whether edge survives
+- fees + queue dynamics determine whether edge survives
 
 Most theoretical edge is lost through execution and adverse selection, not prediction error.
 
