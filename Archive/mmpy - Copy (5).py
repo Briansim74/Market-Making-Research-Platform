@@ -6,26 +6,26 @@ import heapq
 import queue
 import random
 import joblib
-import asyncio
-import uvicorn
 import requests
 import threading
 import websocket
 import itertools
 import numpy as np
 import pandas as pd
-import xgboost as xgb
-from typing import Set
+from collections import deque, defaultdict
 from scipy.stats import spearmanr
-from fastapi import FastAPI, WebSocket
 from datetime import datetime, timezone
 from sortedcontainers import SortedDict
-from collections import deque, defaultdict
+import xgboost as xgb
+import asyncio
+import uvicorn
+from fastapi import FastAPI, WebSocket
+from typing import Set
 from sklearn.preprocessing import StandardScaler
 
 from rich import box
-from rich.live import Live
 from rich.table import Table
+from rich.live import Live
 from rich.panel import Panel
 
 # # =========================
@@ -276,7 +276,11 @@ class BinanceFeed:
 
                     bids, asks = self._parse_book(msg)
 
-                    self.state.market_book.apply_delta(bids, asks, self.state)
+                    self.state.market_book.apply_delta(
+                        bids,
+                        asks,
+                        self.state
+                    )
 
                     self.state.market_book.last_update_id = u
 
@@ -302,7 +306,11 @@ class BinanceFeed:
 
             bids, asks = self._parse_book(msg)
 
-            self.state.market_book.apply_delta(bids, asks, self.state)
+            self.state.market_book.apply_delta(
+                bids,
+                asks,
+                self.state
+            )
 
             self.state.market_book.last_update_id = u
 
@@ -484,6 +492,32 @@ class BinanceFeed:
 
 
 # Strategy Layer
+class MicroSignalModel:
+    def __init__(self, artifact):
+        self.model = artifact["model"]
+        self.target = artifact["target"]
+        self.horizon_ms = artifact["horizon_ms"]
+        self.beta = artifact["beta"]
+
+    def predict(self, features):
+
+        X = [features[k] for k in self.feature_cols]
+
+        return self.model.predict([X])[0] # Important: XGBoost expects 2D input.
+
+class EdgeModel:
+    def __init__(self, artifact):
+        self.model = artifact["model"]
+        self.feature_cols = artifact["feature_cols"]
+        self.target = artifact["target"]
+        self.horizon_ms = artifact["horizon_ms"]
+
+    def predict(self, features):
+
+        X = [features[k] for k in self.feature_cols]
+
+        return self.model.predict([X])[0] # Important: XGBoost expects 2D input.
+
 class RegimeModel:
     def __init__(self, artifact):
         self.scaler = artifact["scaler"]
@@ -506,69 +540,27 @@ class RegimeModel:
 
         return regime, regime_id, prob
 
-class MicroSignalModel:
-    def __init__(self, artifact):
-        self.model = artifact["model"]
-        self.target = artifact["target"]
-        self.horizon_ms = artifact["horizon_ms"]
-        self.beta = artifact["beta"] # beta = 14.44 # 100ms signal
-        self.ic = artifact["ic"] # sqrt(r2), shrinkage factor for beta
-
-    def predict(self, features):
-
-        micro_signal = (features["microprice"] - features["mid"]) / features["mid"]
-
-        fair_bias = self.ic * self.beta * micro_signal # dimensionless micro_signal scaled with beta
-
-        return fair_bias
-
-class MLModel:
-    def __init__(self, artifact):
-        self.model = artifact["model"]
-        self.feature_cols = artifact["feature_cols"]
-        self.target = artifact["target"]
-        self.horizon_ms = artifact["horizon_ms"]
-
-    def predict(self, features):
-
-        X = np.empty((1, len(self.feature_cols)), dtype=np.float32)
-
-        for i, k in enumerate(self.feature_cols):
-            X[0, i] = features[k]
-
-        # X = np.array(
-        #     [[features[k] for k in self.feature_cols]],
-        #     dtype=np.float32
-        # )
-
-        return float(self.model.predict(X)[0]) # json reads float, not np.float32
-
-    # def predict(self, features):
-
-    #     X = [features[k] for k in self.feature_cols]
-
-    #     return self.model.predict([X])[0] # Important: XGBoost expects 2D input.
-
 class MarketMakingStrategy:
     def __init__(self, config, params):
         self.config = config
         self.params = params
         self.gamma = self.params["gamma"]
 
-        # Micro Signal Model (LinearRegression), Edge Model (XGBoost), Regime Model (GaussianMixture)
+        # Edge Model (XGBoost), Regime Model (GaussianMixture)
         self.struct_model = self.params["models"]["struct_model"]
+        # self.micro_signal_model = self.params["models"]["micro_signal_model"]
+        # self.edge_model = self._load_edge_model()
+        # self.regime_model = self._load_regime_model()
         self.micro_signal_model = self._load_model("micro_signal_model")
         self.edge_model = self._load_model("edge_model")
         self.regime_model = self._load_model("regime_model")
-        self.toxicity_model = self._load_model("toxicity_model")
 
     def _load_model(self, model):
 
         MODELS = {
             "micro_signal_model": MicroSignalModel,
-            "edge_model": MLModel,
-            "regime_model": RegimeModel,
-            "toxicity_model": MLModel,
+            "edge_model": EdgeModel,
+            "regime_model": RegimeModel
         }
 
         if self.params["models"][model] == "":
@@ -578,9 +570,42 @@ class MarketMakingStrategy:
 
         artifact = joblib.load(path)
 
-        print('INITIALIZED', model)
+        print('initialized', model)
 
         return MODELS[model](artifact)
+
+    # def _load_micro_signal_model(self):
+
+    #     if self.params["models"]["micro_signal_model"] == "":
+    #         return None
+
+    #     path = f"{os.path.join(self.params["folder_path"], self.params["models"]["micro_signal_model"])}.pkl"
+
+    #     artifact = joblib.load(path)
+
+    #     return EdgeModel(artifact)
+
+    # def _load_edge_model(self):
+
+    #     if self.params["models"]["edge_model"] == "":
+    #         return None
+
+    #     path = f"{os.path.join(self.params["folder_path"], self.params["models"]["edge_model"])}.pkl"
+
+    #     artifact = joblib.load(path)
+
+    #     return EdgeModel(artifact)
+    
+    # def _load_regime_model(self):
+
+    #     if self.params["models"]["regime_model"] == "":
+    #         return None
+
+    #     path = f"{os.path.join(self.params["folder_path"], params["models"]["regime_model"])}.pkl"
+
+    #     artifact = joblib.load(path)
+
+    #     return RegimeModel(artifact)
 
     """
     Strategy-level last_bid/last_ask
@@ -593,6 +618,7 @@ class MarketMakingStrategy:
 
     This is decision memory
     """
+
     # -------------------------
     # CORE ALPHA SIGNALS
     # -------------------------
@@ -609,15 +635,13 @@ class MarketMakingStrategy:
 
         microprice = (best_ask * bid_size + best_bid * ask_size) / (bid_size + ask_size + 1e-9)
 
-        order_imbalance = state.order_imbalance # order imbalance, resting flow
-        trade_imbalance = state.trade_imbalance # trade imbalance, aggressitve trade flow
+        imbalance = (bid_size - ask_size) / (bid_size + ask_size + 1e-9)
 
-        # Your best estimate of where the mid should move next, given order flow
-        fair = microprice + policy["alpha_order_imb"] * order_imbalance + policy["alpha_trade_imb"] * trade_imbalance
+        flow = state.trade_imbalance
 
-        return fair, microprice
+        return microprice + policy["alpha_imb"] * imbalance + policy["alpha_flow"] * flow, microprice
     
-    def compute_spread(self, features, policy, toxicity):
+    def compute_spread(self, features, policy):
 
         sigma = features["volatility"]
 
@@ -626,7 +650,7 @@ class MarketMakingStrategy:
 
         raw_spread = max(base, vol_component)
         
-        spread = raw_spread * policy["spread_multiplier"] * (1.0 + toxicity["k1"] * toxicity["tox"])
+        spread = raw_spread * policy["spread_multiplier"]
 
         return spread
     
@@ -638,7 +662,6 @@ class MarketMakingStrategy:
 
         effective_inventory = state.inventory - policy["inventory_target"]
 
-        # long inv, skew pushes fair downward, more willing to sell
         return -effective_inventory * self.gamma * sigma * mid
 
     def compute_signal_quality(self, state):
@@ -657,36 +680,42 @@ class MarketMakingStrategy:
         # 1. correlation (true IC)
         # --------------------------
         if np.std(preds) < 1e-8 or np.std(rets) < 1e-8:
-            ic = 0.0 # make it 0.0 instead of nan
+            ic = np.nan
         else:
             ic = np.corrcoef(preds, rets)[0, 1]
-            ic = 0.0 if np.isnan(ic) else ic
+            ic = np.nan if np.isnan(ic) else ic
 
         # --------------------------
         # 2. rank IC (more robust)
         # --------------------------
         if np.std(preds) < 1e-8 or np.std(rets) < 1e-8:
-            rank_ic = 0.0
+            rank_ic = np.nan
         else:
             rank_ic = spearmanr(preds, rets).statistic
-            rank_ic = 0.0 if np.isnan(rank_ic) else rank_ic
+            rank_ic = np.nan if np.isnan(rank_ic) else rank_ic
 
         # --------------------------
         # 3. directional accuracy
         # --------------------------
         hit_rate = np.mean(np.sign(preds) == np.sign(rets))
+
         directional_score = (hit_rate - 0.5) * 2  # [-1, 1]
 
         # --------------------------
         # 4. stability penalty (important in MM)
         # --------------------------
         pred_vol = np.std(preds)
+
         stability_penalty = np.exp(-pred_vol * 50)  # tune factor
 
         # --------------------------
         # 5. final score
         # --------------------------
-        raw = 0.5 * ic + 0.3 * rank_ic + 0.2 * directional_score
+        raw = (
+            0.5 * ic +
+            0.3 * rank_ic +
+            0.2 * directional_score
+        )
 
         signal_quality = stability_penalty * np.tanh(3 * raw)
 
@@ -701,11 +730,11 @@ class MarketMakingStrategy:
                 "regime": "no_model",
                 "regime_id": -1.0,
                 "regime_prob": 0.0,
-                "alpha_order_imb": 0.2, # Trust in order-book imbalance
-                "alpha_trade_imb": 0.05, # Trust in trade flow
+                "alpha_imb": 0.2, # Trust in order-book imbalance
+                "alpha_flow": 0.05, # Trust in trade flow
                 "alpha_struct": 0.3, # Trust in reservation price
                 "spread_multiplier": 1.0, # How aggressively to provide liquidity
-                "k0": 0.5,
+                "k": 1.0,
                 "inventory_target": 0.0 # Desired directional inventory
             }
 
@@ -725,47 +754,45 @@ class MarketMakingStrategy:
 
         regime, regime_id, prob = self.regime_model.predict(features)
 
-        if regime == "trending": # Regime 0
-            alpha_order_imb = 0.6
-            alpha_trade_imb = 0.2
-            alpha_struct = 0.8 # trust fair value model strongly
-            spread_multiplier = 2.0
-            k0 = 1.2
-            inventory_target = np.sign(features["trade_imbalance"]) # stay long if long imbalance, etc, controlled directional LP
-        
-        elif regime == "toxic": # Regime 1 — LOW VOL (silent competition regime)
-            alpha_order_imb = 0.05
-            alpha_trade_imb = 0.01
-            alpha_struct = 0.4 # rely more on model, less on microstructure
-            spread_multiplier = 1.5  # widen aggressively
-            k0 = 0.5
-            inventory_target = 0.7 # reduce model aggressiveness
-        
-        elif regime == "low_vol": # Regime 2 — low-vol (your money regime), This is where MM should be most active and balanced
-            alpha_order_imb = 0.15
-            alpha_trade_imb = 0.05
+        if regime == "low_vol": # Regime 0 — NEUTRAL (your money regime), This is where MM should be most active and balanced
+            alpha_imb = 0.05
+            alpha_flow = 0.01
             alpha_struct = 0.2 # default is 0.3
-            spread_multiplier = 0.7 # tight spreads
-            k0 = 1.0 # allow ml to participate fully
+            spread_multiplier = 0.8
+            k = 1.0
             inventory_target = 0.0
+
+        elif regime == "neutral": # Regime 1 — LOW VOL (silent competition regime)
+            alpha_imb = 0.05
+            alpha_flow = 0.01
+            alpha_struct = 0.4
+            spread_multiplier = 0.8  # tighter spreads (safe environment)
+            k = 1.0
+            inventory_target = 0.7 # reduce model aggressiveness
+
+        elif regime == "trending":
+            alpha_imb = 0.5
+            alpha_flow = 0.15
+            alpha_struct = 0.8
+            spread_multiplier = 2.0
+            k = 1.5
+            inventory_target = np.sign(features["trade_imbalance"]) # stay long if long imbalance, etc
 
         policy = {
             "regime": regime,
             "regime_id": regime_id,
             "regime_prob": prob,
-            "alpha_order_imb": alpha_order_imb,
-            "alpha_trade_imb": alpha_trade_imb,
+            "alpha_imb": alpha_imb,
+            "alpha_flow": alpha_flow,
             "alpha_struct": alpha_struct,
             "spread_multiplier": spread_multiplier,
-            "k0": k0,
-            "inventory_target": inventory_target,
-            "residual_mid": 0.0,
-            "micro_residual":  0.0
+            "k": k,
+            "inventory_target": inventory_target
         }
     
         return policy
     
-    def compute_struct_delta(self, features, policy):
+    def compute_struct_delta(self, features):
 
         if self.struct_model != "blended_AS":
             return 0.0
@@ -814,24 +841,13 @@ class MarketMakingStrategy:
         """
         reservation = features["fair"] + features["skew"] # fair value + inventory risk to adjust quoting center
 
-        struct_center = features["mid"] + policy["alpha_struct"] * (reservation - features["mid"])
+        struct_center = features["mid"] + features["alpha_struct"] * (reservation - features["mid"])
 
         struct_delta = struct_center - features["mid"]  # new center with mid as baseline
 
         return struct_delta
         
-    def compute_micro_signal_delta(self, features):
-
-        if self.micro_signal_model == None:
-            return 0.0
-
-        fair_bias = self.micro_signal_model.predict(features)
-
-        micro_signal_delta = features["mid"] * fair_bias
-
-        return micro_signal_delta
-    
-    def compute_ml_delta(self, state, struct_delta, micro_signal_delta, features, policy):
+    def compute_ml_delta(self, state, center, features):
 
         """
         ml_delta = expected directional drift from current equilibrium
@@ -849,44 +865,41 @@ class MarketMakingStrategy:
         if self.edge_model == None: # no edge_model active
             return 0.0, 0.0
         
-        reservation = features["mid"] + struct_delta + micro_signal_delta
+        features["residual_mid"] = (center - features["mid"]) / features["mid"]
+        features["micro_residual"] = (features["microprice"] - center) / center
         
-        expected_return = self.edge_model.predict(features) # expected return given market state in log space
+        expected_return = self.edge_model.predict(features) # Important: XGBoost expects 2D input.
 
-        signal_quality = self.compute_signal_quality(state) # get signal accuracy
+        signal_quality = self.compute_signal_quality(state)
 
         # store prediction
         state.market_feature_state.ml_predictions.append({
             "ts": state.last_depth_ts,
             "pred": expected_return,
-            "reservation": reservation,
+            "reservation": center,  # IMPORTANT
         })
 
-        effective_k = policy["k0"] * signal_quality
+        ml_center = center * np.exp(expected_return * features["k"]) # regime multiplier, k > 1, scale up
 
-        ml_center = reservation * np.exp(expected_return * effective_k) # regime multiplier, k > 1, scale up
-
-        ml_delta = ml_center - reservation
+        ml_delta = ml_center - center
 
         return ml_delta, signal_quality
-
     
-    def compute_toxicity(self, features):
+    def compute_micro_signal_delta(self, features):
 
-        toxicity = {
-            "tox": 0.0,
-            "k1": 0.2, # spread tox multiplier k1 = 0.15 to 0.30 (0.2)
-            "k2": 0.357  # order size tox multiplier k2 = 0.2 to 0.5 (0.357)
-        }
+        if self.micro_signal_model == "":
+            return 0.0
 
-        if self.toxicity_model == None: # no toxicity_model active
-            return toxicity
-        
-        prediction = self.toxicity_model.predict(features) # E[markout | state]
+        beta = 14.44 # 100ms signal
 
-        toxicity["tox"] = -prediction # bad markout < 0, tox > 0
+        micro_signal = (features["microprice"] - features["mid"]) / features["mid"]
 
-        return toxicity
+        fair_bias = beta * micro_signal
+
+        micro_signal_delta = features["mid"] * fair_bias
+
+        return micro_signal_delta
+
     
     # -------------------------
     # FINAL QUOTE GENERATION
@@ -916,7 +929,8 @@ class MarketMakingStrategy:
             "fair": fair,
             "skew": skew,
             "microprice": microprice,
-            "microprice_dev": microprice - mid,
+            "alpha_struct": policy["alpha_struct"],
+            "k": policy["k"],
             "spread": best_ask - best_bid,
             "order_imbalance": state.order_imbalance,
             "trade_imbalance": state.trade_imbalance,
@@ -924,20 +938,27 @@ class MarketMakingStrategy:
             "volatility": state.get_vol(),
             "queue_ahead_bid": state.compute_queue_ahead("bids", self.config.to_tick(best_bid)),
             "queue_ahead_ask": state.compute_queue_ahead("asks", self.config.to_tick(best_ask)),
+            "residual_mid": 0.0,
+            "micro_residual": 0.0
         }
 
-        # Alpha Generation
-        struct_delta = self.compute_struct_delta(features, policy) # blended AS model
+        """
+        center = microprice + struct_delta + ml_delta
+        
+        """
+
+        struct_delta = self.compute_struct_delta(features) # mm-core, adjusted to blended AS model
+
         micro_signal_delta = self.compute_micro_signal_delta(features) # adjusted to 100ms microprice adjustment signal
-        ml_delta, signal_quality = self.compute_ml_delta(state, struct_delta, micro_signal_delta, features, policy) # alpha model, any residual mispricing
 
-        center = mid + struct_delta + micro_signal_delta + ml_delta # mid value anchored, more stable than microprice as an anchor
+        center = mid + micro_signal_delta + struct_delta
 
-        # Toxicity filter, to adjust spread and quoting size
-        toxicity = self.compute_toxicity(features) # adverse selection
+        ml_delta, signal_quality = self.compute_ml_delta(state, center, features) # alpha model, any residual mispricing
+   
+        center = center + ml_delta # mid value anchored, more stable than microprice as an anchor
 
         # 3. Spread (your model or fallback to market spread)
-        spread = self.compute_spread(features, policy, toxicity)
+        spread = self.compute_spread(features, policy)
 
         half = spread / 2
 
@@ -988,22 +1009,19 @@ class MarketMakingStrategy:
             # model internals
             "fair": fair,
             "skew": skew,
-            "struct_delta": struct_delta,
-            "micro_signal_delta": micro_signal_delta,
             "reservation": center,
 
             # policy
             "regime": policy["regime"],
             "regime_id": policy["regime_id"],
             "regime_prob": policy["regime_prob"],  # optional if your model outputs probabilities
-            "alpha_order_imb": policy["alpha_order_imb"],
-            "alpha_trade_imb": policy["alpha_trade_imb"],
-            "alpha_struct": policy["alpha_struct"], # policy["alpha"] # to check how to get last_signal since we dont use this anymore
-            "k0": policy["k0"],
+            "alpha_imb": policy["alpha_imb"],
+            "alpha_flow": policy["alpha_flow"],
+            "alpha_struct": features["alpha_struct"], # policy["alpha"] # to check how to get last_signal since we dont use this anymore
+            "k": features["k"],
             "spread_multiplier": policy["spread_multiplier"],
             "inventory_target": policy["inventory_target"],
             "signal_quality": signal_quality,
-            "toxicity": toxicity,
 
             # market feature state
             "bid_delta": bid_delta, # check why quote churn is 0.0
@@ -1034,9 +1052,8 @@ class MarketMakingStrategy:
 
 # Dataset Recording Layer
 class DatasetRecorder:
-    def __init__(self, config, state, params):
+    def __init__(self, config, params):
         self.config = config
-        self.state = state
         self.params = params
         
         self.rows = []
@@ -1122,11 +1139,9 @@ class DatasetRecorder:
             # model internals
             "fair": signal["fair"],
             "skew": signal["skew"],
-            "struct_delta": signal["struct_delta"],
-            "micro_signal_delta": signal["micro_signal_delta"],
             "reservation": signal["reservation"],
-            "alpha_order_imb": signal["alpha_order_imb"],
-            "alpha_trade_imb": signal["alpha_trade_imb"],
+            "alpha_imb": signal["alpha_imb"],
+            "alpha_flow": signal["alpha_flow"],
             "alpha_struct": signal["alpha_struct"],
 
             # action
@@ -1183,9 +1198,7 @@ class DatasetRecorder:
 
     """
 
-    def log_trade(self, trade, symbol):
-
-        book = self.state.market_book
+    def log_trade(self, trade, book, symbol):
 
         bid_tick, bid_size = book.best_bid()
         ask_tick, ask_size = book.best_ask()
@@ -1280,10 +1293,7 @@ class DatasetRecorder:
     “I actually placed/cancelled/replaced X in the book at time t”
     """
 
-    def log_quote(self, ts, order, side, event_type, price):
-
-        signal = order.metadata["signal"]
-        
+    def log_quote(self, ts, order, side, event_type, price, signal):       
         self.quotes.append({
             # Event
             "ts": ts,
@@ -1324,8 +1334,8 @@ class DatasetRecorder:
             "fair": signal["fair"],
             "skew": signal["skew"],
             "reservation": signal["reservation"],
-            "alpha_order_imb": signal["alpha_order_imb"],
-            "alpha_trade_imb": signal["alpha_trade_imb"],
+            "alpha_imb": signal["alpha_imb"],
+            "alpha_flow": signal["alpha_flow"],
             "alpha_struct": signal["alpha_struct"]
         })
 
@@ -1352,9 +1362,7 @@ class DatasetRecorder:
 
     """
 
-    def log_fill(self, qty, order, is_maker):
-
-        book = self.state.market_book
+    def log_fill(self, ts, qty, order, inventory, book, volatility, is_maker):
 
         bid_tick, bid_size = book.best_bid()
         ask_tick, ask_size = book.best_ask()
@@ -1362,12 +1370,14 @@ class DatasetRecorder:
         best_bid = self.config.from_tick(bid_tick)
         best_ask = self.config.from_tick(ask_tick)
 
-        volatility_at_fill = self.state.get_vol()
-        signal = order.metadata["signal"]
+        my_bid = order.metadata["my_bid"]
+        my_ask = order.metadata["my_ask"]
 
         self.fills.append({
+            # time
+            "ts": ts,
+
             # execution
-            "ts": self.state.last_trade_ts,
             "side": order.side,
             "price": self.config.from_tick(order.price),
             "price_tick": order.price,
@@ -1379,95 +1389,25 @@ class DatasetRecorder:
             "fill_status": "PARTIAL" if order.remaining > 0 else "FULL",
 
             # portfolio state
-            "inventory": self.state.inventory,
-
-            # decision time snapshot from last signal, for toxicity modelling
-            "mid": signal["mid"],
-            "microprice": signal["microprice"],
-            "microprice_dev": signal["microprice"] - signal["mid"],
-            "spread": signal["spread"],
-            "order_imbalance": signal["order_imbalance"],
-            "trade_imbalance": signal["trade_imbalance"],
-            "volatility": signal["volatility"],
-            "volatility_bps": signal["volatility"] * 10000,
-            "queue_ahead_bid": signal["queue_ahead_bid"],
-            "queue_ahead_ask": signal["queue_ahead_ask"],
+            "inventory": inventory,
 
             # market state at fill
-            "mid_at_fill": (best_bid + best_ask) / 2,
-            "spread_at_fill": best_ask - best_bid,
-            "volatility_at_fill": volatility_at_fill,
-            "volatility_at_fill_bps": volatility_at_fill * 10000,
+            "mid": (best_bid + best_ask) / 2,
+            "spread": best_ask - best_bid,
+            "volatility": volatility,
+            "volatility_bps": volatility * 10000,
 
             # quote geometry
-            "my_bid": signal["my_bid"],
-            "my_ask": signal["my_ask"],
-            "bid_distance_touch": signal["my_bid"] - best_bid,
-            "ask_distance_touch": signal["my_ask"] - best_ask,
-            "bid_distance_spread": signal["my_bid"] - best_ask,
-            "ask_distance_spread": signal["my_ask"] - best_bid,
+            "my_bid": my_bid,
+            "my_ask": my_ask,
+            "bid_distance_touch": my_bid - best_bid,
+            "ask_distance_touch": my_ask - best_ask,
+            "bid_distance_spread": my_bid - best_ask,
+            "ask_distance_spread": my_ask - best_bid,
 
             # microstructure
             "queue_ahead_at_join": order.metadata["queue_ahead_at_join"],
     })
-        
-    # "ts": ts,
-    #         "symbol": symbol,
-
-    #         # market
-    #         "best_bid": signal["best_bid"],
-    #         "best_ask": signal["best_ask"],
-    #         "mid": signal["mid"],
-    #         "microprice": signal["microprice"],
-            
-    #         "best_bid_tick": self.config.to_tick(signal["best_bid"]),
-    #         "best_ask_tick": self.config.to_tick(signal["best_ask"]),
-    #         "mid_tick": self.config.to_tick(signal["mid"]),
-
-    #         "spread": signal["best_ask"] - signal["best_bid"],
-
-    #         # microstructure
-    #         "order_imbalance": signal["order_imbalance"],
-    #         "trade_imbalance": signal["trade_imbalance"],
-    #         "volatility": signal["volatility"],
-    #         "queue_ahead_bid": signal["queue_ahead_bid"],
-    #         "queue_ahead_ask": signal["queue_ahead_ask"],
-
-    #         # risk
-    #         "inventory": signal["inventory"],
-    #         "realized_pnl": signal["realized_pnl"],
-    #         "unrealized_pnl": signal["unrealized_pnl"],
-    #         "total_pnl": signal["total_pnl"],
-    #         "equity": signal["equity"],
-
-    #         # model internals
-    #         "fair": signal["fair"],
-    #         "skew": signal["skew"],
-    #         "reservation": signal["reservation"],
-    #         "alpha_order_imb": signal["alpha_order_imb"],
-    #         "alpha_trade_imb": signal["alpha_trade_imb"],
-    #         "alpha_struct": signal["alpha_struct"],
-
-    #         # action
-    #         "my_bid": signal["my_bid"],
-    #         "my_ask": signal["my_ask"],
-
-    #         "my_bid_tick": self.config.to_tick(signal["my_bid"]),
-    #         "my_ask_tick": self.config.to_tick(signal["my_ask"]),
-
-    #         # execution geometry
-    #         # aggressiveness vs touch
-    #         "bid_distance_touch": signal["my_bid"] - signal["best_bid"],
-    #         "ask_distance_touch": signal["my_ask"] - signal["best_ask"],
-
-    #         # position inside spread
-    #         "bid_distance_spread": signal["my_bid"] - signal["best_ask"],
-    #         "ask_distance_spread": signal["my_ask"] - signal["best_bid"],
-
-    #         # quote churn
-    #         "bid_delta": signal["bid_delta"],
-    #         "ask_delta": signal["ask_delta"],
-    #         "quote_churn": signal["quote_churn"],
 
     def create_run_dir(self, base="data/runs"):
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1478,7 +1418,6 @@ class DatasetRecorder:
         return run_path, run_id
 
     def export_run(self, base_path=r"data\runs"):
-        self.state.update_performance()
 
         run_path, run_id = self.create_run_dir(base_path)
 
@@ -1502,13 +1441,8 @@ class DatasetRecorder:
 
         manifest = dict(self.params)
         
-        manifest["run_id"] = run_id
-        manifest["folder_path"] = run_path
-        manifest["performance"]["pnl"] = round(self.state.get_pnl(), 4)
-        manifest["performance"]["sharpe"] = round(self.state.compute_sharpe(), 4)
-        manifest["performance"]["fees_paid"] = round(self.state.fees_paid, 4)
-        manifest["performance"]["fees_per_fill"] = round(self.state.fees_paid / len(self.fills), 4)
-        manifest["performance"]["pnl_per_fill"] = round(self.state.get_pnl() / len(self.fills), 4)
+        params["run_id"] = run_id
+        params["folder_path"] = run_path
 
         # 3. write manifest
         with open(manifest_path, "w") as f:
@@ -1519,7 +1453,6 @@ class DatasetRecorder:
 
 # Execution Layer
 class Order:
-
     def __init__(self, order_id, side, price, qty, ts, owner, signal, queue_ahead_at_join):
         self.order_id = order_id
         self.side = side
@@ -1529,8 +1462,9 @@ class Order:
         self.status = "LIVE"
         self.timestamp = ts
         self.owner = owner
-        self.metadata = { # used for toxicity ML training
-            "signal": signal,
+        self.metadata = {
+            "my_bid": signal["my_bid"],
+            "my_ask": signal["my_ask"],
             "queue_ahead_at_join": queue_ahead_at_join
         }
 
@@ -1609,7 +1543,7 @@ class Execution:
     natural risk balancing
     """
 
-    def _compute_order_size(self, signal): # Asymmetrical Quoting
+    def _compute_order_size(self): # Asymmetrical Quoting
         state = self.state
 
         inv = state.inventory
@@ -1640,15 +1574,13 @@ class Execution:
         # -------------------------
         risk_penalty = math.exp(-0.2 * (inv ** 2))
 
-        toxicity_penalty = np.exp(-signal["toxicity"]["k2"] * signal["toxicity"]["tox"])
-
         # -------------------------
         # 4. combine
         # -------------------------
         base = base_size * vol_penalty * risk_penalty
 
         # optional: keep symmetric size baseline but asymmetric quoting power
-        size = base * toxicity_penalty
+        size = base
 
         # clamp
         size = max(0.05, min(size, 2.0))
@@ -1673,7 +1605,7 @@ class Execution:
         bid = signal["my_bid"]
         ask = signal["my_ask"]
 
-        order_sizes = self._compute_order_size(signal)
+        order_sizes = self._compute_order_size()
         ts = self.config.now_ms()
 
         # -------------------------
@@ -1695,6 +1627,7 @@ class Execution:
                 side="BID",
                 event_type="NEW",
                 price=bid,
+                signal=signal
             )
 
             self.recorder.log_quote(
@@ -1703,6 +1636,7 @@ class Execution:
                 side="ASK",
                 event_type="NEW",
                 price=ask,
+                signal=signal
             )
 
             return
@@ -1734,6 +1668,7 @@ class Execution:
                 side="BID",
                 event_type="REPLACE",
                 price=bid,
+                signal=signal
             )
 
         if ask_change:
@@ -1751,6 +1686,7 @@ class Execution:
                 side="ASK",
                 event_type="REPLACE",
                 price=ask,
+                signal=signal
             )
 
         self.current_bid_size = order_sizes["bid_size"]
@@ -1903,12 +1839,14 @@ class Execution:
                 if o.side == side and o.price == price and o.status == "LIVE"
             ]
 
+            self.state.fill_candidates = orders
+
             if not orders:
                 return
-            
-            self.state.last_fill_candidate = orders
             # -------------------------
-            # Poisson arrival of liquidity, much more stable statistically maybe to hawkes in future
+            # Poisson Arrival Logic, maybe to hawkes for adverse selection?
+
+            # Poisson arrival of liquidity, much more stable statistically.
             # -------------------------
 
             queue_ahead = self.state.compute_queue_ahead( # passive world
@@ -1918,9 +1856,27 @@ class Execution:
 
             trade_rate = self.get_trade_rate(trade) # aggressive world
  
-            lambda_fill = trade_rate / (queue_ahead + 1e-9) # hazard rate (/ s), stochasitc estimation to model cancels / trades from l2 data
+            lambda_fill = trade_rate / (queue_ahead + 1e-9) # hazard rate (/ s)
 
             p_fill = 1 - np.exp(-lambda_fill * 0.1) # fill prob of at least 1 event in the next 100ms (dt = 0.1)
+    
+            # -------------------------
+            # Stochastic Arrival Logic
+
+            # Problem: it’s deterministic under scaling
+
+            # If you scale qty or queue_ahead, behavior changes abruptly and nonlinearly:
+
+            # small changes in queue → big jumps in fill probability
+            # no time structure (everything is “instant probability”)
+            # no notion of arrival over time
+
+            # So your fill process is:
+
+            # static + ratio-based + memoryless in a bad way
+            # -------------------------
+            # pressure = qty / (queue_ahead + qty + 1e-9) # Stochastic partial fills, ad-hoc Bernoulli classifier
+            # p_fill = pressure
 
             if p_fill < random.random():
                 return
@@ -1944,11 +1900,19 @@ class Execution:
                 order.remaining -= fill
                 remaining_flow -= fill
 
-                self.state.on_fill(self.config.from_tick(order.price), fill, order.side, "maker")
+                self.state.on_fill(self.config.from_tick(order.price), fill, order.side)
 
                 self.state.last_order_update = order
 
-                self.recorder.log_fill(qty=fill, order=order, is_maker=True)
+                self.recorder.log_fill(
+                    ts=self.state.last_trade_ts,
+                    qty=fill,
+                    order=order,
+                    inventory=self.state.inventory,
+                    book=self.state.market_book,
+                    volatility=self.state.get_vol(),
+                    is_maker=True
+                )
 
                 if order.remaining == 0:
                     order.status = "FILLED"
@@ -1964,7 +1928,6 @@ class Execution:
 
             if order.side == "BUY":
                 levels = list(book.asks.items())  # lowest ask first
-            
             else:
                 levels = list(book.bids.items())[::-1]  # highest bid first
 
@@ -1980,10 +1943,6 @@ class Execution:
 
                 order.remaining -= fill
 
-                order.price = price # for dashboard UI for market orders
-                self.state.last_fill_candidate = [order]
-                self.state.last_order_update = order
-
                 print(f"{order.side} | {self.config.from_tick(price):>10.4f} | {fill:>8.6f} | {order.status}")
 
                 # update book liquidity
@@ -1992,7 +1951,6 @@ class Execution:
                     
                     if new_size <= 0:
                         del book.asks[price]
-
                     else:
                         book.asks[price] = new_size
                 else:
@@ -2000,22 +1958,22 @@ class Execution:
                     
                     if new_size <= 0:
                         del book.bids[price]
-
                     else:
                         book.bids[price] = new_size
 
                 self.state.on_fill(
                     self.config.from_tick(price),
                     fill,
-                    order.side,
-                    "taker"
+                    order.side
                 )
 
             if order.remaining == 0:
                 order.status = "FILLED"
 
+
 # Orchestration Layer
 class Engine:
+    # def __init__(self, config, state, strategy, execution, recorder, dashboard, params):
     def __init__(self, config, state, strategy, execution, recorder, dashboard, params, signal_queue):
         self.config = config
         self.params = params
@@ -2067,7 +2025,9 @@ class Engine:
     def on_trade_event(self, trade):
 
         # Dataset recording
-        self.recorder.log_trade(trade=trade, symbol=self.instrument.upper())
+        self.recorder.log_trade(trade=trade, 
+                                book=self.state.market_book, 
+                                symbol=self.instrument.upper())
 
         self.execution.process_trade(trade)
     
@@ -2108,7 +2068,7 @@ class Engine:
         # -------------------------
         # POLICY
         # -------------------------
-        regime = state.last_signal["regime"] if state.last_signal else "no model"
+        regime = state.last_signal["regime"] if state.last_signal else ""
 
         # -------------------------
         # SIGNALS
@@ -2117,10 +2077,10 @@ class Engine:
         microprice = state.last_signal["microprice"] if state.last_signal else 0.0
         skew = state.last_signal["skew"] if state.last_signal else 0.0
         reservation = state.last_signal["reservation"] if state.last_signal else 0.0
-        alpha_order_imb = state.last_signal["alpha_order_imb"] if state.last_signal else 0.0
-        alpha_trade_imb = state.last_signal["alpha_trade_imb"] if state.last_signal else 0.0
+        alpha_imb = state.last_signal["alpha_imb"] if state.last_signal else 0.0
+        alpha_flow = state.last_signal["alpha_flow"] if state.last_signal else 0.0
         alpha_struct = state.last_signal["alpha_struct"] if state.last_signal else 0.0
-        k0 = state.last_signal["k0"] if state.last_signal else 0.0
+        k = state.last_signal["k"] if state.last_signal else 0.0
         spread_multiplier = state.last_signal["spread_multiplier"] if state.last_signal else 0.0
         inventory_target = state.last_signal["inventory_target"] if state.last_signal else 0.0
         signal_quality = state.last_signal["signal_quality"] if state.last_signal else 0.0
@@ -2135,22 +2095,15 @@ class Engine:
 
         with execution.lock: # Another lock
             orders = sorted(execution.open_orders.values(), key=lambda o: 0 if o.side == "BUY" else 1)
-
         orders = [f"{o.side:<5} | {self.config.from_tick(o.price):>10.4f} | {o.qty:>8.6f} [{o.status}]" for o in orders]
-        # orders = [f"{o.side:<5} | {(f"{self.config.from_tick(o.price):>10.4f}" if o.price is not None else "MARKET")} | {o.qty:>8.6f} [{o.status}]" for o in orders]
         orders_str = (orders + ["—", "—"])[:2]
 
-        last_fill_candidate_str = "\n".join([f"{o.side:<5} | {self.config.from_tick(o.price):>10.4f} | {o.remaining:>8.6f} [{o.status}]"
-            for o in state.last_fill_candidate
+        fill_candidates_str = "\n".join([f"{o.side:<5} | {self.config.from_tick(o.price):>10.4f} | {o.qty:>8.6f} [{o.status}]"
+            for o in state.fill_candidates
         ]) or "—"
-
-        # last_fill_candidate_str = "\n".join([f"{o.side:<5} | {(f"{self.config.from_tick(o.price):>10.4f}" if o.price is not None else "MARKET")} | {o.qty:>8.6f} [{o.status}]"
-        #     for o in state.last_fill_candidate
-        # ]) or "—"
 
         last_order_update = state.last_order_update if state.last_order_update else None
         last_order_update_str = f"{last_order_update.side:<5} | {self.config.from_tick(last_order_update.price):>10.4f} | {last_order_update.remaining:>8.6f} [{last_order_update.status}]" if last_order_update else "—"
-        # last_order_update_str = f"{last_order_update.side:<5} | {(f"{self.config.from_tick(last_order_update.price):>10.4f}" if last_order_update.price is not None else "MARKET")} | {last_order_update.remaining:>8.6f} [{last_order_update.status}]" if last_order_update else "—"
 
         state.update_performance() # update sharpe
         # -------------------------
@@ -2197,10 +2150,10 @@ class Engine:
                 "fair_value": fair,
                 "skew": skew,
                 "reservation": reservation,
-                "alpha_order_imb": alpha_order_imb,
-                "alpha_trade_imb": alpha_trade_imb,
+                "alpha_imb": alpha_imb,
+                "alpha_flow": alpha_flow,
                 "alpha_struct": alpha_struct,
-                "k0": k0,
+                "k": k,
                 "spread_multiplier": spread_multiplier,
                 "inventory_target": inventory_target,
                 "signal_quality": signal_quality,
@@ -2220,7 +2173,7 @@ class Engine:
                 "ask_pressure": ask_pressure,
                 "open_order_one": orders_str[0],
                 "open_order_two": orders_str[1],
-                "last_fill_candidate": last_fill_candidate_str,
+                "fill_candidates": fill_candidates_str,
                 "last_order_update": last_order_update_str
             },
 
@@ -2228,7 +2181,6 @@ class Engine:
                 "inventory": state.inventory,
                 "realized_pnl": state.realized_pnl,
                 "unrealized_pnl": state.get_unrealized_pnl(mid),
-                "fees_paid": state.fees_paid,
                 "total_pnl": state.get_pnl()
             },
 
@@ -2323,7 +2275,7 @@ class Engine:
 
         table.add_row("Open Orders", snapshot["execution"]["open_order_one"])
         table.add_row("", snapshot["execution"]["open_order_two"])
-        table.add_row("Last Fill Candidate", snapshot["execution"]["last_fill_candidate"])
+        table.add_row("Fill Candidates", snapshot["execution"]["fill_candidates"])
         table.add_row("Last Order Update", snapshot["execution"]["last_order_update"])
         table.add_row("", "")
 
@@ -2334,7 +2286,6 @@ class Engine:
         table.add_row("Inventory", self.color_risk(snapshot["risk"]["inventory"], limit=10))
         table.add_row("Realized PnL", self.color_pnl(snapshot["risk"]["realized_pnl"]))
         table.add_row("Unrealized PnL", self.color_pnl(snapshot["risk"]["unrealized_pnl"]))
-        table.add_row("Fees Paid", self.color_pnl(-snapshot["risk"]["fees_paid"]))
         table.add_row("Total PnL", self.color_pnl(snapshot["risk"]["total_pnl"]))
         table.add_row("Risk", self.centered_inventory_bar(inv=snapshot["risk"]["inventory"], max_inv=10, width=21))
         table.add_row("", "")
@@ -2382,9 +2333,11 @@ class Engine:
     def centered_inventory_bar(self, inv, max_inv=10, width=21): 
 
         half = width // 2
+
         scaled = int((inv / max_inv) * half)
 
         chars = [" "] * width
+
         chars[half] = "|"
 
         if scaled > 0:
@@ -2398,7 +2351,11 @@ class Engine:
         left_half = "".join(chars[:half])
         right_half = "".join(chars[half + 1:])
 
-        inv_bar = f"[red]{left_half}[/red][white]{chars[half]}[/white][green]{right_half}[/green]"
+        inv_bar = (
+            f"[red]{left_half}[/red]"
+            f"[white]{chars[half]}[/white]"
+            f"[green]{right_half}[/green]"
+        )
 
         return inv_bar
 
@@ -2417,23 +2374,22 @@ class MarketFeatureState:
         # ML k signal quality
         self.ml_predictions = deque(maxlen=200)
         self.ml_signal_log = deque(maxlen=5000)
-        self.ml_horizon_ms = 0.0
 
         # for delta tracking
         self.prev_best_bid = None
         self.prev_best_ask = None
 
 class State:
-    def __init__(self, config, params):
+    def __init__(self, config):
         
         # Market Data Layer
         self.config = config
-        self.params = params
         self.market_book = OrderBook(config=self.config)
         self.last_mid = None
 
         # Market Regime Layer
         self.market_feature_state = MarketFeatureState(maxlen=10)
+        self.ml_horizon_ms = 0.0
 
         # Strategy Layer
         self.last_signal = None
@@ -2453,11 +2409,6 @@ class State:
         self.equity_history = deque(maxlen=10000)
         self.return_history = deque(maxlen=10000)
         self.last_equity = None
-
-        # Exchange fees
-        self.maker_fee_rate = self.params["fees"]["maker_fee_rate"] # 0.0002 0.02%
-        self.taker_fee_rate = self.params["fees"]["taker_fee_rate"] # 0.0002 0.02%
-        self.fees_paid = 0.0
 
         # Microstructure Simulation Layer
         self.queue_flow = {
@@ -2481,7 +2432,7 @@ class State:
         self.last_trade_ts = None
         self.last_trade = {}
         self.last_depth_ts = None
-        self.last_fill_candidate = []
+        self.fill_candidates = []
         self.last_order_update = None
 
         # Control Layer
@@ -2509,163 +2460,67 @@ class State:
         
         self.order_imbalance = (bid_size - ask_size) / (bid_size + ask_size + 1e-9)
 
-    # def on_fill(self, price, qty, side):
-
-    #     fill_value = price * qty
-
-    #     # -------------------------
-    #     # Snapshot old state FIRST
-    #     # -------------------------
-    #     old_inv = self.inventory
-    #     old_avg = self.avg_entry_price
-
-    #     # -------------------------
-    #     # BUY: you gain inventory
-    #     # -------------------------
-    #     if side == "BUY":
-
-    #         new_inv = old_inv + qty
-
-    #         # If you were short → realize PnL
-    #         if old_inv < 0:
-    #             closed_qty = min(qty, abs(old_inv))
-    #             self.realized_pnl += closed_qty * (old_avg - price)
-
-    #         # update cash
-    #         self.cash -= fill_value
-
-    #         # update inventory
-    #         self.inventory = new_inv
-
-    #         # update avg entry price ONLY if position exists
-    #         if new_inv != 0:
-    #             self.avg_entry_price = (
-    #                 old_avg * old_inv + price * qty
-    #             ) / new_inv
-    #         else:
-    #             self.avg_entry_price = 0.0
-
-    #     # -------------------------
-    #     # SELL: you reduce inventory / go short
-    #     # -------------------------
-    #     else:
-
-    #         new_inv = old_inv - qty
-
-    #         # If you were long → realize PnL
-    #         if old_inv > 0:
-    #             closed_qty = min(qty, old_inv)
-    #             self.realized_pnl += closed_qty * (price - old_avg)
-
-    #         # update cash
-    #         self.cash += fill_value
-
-    #         # update inventory
-    #         self.inventory = new_inv
-
-    #         # update avg entry price ONLY if position exists
-    #         if new_inv != 0:
-    #             self.avg_entry_price = (
-    #                 old_avg * old_inv - price * qty
-    #             ) / new_inv
-    #         else:
-    #             self.avg_entry_price = 0.0
-
-    def on_fill(self, price, qty, side, liquidity="maker"):
-        """
-        side: "BUY" or "SELL"
-        price: execution price
-        qty: executed quantity
-        """
-
-        old_inv = self.inventory
-        old_avg = self.avg_entry_price
+    def on_fill(self, price, qty, side):
 
         fill_value = price * qty
 
-        fee_rate = self.maker_fee_rate if liquidity == "maker" else self.taker_fee_rate # fee rate
+        # -------------------------
+        # Snapshot old state FIRST
+        # -------------------------
+        old_inv = self.inventory
+        old_avg = self.avg_entry_price
 
-        fee = fill_value * fee_rate
-
-        self.fees_paid += fee
-
-        # -----------------------------
-        # BUY FLOW
-        # -----------------------------
+        # -------------------------
+        # BUY: you gain inventory
+        # -------------------------
         if side == "BUY":
 
-            # 1. If we are SHORT → close short first
+            new_inv = old_inv + qty
+
+            # If you were short → realize PnL
             if old_inv < 0:
-                close_qty = min(qty, abs(old_inv))
+                closed_qty = min(qty, abs(old_inv))
+                self.realized_pnl += closed_qty * (old_avg - price)
 
-                # realized PnL from short
-                self.realized_pnl += close_qty * (old_avg - price)
+            # update cash
+            self.cash -= fill_value
 
-                old_inv += close_qty
-                qty -= close_qty
+            # update inventory
+            self.inventory = new_inv
 
-            self.inventory = old_inv
+            # update avg entry price ONLY if position exists
+            if new_inv != 0:
+                self.avg_entry_price = (
+                    old_avg * old_inv + price * qty
+                ) / new_inv
+            else:
+                self.avg_entry_price = 0.0
 
-            # 2. Remaining BUY opens/increases LONG
-            if qty > 0:
-                new_inv = old_inv + qty
-
-                if old_inv > 0:
-                    # averaging long
-                    self.avg_entry_price = (
-                        old_avg * old_inv + price * qty
-                    ) / new_inv
-                else:
-                    # fresh long
-                    self.avg_entry_price = price
-
-                self.inventory = new_inv
-
-            # cash always decreases on buy
-            # self.cash -= fill_value
-            self.cash -= (fill_value + fee) # maker/taker fees
-
-        # -----------------------------
-        # SELL FLOW
-        # -----------------------------
+        # -------------------------
+        # SELL: you reduce inventory / go short
+        # -------------------------
         else:
 
-            # 1. If we are LONG → close long first
+            new_inv = old_inv - qty
+
+            # If you were long → realize PnL
             if old_inv > 0:
-                close_qty = min(qty, old_inv)
+                closed_qty = min(qty, old_inv)
+                self.realized_pnl += closed_qty * (price - old_avg)
 
-                # realized PnL from long
-                self.realized_pnl += close_qty * (price - old_avg)
+            # update cash
+            self.cash += fill_value
 
-                old_inv -= close_qty
-                qty -= close_qty
+            # update inventory
+            self.inventory = new_inv
 
-            self.inventory = old_inv
-
-            # 2. Remaining SELL opens/increases SHORT
-            if qty > 0:
-                new_inv = old_inv - qty
-
-                if old_inv < 0:
-                    # averaging short
-                    self.avg_entry_price = (
-                        old_avg * abs(old_inv) + price * qty
-                    ) / abs(new_inv)
-                else:
-                    # fresh short
-                    self.avg_entry_price = price
-
-                self.inventory = new_inv
-
-            # cash always increases on sell
-            # self.cash += fill_value
-            self.cash += (fill_value - fee) # maker/taker fees
-
-        # -----------------------------
-        # RESET avg price if flat
-        # -----------------------------
-        if self.inventory == 0:
-            self.avg_entry_price = 0.0
+            # update avg entry price ONLY if position exists
+            if new_inv != 0:
+                self.avg_entry_price = (
+                    old_avg * old_inv - price * qty
+                ) / new_inv
+            else:
+                self.avg_entry_price = 0.0
 
     def get_unrealized_pnl(self, mid):
         return self.inventory * (mid - self.avg_entry_price)
@@ -2733,6 +2588,61 @@ class State:
                     + depletion
                 )
 
+    # def update_queue_from_depth(self, bids, asks):
+
+    #     # Tracks the size reduction, it is a positive number
+
+    #     # -------------------------
+    #     # BIDS
+    #     # ------------------------- 
+
+    ##     ts = self.last_depth_ts 
+
+    #     for p, q in bids: # IMPLEMENT STALE DELETE FUNCTION
+
+    #         tick = self.config.to_tick(float(p))
+
+    #         old = self.market_book.bids.get(tick, 0.0)
+    #         new = float(q)
+
+    #         if old > 0:
+    #             depletion = max(0.0, old - new) # simple assumption: any size reduction is due to queue depletion
+
+    #             entry = self.queue_flow["bids"].get(tick, {"volume": 0.0, "last_ts": ts})
+
+    #             dt = max((ts - entry["last_ts"]) / 1000.0, 1e-3) # in 1s, “how long has it been since THIS price level last changed, measured at the current depth event time”
+
+    #             entry["volume"] += depletion
+    #             entry["rate"] = entry["volume"] / dt
+    #             entry["last_ts"] = ts
+
+    #             self.queue_flow["bids"][tick] = entry
+
+    #     # -------------------------
+    #     # ASKS
+    #     # -------------------------
+
+    #     for p, q in asks:
+
+    #         tick = self.config.to_tick(float(p))
+
+    #         old = self.market_book.asks.get(tick, 0.0)
+    #         new = float(q)
+
+    #         if old > 0:
+    #             depletion = max(0.0, old - new) # simple assumption: any size reduction is due to queue depletion
+
+    #             entry = self.queue_flow["asks"].get(tick, {"volume": 0.0, "last_ts": ts})
+
+    #             dt = max((ts - entry["last_ts"]) / 1000.0, 1e-3)
+
+    #             entry["volume"] += depletion
+    #             entry["rate"] = entry["volume"] / dt
+    #             entry["last_ts"] = ts
+
+    #             self.queue_flow["asks"][tick] = entry
+
+
     def update_market_feature_state(self):
 
         mfs = self.market_feature_state
@@ -2792,21 +2702,30 @@ class State:
         return regime
 
     def update_ml_realization(self):
-
         mfs = self.market_feature_state
 
-        now = self.config.now_ms()
+        new_realizations = []
 
-        while mfs.ml_predictions and now - mfs.ml_predictions[0]["ts"] >= mfs.ml_horizon_ms:
-            
-            entry = mfs.ml_predictions.popleft()
+        for entry in mfs.ml_predictions:
 
-            realized = np.log(self.last_mid / entry["reservation"])
+            if "realized" in entry:
+                continue
 
-            mfs.ml_signal_log.append({
-                "pred": entry["pred"],
-                "realized": realized
-            })
+            # check if horizon passed (simple version: time-based or index-based)
+            if self.config.now_ms() - entry["ts"] >= self.ml_horizon_ms:
+
+                realized = np.log(
+                    self.last_mid / entry["reservation"]
+                )
+
+                new_realizations.append({
+                    "pred": entry["pred"],
+                    "realized": realized
+                })
+
+                entry["realized"] = True
+
+        mfs.ml_signal_log.extend(new_realizations)
 
     def update_performance(self):
 
@@ -2841,15 +2760,15 @@ class State:
         returns = returns[np.isfinite(returns)]
 
         if len(returns) < 30:
-            print('SHARPE - len(returns) < 30:', np.nan)
+            print('SHARPE - len(returns) < 30:', 0.0)
 
-            return np.nan
+            return 0.0
 
         std = np.std(returns)
         if std == 0 or np.isnan(std):
-            print('SHARPE - std == 0 / isnan(std):', np.nan)
+            print('SHARPE - std == 0 / isnan(std):', 0.0)
 
-            return np.nan
+            return 0.0
 
         sharpe_ratio = np.mean(returns) / np.std(returns) + 1e-9
         
@@ -3095,7 +3014,7 @@ class ReplayFeed:
         
         self.state.last_trade = trade
 
-        # store latest exchange timestamp globally
+        # ✅ store latest exchange timestamp globally
         self.state.last_trade_ts = trade["timestamp"]
 
         # send to engine execution layer
@@ -3195,11 +3114,11 @@ class TradingSystem:
         self.strategy = MarketMakingStrategy(config=self.config, params=params)
 
         # Market State
-        self.state = State(config=self.config, params=params)
-        self.state.market_feature_state.ml_horizon_ms = self.strategy.edge_model.horizon_ms if self.strategy.edge_model is not None else 0.0 # for ML signal horizon
+        self.state = State(config=self.config)
+        self.state.ml_horizon_ms = self.strategy.edge_model.horizon_ms if self.strategy.edge_model is not None else 0.0 # for ML signal horizon
 
         # Data Recording Layer
-        self.recorder = DatasetRecorder(config=self.config, state=self.state, params=params)
+        self.recorder = DatasetRecorder(config=self.config, params=params)
 
         # Execution Layer
         self.execution = Execution(
@@ -3240,16 +3159,11 @@ class TradingSystem:
         )
 
         # Runtime Control
-        # self.running = False
-        self.engine_running = False
-        self.dashboard_running = False
+        self.running = False
         self.threads = []
 
     def start(self):
-        # self.running = True
-
-        self.engine_running = True
-        self.dashboard_running = True
+        self.running = True
         
         self.react_dashboard.start()
 
@@ -3264,8 +3178,7 @@ class TradingSystem:
     def start_execution_loop(self): # EVENT DRIVEN
 
         def exec_loop():
-            # while self.running:
-            while self.engine_running:
+            while self.running:
                 try:
                     signal = self.signal_queue.get(timeout=0.1)
 
@@ -3280,25 +3193,23 @@ class TradingSystem:
 
         t = threading.Thread(target=exec_loop, daemon=True)
         t.start()
-        self.threads.append(t)
 
     def start_rich_dashboard_loop(self):
 
         def rich_loop():
-            # while self.running:
-            while self.dashboard_running:
+            while self.running:
                 self.engine.update_dashboard()
                 time.sleep(0.02) # 50Hz dashboard refresh
 
         t = threading.Thread(target=rich_loop,daemon=True)
         t.start()
+
         self.threads.append(t)
 
     def start_react_dashboard_loop(self):
 
         def react_loop():
-            # while self.running:
-            while self.dashboard_running:
+            while self.running:
                 snapshot = self.engine.build_snapshot()
 
                 self.react_dashboard.publish({
@@ -3315,8 +3226,7 @@ class TradingSystem:
     def run_forever(self):
 
         try:
-            # while self.running:
-            while self.engine_running:
+            while self.running:
                 time.sleep(1)
 
         except KeyboardInterrupt: # lets you stop with CTRL+C (standard in HFT backtests too)
@@ -3328,39 +3238,33 @@ class TradingSystem:
     def shutdown(self):
 
         # 1. stop feed
-        # self.running = False
-
-        self.engine_running = False
-
+        self.running = False
         self.feed.stop()
 
-        # # 2. stop signal flow
-        # self.signal_queue = queue.Queue()
+        # 2. stop signal flow
+        self.signal_queue = queue.Queue()
 
         # 3. cancel all orders
         print("CLOSING OPEN POSITIONS")
-        print("")
         self.execution._cancel_side("BUY")
         self.execution._cancel_side("SELL")
 
-        # 4. wait for fill completion
+        # 5. wait for fill completion
         while self.execution.open_orders:
             time.sleep(0.05)
 
-        # 5. flatten inventory
+        # 4. flatten inventory
         self.execution.place_market()
-        print("")
-
-        # IMPORTANT: allow fills to settle
-        while abs(self.state.inventory) > 1e-9: 
-            time.sleep(0.05)
-
-        self.dashboard_running = False
 
         for t in self.threads:
             t.join(timeout=1)
 
         # 6. final stats
+        print("PNL:", self.state.get_pnl())
+        self.state.update_performance()
+        self.state.compute_sharpe()
+
+        # 7. persist
         self.recorder.export_run()
 
 def load_manifest(path):
@@ -3368,11 +3272,8 @@ def load_manifest(path):
         return json.load(f)
     
 if __name__ == "__main__":
-    # params = load_manifest(r"data\manifest_live.json")
+    params = load_manifest(r"data\manifest_live.json")
     # params = load_manifest(r"data\runs\run_20260601_122340\manifest_replay.json")
-    path = input("Enter manifest path: ").strip('"').strip("'")
-    params = load_manifest(path)
-    # params = load_manifest(r"data\runs\run_20260606_031617\manifest_replay_mid_microsignal_fees.json")
     
     system = TradingSystem(params=params)
     

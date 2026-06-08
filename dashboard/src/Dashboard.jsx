@@ -217,8 +217,8 @@ export default function Dashboard() {
           />
 
           <Row
-            label="Fill Candidates"
-            value={e.fill_candidates}
+            label="Last Fill Candidate"
+            value={e.last_fill_candidate}
           />
 
           <Row
