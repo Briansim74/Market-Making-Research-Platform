@@ -1,7 +1,7 @@
 # Market-Making-Research-Platform
 Research framework for market making as a coupled system of alpha, execution, inventory, and regime-dependent liquidity provision.
 
-Built for deterministic replay, event-level simulation, and execution-aware signal evaluation.
+Built for live L2 market data, deterministic replay, and execution-aware signal evaluation.
 
 ## Core Insight
 Market making is not a forecasting problem.
@@ -160,7 +160,6 @@ Reservation price adjusts based on:
 - inventory level
 - volatility
 - regime
-- signal strength
 
 Objective:
 - balance spread capture vs directional exposure under changing conditions.
