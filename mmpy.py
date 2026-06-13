@@ -2,12 +2,15 @@ import os
 import time
 import json
 import math
+import uuid
+import hmac
 import heapq
 import queue
 import random
 import joblib
 import asyncio
 import uvicorn
+import hashlib
 import requests
 import threading
 import websocket
@@ -17,6 +20,7 @@ import pandas as pd
 import xgboost as xgb
 from typing import Set
 from scipy.stats import spearmanr
+from urllib.parse import urlencode
 from fastapi import FastAPI, WebSocket
 from datetime import datetime, timezone
 from sortedcontainers import SortedDict
@@ -34,14 +38,37 @@ from rich.panel import Panel
 
 class MarketConfig:
     def __init__(self, params):
-        self.tick_size = params["tick_size"]
+        self.load_filters(params)
+    
+    def load_filters(self, params):
+        if params["exchange"] == "binance_spot":
+            self.tick_size = params["tick_size"]
+            self.step_size = params["step_size"]
+            print('Tick_size:', self.tick_size)
+            print('Step_size:', self.step_size)
+            return
+        
+        url = f"{params["api"]["base_url"]}/fapi/v1/exchangeInfo"
+        r = requests.get(url, params={"symbol": params["instrument"].upper()})
+        data = r.json()
+
+        filters = data["symbols"][0]["filters"]
+
+        for f in filters:
+            if f["filterType"] == "PRICE_FILTER":
+                self.tick_size = float(f["tickSize"])
+                print('Tick_size:', self.tick_size)
+
+            if f["filterType"] == "LOT_SIZE":
+                self.step_size = float(f["stepSize"])
+                print('Step_size:', self.step_size)
 
     def to_tick(self, price):
         return int(round(price / self.tick_size))
 
     def from_tick(self, tick):
         return tick * self.tick_size
-
+    
     def round_price(self, price):
         return round(price / self.tick_size) * self.tick_size
     
@@ -52,7 +79,6 @@ class MarketConfig:
         return int(ts * 1000)
     
     def format_ms(self, ts_ms):
-
         return time.strftime(
             "%Y-%m-%d %H:%M:%S",
             time.localtime(ts_ms / 1000)
@@ -67,12 +93,13 @@ class MarketConfig:
 
 # Market Data Layer
 class OrderBook:
-    def __init__(self, config):
+    def __init__(self, config, params):
         self.config = config
+        self.params = params
         self.bids = SortedDict()
         self.asks = SortedDict()
         self.last_update_id = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
     def best_bid(self):
         with self.lock:
@@ -87,11 +114,18 @@ class OrderBook:
             return self.asks.peekitem(0)
     
     def initialize_from_binance(self, symbol, limit):
+        
+        if self.params["exchange"] == "binance_spot":
+            url = (
+                f"https://api.binance.com/api/v3/depth" # spot
+                f"?symbol={symbol}&limit={limit}"
+            )
 
-        url = (
-            f"https://api.binance.com/api/v3/depth"
-            f"?symbol={symbol}&limit={limit}"
-        )
+        elif self.params["exchange"] == "binance_futures":
+            url = (
+                f"https://testnet.binancefuture.com/fapi/v1/depth" # testnet futures
+                f"?symbol={symbol}&limit={limit}"
+            )
 
         snapshot = requests.get(url).json()
 
@@ -135,7 +169,7 @@ class OrderBook:
 
         return self.last_update_id, snapshot
 
-    def apply_delta(self, bids, asks, state=None): # Apply deltas to the order book, removing levels with zero quantity and adding/updating levels with non-zero quantity
+    def apply_delta(self, bids, asks): # Apply deltas to the order book, removing levels with zero quantity and adding/updating levels with non-zero quantity
         with self.lock:
             for p, q in bids:
                 p = self.config.to_tick(float(p))
@@ -165,9 +199,9 @@ class OrderBook:
             ask_tick, _ = self.asks.peekitem(0)
 
             return self.config.from_tick((bid_tick + ask_tick) / 2)
-        
+
 # Feed Layer
-class BinanceFeed:
+class BinanceSpotFeed:
     def __init__(self, state, on_market_data, on_trade_event, logger, params):
         self.state = state
         self.instrument = params["instrument"]
@@ -185,20 +219,23 @@ class BinanceFeed:
         self.trade_thread = None
 
         self.running = False
-        self.depth_buffer = deque()
+        self.depth_buffer = []
         self.buffering = True
-        self.sync_done = False
+
+        self.buffer_lock = threading.Lock()
+        self.first_depth_event = threading.Event()
 
     def start(self):
 
         self.running = True
         self.buffering = True
-        self.sync_done = False
 
-        # use LIST during buffering
         self.depth_buffer = []
+        self.buffer_lock = threading.Lock()
 
-        # depth_socket = f"wss://stream.binance.com:9443/ws/{self.instrument}@depth" #1000ms
+        # -------------------------
+        # 1. START WEBSOCKETS FIRST (important)
+        # -------------------------
         depth_socket = f"wss://stream.binance.com:9443/ws/{self.instrument}@depth@100ms" #100ms
         trade_socket = f"wss://stream.binance.com:9443/ws/{self.instrument}@trade"
 
@@ -212,9 +249,6 @@ class BinanceFeed:
             on_message=self._on_trade_message
         )
 
-        # -------------------------
-        # START SOCKETS
-        # -------------------------
         self.depth_thread = threading.Thread(
             target=self.depth_socket.run_forever,
             daemon=True
@@ -230,91 +264,75 @@ class BinanceFeed:
 
         print("SOCKETS STARTED")
 
-        # give websocket time to buffer events
-        time.sleep(1.0)
+        # wait until websocket is alive
+        self.first_depth_event.wait(timeout=5)
 
         # -------------------------
-        # FETCH SNAPSHOT
+        # TAKE SNAPSHOT
         # -------------------------
-
-        last_update_id, snapshot = self.state.market_book.initialize_from_binance(
+        snapshot_id, snapshot = self.state.market_book.initialize_from_binance(
             self.instrument.upper(),
             1000
         )
 
         self.log_orderbook_snapshot(snapshot)
 
-        print("SNAPSHOT FETCHED:", last_update_id)
+        # -------------------------
+        # WAIT FOR STREAM ALIGNMENT (YOUR GATE FIX)
+        # -------------------------
+        valid = False
+
+        for _ in range(500):  # max ~5s
+            with self.buffer_lock:
+                if any(m["u"] > snapshot_id for m in self.depth_buffer):
+                    valid = True
+                    break
+            time.sleep(0.01)
+
+        if not valid:
+            raise RuntimeError("Stream not aligned (no post-snapshot events)")
+        
+        # -------------------------
+        # COPY BUFFER SAFELY
+        # -------------------------
+        with self.buffer_lock:
+            buffered = list(self.depth_buffer)
+
+        buffered.sort(key=lambda x: x["U"])
 
         # -------------------------
-        # SORT BUFFER
+        # FILTER ONLY VALID EVENTS
         # -------------------------
-        self.depth_buffer.sort(key=lambda x: x["U"])
+        aligned = [m for m in buffered if m["u"] > snapshot_id]
 
-        synced = False
+        if not aligned:
+            raise RuntimeError("No usable post-snapshot events after alignment")
 
         # -------------------------
-        # PROCESS BUFFER
+        # APPLY REPLAY
         # -------------------------
-        for msg in self.depth_buffer:
-
+        for msg in aligned:
             U = msg["U"]
             u = msg["u"]
 
-            print("BUFFER", U, u, last_update_id)
-
-            # discard old events
-            if u < last_update_id:
-                continue
-
-            # -------------------------
-            # FIRST BRIDGE EVENT
-            # -------------------------
-            if not synced:
-
-                if U <= last_update_id <= u:
-
-                    bids, asks = self._parse_book(msg)
-
-                    self.state.market_book.apply_delta(bids, asks, self.state)
-
-                    self.state.market_book.last_update_id = u
-
-                    self.state.update_vol()
-
-                    synced = True
-
-                    print("BOOK SYNCHRONIZED")
-
-                continue
-
-            # -------------------------
-            # CONTINUITY CHECK
-            # -------------------------
-            expected = self.state.market_book.last_update_id + 1
-
-            if U != expected:
-
-                raise RuntimeError(
-                    f"ORDER BOOK GAP DETECTED "
-                    f"expected={expected} got={U}"
-                )
+            print('BUFFER U:', U, 'u:', u, 'snapshot_id:', snapshot_id)
 
             bids, asks = self._parse_book(msg)
 
-            self.state.market_book.apply_delta(bids, asks, self.state)
+            self.state.market_book.apply_delta(bids, asks)
 
             self.state.market_book.last_update_id = u
 
             self.state.update_vol()
 
-        if not synced:
-            raise RuntimeError("FAILED TO SYNCHRONIZE BOOK")
+        print("BOOK SYNCHRONIZED")
 
         # -------------------------
         # LIVE MODE
         # -------------------------
-        self.buffering = False
+        with self.buffer_lock:
+            self.buffering = False
+
         self.state.initialized = True
 
         print("LIVE BOOK RUNNING")
@@ -359,65 +377,63 @@ class BinanceFeed:
         book = state.market_book
 
         U = message["U"]
-        u = message["u"]
+        u = message["u"] # spot, we use U (1st event) and u (last event)
         last_id = book.last_update_id
 
-        # -----------------------------
-        # 1. FIRST VALIDATION (CRITICAL)
-        # -----------------------------
-        if last_id is None:
-            return  # must wait for snapshot initialization
-
-        # drop outdated updates
         if u <= last_id:
             return
 
         # gap detected → must resync
-        if U > last_id + 1:
-            print("GAP DETECTED — RESYNC REQUIRED")
+        if U > last_id + 1: # we use U = previous message u + 1, since spot doesnt have futures pu
+            print(
+                "GAP DETECTED",
+                "expected", last_id + 1,
+                "got", U
+                )
             state.initialized = False
             return
+    
+        with book.lock:
+            # -----------------------------
+            # APPLY DELTA
+            # -----------------------------
 
-        # -----------------------------
-        # 2. APPLY DELTA
-        # -----------------------------
+            bids, asks = self._parse_book(message)
 
-        bids, asks = self._parse_book(message)
+            self.state.update_queue_from_depth(
+                bids=bids,
+                asks=asks
+            )
 
-        self.state.update_queue_from_depth(
-            bids=bids,
-            asks=asks
-        )
+            book.apply_delta(bids, asks)
 
-        book.apply_delta(bids, asks, self.state)
+            book.last_update_id = u
 
-        book.last_update_id = u
+            # -----------------------------
+            # VOL UPDATE
+            # -----------------------------
+            state.update_vol()
 
-        # -----------------------------
-        # 3. VOL UPDATE
-        # -----------------------------
-        state.update_market_feature_state() # regime update
+            state.compute_order_imbalance()
 
-        state.update_vol()
+            state.update_market_feature_state() # regime update
 
-        state.compute_order_imbalance()
+            state.update_ml_realization() # compute ml signal quality
 
-        state.update_ml_realization() # compute ml signal quality
+            state.update_performance()
 
-        # -----------------------------
-        # 4. INITIALIZATION FIX (SEE BELOW)
-        # -----------------------------
-        if not state.initialized:
-            return
-
-        # -----------------------------
-        # 5. STRATEGY CALL
-        # -----------------------------
+        # -------------------------
+        # STRATEGY ONLY AFTER INIT
+        # -------------------------
         if state.initialized:
             self.on_market_data()
 
     def _on_depth_message(self, ws, message):
+        
         msg = json.loads(message)
+
+        # signal FIRST message received, for initial start
+        self.first_depth_event.set()
 
         # -------------------------
         # RAW LOGGING (BEST PLACE)
@@ -431,15 +447,316 @@ class BinanceFeed:
         # -------------------------
         # BUFFER DURING INIT
         # -------------------------
-
         if self.buffering:
-            self.depth_buffer.append(msg)
+            with self.buffer_lock: # add lock 
+                self.depth_buffer.append(msg)
             return
 
         # -------------------------
         # LIVE PROCESSING
         # -------------------------
+        self.state.last_depth_ts = msg["E"]
 
+        self._on_depth(msg)
+
+    # -------------------------
+    # TRADE EVENT
+    # -------------------------
+
+    def _parse_trade(self, message):
+
+        return {
+            "side": "SELL" if message["m"] else "BUY", # message["m"] is a boolean flag called “isBuyerMaker”, if true, SELLER is aggressive taker, if false, BUYER is aggressive taker
+            "price": float(message["p"]),
+            "qty": float(message["q"]),
+            "timestamp": message["T"]
+        }
+
+    def _on_trade_message(self, ws, message):
+        if not self.running:
+            return
+        
+        msg = json.loads(message)
+
+        # -------------------------
+        # RAW LOGGING (BEST PLACE)
+        # -------------------------
+        self.log_event({
+            "type": "trade",
+            "ts": msg["T"],
+            "message": message
+        })
+
+        trade = self._parse_trade(msg)
+        
+        self.state.last_trade = trade
+
+        # store latest exchange timestamp globally
+        self.state.last_trade_ts = trade["timestamp"]
+
+        # send to engine execution layer
+        self.on_trade_event(trade)
+
+
+class BinanceFuturesFeed:
+    def __init__(self, state, on_market_data, on_trade_event, logger, params):
+        self.state = state
+        self.instrument = params["instrument"]
+
+        self.on_market_data = on_market_data
+        self.on_trade_event = on_trade_event
+
+        self.log_event = logger["log_event"]
+        self.log_orderbook_snapshot = logger["log_orderbook_snapshot"]
+
+        self.depth_socket = None
+        self.trade_socket = None
+
+        self.depth_thread = None
+        self.trade_thread = None
+
+        self.running = False
+        self.depth_buffer = []
+        self.buffering = True
+
+        self.buffer_lock = threading.Lock()
+        self.first_depth_event = threading.Event()
+
+    # -------------------------
+    # START
+    # -------------------------
+    def start(self):
+
+        self.running = True
+        self.buffering = True
+
+        self.depth_buffer = []
+        self.buffer_lock = threading.Lock()
+
+        # -------------------------
+        # 1. START WEBSOCKETS FIRST (important)
+        # -------------------------
+        # depth_socket = f"wss://fstream.binance.com/ws/{self.instrument}@depth@100ms" # mainnet
+        # trade_socket = f"wss://fstream.binance.com/ws/{self.instrument}@trade"
+
+        depth_socket = f"wss://stream.binancefuture.com/ws/{self.instrument}@depth@100ms" # testnet
+        trade_socket = f"wss://stream.binancefuture.com/ws/{self.instrument}@trade"
+
+        self.depth_socket = websocket.WebSocketApp(
+            depth_socket,
+            on_message=self._on_depth_message
+        )
+
+        self.trade_socket = websocket.WebSocketApp(
+            trade_socket,
+            on_message=self._on_trade_message
+        )
+
+        self.depth_thread = threading.Thread(
+            target=self.depth_socket.run_forever,
+            daemon=True
+        )
+
+        self.trade_thread = threading.Thread(
+            target=self.trade_socket.run_forever,
+            daemon=True
+        )
+
+        self.depth_thread.start()
+        self.trade_thread.start()
+
+        print("SOCKETS STARTED")
+
+        # wait until WS is alive
+        self.first_depth_event.wait(timeout=5)
+
+        # -------------------------
+        # TAKE SNAPSHOT
+        # -------------------------
+        snapshot_id, snapshot = self.state.market_book.initialize_from_binance(
+            self.instrument.upper(),
+            1000
+        )
+
+        self.log_orderbook_snapshot(snapshot)
+
+        # -------------------------
+        # WAIT FOR STREAM ALIGNMENT (YOUR GATE FIX)
+        # -------------------------
+        valid = False
+
+        for _ in range(500):  # max ~5s
+            with self.buffer_lock:
+                if any(m["u"] > snapshot_id for m in self.depth_buffer):
+                    valid = True
+                    break
+            time.sleep(0.01)
+
+        if not valid:
+            raise RuntimeError("Stream not aligned (no post-snapshot events)")
+
+        # -------------------------
+        # COPY BUFFER SAFELY
+        # -------------------------
+        with self.buffer_lock:
+            buffered = list(self.depth_buffer)
+
+        buffered.sort(key=lambda x: x["U"])
+        
+        # -------------------------
+        # FILTER ONLY VALID EVENTS
+        # -------------------------
+        aligned = [m for m in buffered if m["u"] > snapshot_id]
+
+        if not aligned:
+            raise RuntimeError("No usable post-snapshot events after alignment")
+
+        # -------------------------
+        # APPLY REPLAY
+        # -------------------------
+        for msg in aligned:
+            U = msg["U"]
+            u = msg["u"]
+
+            print('BUFFER U:', U, 'u:', u, 'snapshot_id:', snapshot_id)
+
+            bids, asks = self._parse_book(msg)
+
+            self.state.market_book.apply_delta(bids, asks)
+
+            self.state.market_book.last_update_id = u # update last order ID for on_depth syncing
+
+            self.state.update_vol()
+
+        print("BOOK SYNCHRONIZED")
+
+        # -------------------------
+        # LIVE MODE
+        # -------------------------
+        with self.buffer_lock:
+            self.buffering = False
+
+        self.state.initialized = True
+
+        print("LIVE BOOK RUNNING")
+
+    def stop(self):
+
+        print("STOPPING BINANCE FEED")
+
+        self.running = False
+
+        try:
+            if self.depth_socket:
+                self.depth_socket.close()
+
+            if self.trade_socket:
+                self.trade_socket.close()
+
+        except Exception as e:
+            print("Socket close error:", e)
+
+        if self.depth_thread:
+            self.depth_thread.join(timeout=2)
+
+        if self.trade_thread:
+            self.trade_thread.join(timeout=2)
+
+        print("BINANCE FEED STOPPED")
+
+    # -------------------------
+    # DEPTH EVENT
+    # -------------------------
+
+    def _parse_book(self, message):
+        bids = [(float(p), float(q)) for p, q in message.get("b", [])]
+        asks = [(float(p), float(q)) for p, q in message.get("a", [])]
+
+        return bids, asks
+
+    def _on_depth(self, message):
+        
+        state = self.state
+        book = self.state.market_book
+
+        u = message["u"]
+        pu = message["pu"] # futures, we use pu (prev last event) and u (last event)
+        last_id = book.last_update_id
+
+        if u <= last_id:
+            return
+
+        if pu != last_id:
+            print(
+                "GAP DETECTED",
+                "expected", last_id,
+                "got", pu
+                )
+            self.state.initialized = False
+            return
+
+        with book.lock:
+            # -------------------------
+            # APPLY DELTA
+            # -------------------------
+
+            bids, asks = self._parse_book(message)
+
+            self.state.update_queue_from_depth(
+                bids=bids,
+                asks=asks
+            )
+
+            book.apply_delta(bids, asks)
+
+            book.last_update_id = u
+
+            # -----------------------------
+            # VOL UPDATE
+            # -----------------------------
+            state.update_vol()
+
+            state.compute_order_imbalance()
+
+            state.update_market_feature_state() # regime update
+
+            state.update_ml_realization() # compute ml signal quality
+
+            state.update_performance()
+
+        # -------------------------
+        # STRATEGY ONLY AFTER INIT
+        # -------------------------
+        if state.initialized:
+            self.on_market_data()
+
+    def _on_depth_message(self, ws, message):
+
+        msg = json.loads(message)
+
+        # signal FIRST message received, for initial start
+        self.first_depth_event.set()
+
+        # -------------------------
+        # RAW LOGGING (BEST PLACE)
+        # -------------------------
+        self.log_event({
+            "type": "depth",
+            "ts": msg["E"],
+            "message": message
+        })
+
+        # -------------------------
+        # BUFFER DURING INIT
+        # -------------------------
+        if self.buffering:
+            with self.buffer_lock: # add lock 
+                self.depth_buffer.append(msg)
+            return
+
+        # -------------------------
+        # LIVE PROCESSING
+        # -------------------------
         self.state.last_depth_ts = msg["E"]
 
         self._on_depth(msg)
@@ -536,18 +853,7 @@ class MLModel:
         for i, k in enumerate(self.feature_cols):
             X[0, i] = features[k]
 
-        # X = np.array(
-        #     [[features[k] for k in self.feature_cols]],
-        #     dtype=np.float32
-        # )
-
         return float(self.model.predict(X)[0]) # json reads float, not np.float32
-
-    # def predict(self, features):
-
-    #     X = [features[k] for k in self.feature_cols]
-
-    #     return self.model.predict([X])[0] # Important: XGBoost expects 2D input.
 
 class MarketMakingStrategy:
     def __init__(self, config, params):
@@ -621,7 +927,7 @@ class MarketMakingStrategy:
 
         sigma = features["volatility"]
 
-        base = 0.03
+        base = 0.03 # keep base spread 0.03, since testnet futures have unusually wide spread
         vol_component = 3 * sigma
 
         raw_spread = max(base, vol_component)
@@ -893,7 +1199,7 @@ class MarketMakingStrategy:
     # -------------------------
     
     def generate_quotes(self, state): ############## Fair Value Anchoring (not market anchoring)
-
+        
         book = state.market_book
 
         bid_tick, bid_size = book.best_bid()
@@ -995,10 +1301,10 @@ class MarketMakingStrategy:
             # policy
             "regime": policy["regime"],
             "regime_id": policy["regime_id"],
-            "regime_prob": policy["regime_prob"],  # optional if your model outputs probabilities
+            "regime_prob": policy["regime_prob"],
             "alpha_order_imb": policy["alpha_order_imb"],
             "alpha_trade_imb": policy["alpha_trade_imb"],
-            "alpha_struct": policy["alpha_struct"], # policy["alpha"] # to check how to get last_signal since we dont use this anymore
+            "alpha_struct": policy["alpha_struct"],
             "k0": policy["k0"],
             "spread_multiplier": policy["spread_multiplier"],
             "inventory_target": policy["inventory_target"],
@@ -1410,64 +1716,6 @@ class DatasetRecorder:
             # microstructure
             "queue_ahead_at_join": order.metadata["queue_ahead_at_join"],
     })
-        
-    # "ts": ts,
-    #         "symbol": symbol,
-
-    #         # market
-    #         "best_bid": signal["best_bid"],
-    #         "best_ask": signal["best_ask"],
-    #         "mid": signal["mid"],
-    #         "microprice": signal["microprice"],
-            
-    #         "best_bid_tick": self.config.to_tick(signal["best_bid"]),
-    #         "best_ask_tick": self.config.to_tick(signal["best_ask"]),
-    #         "mid_tick": self.config.to_tick(signal["mid"]),
-
-    #         "spread": signal["best_ask"] - signal["best_bid"],
-
-    #         # microstructure
-    #         "order_imbalance": signal["order_imbalance"],
-    #         "trade_imbalance": signal["trade_imbalance"],
-    #         "volatility": signal["volatility"],
-    #         "queue_ahead_bid": signal["queue_ahead_bid"],
-    #         "queue_ahead_ask": signal["queue_ahead_ask"],
-
-    #         # risk
-    #         "inventory": signal["inventory"],
-    #         "realized_pnl": signal["realized_pnl"],
-    #         "unrealized_pnl": signal["unrealized_pnl"],
-    #         "total_pnl": signal["total_pnl"],
-    #         "equity": signal["equity"],
-
-    #         # model internals
-    #         "fair": signal["fair"],
-    #         "skew": signal["skew"],
-    #         "reservation": signal["reservation"],
-    #         "alpha_order_imb": signal["alpha_order_imb"],
-    #         "alpha_trade_imb": signal["alpha_trade_imb"],
-    #         "alpha_struct": signal["alpha_struct"],
-
-    #         # action
-    #         "my_bid": signal["my_bid"],
-    #         "my_ask": signal["my_ask"],
-
-    #         "my_bid_tick": self.config.to_tick(signal["my_bid"]),
-    #         "my_ask_tick": self.config.to_tick(signal["my_ask"]),
-
-    #         # execution geometry
-    #         # aggressiveness vs touch
-    #         "bid_distance_touch": signal["my_bid"] - signal["best_bid"],
-    #         "ask_distance_touch": signal["my_ask"] - signal["best_ask"],
-
-    #         # position inside spread
-    #         "bid_distance_spread": signal["my_bid"] - signal["best_ask"],
-    #         "ask_distance_spread": signal["my_ask"] - signal["best_bid"],
-
-    #         # quote churn
-    #         "bid_delta": signal["bid_delta"],
-    #         "ask_delta": signal["ask_delta"],
-    #         "quote_churn": signal["quote_churn"],
 
     def create_run_dir(self, base="data/runs"):
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1507,8 +1755,8 @@ class DatasetRecorder:
         manifest["performance"]["pnl"] = round(self.state.get_pnl(), 4)
         manifest["performance"]["sharpe"] = round(self.state.compute_sharpe(), 4)
         manifest["performance"]["fees_paid"] = round(self.state.fees_paid, 4)
-        manifest["performance"]["fees_per_fill"] = round(self.state.fees_paid / len(self.fills), 4)
-        manifest["performance"]["pnl_per_fill"] = round(self.state.get_pnl() / len(self.fills), 4)
+        manifest["performance"]["fees_per_fill"] = round(self.state.fees_paid / (len(self.fills)+ 1e-9), 4)
+        manifest["performance"]["pnl_per_fill"] = round(self.state.get_pnl() / (len(self.fills) + 1e-9), 4)
 
         # 3. write manifest
         with open(manifest_path, "w") as f:
@@ -1517,53 +1765,694 @@ class DatasetRecorder:
         print("DATASETS SAVED SUCCESSFULLY")
         print(f"Saved run → {run_path}")
 
-# Execution Layer
-class Order:
 
-    def __init__(self, order_id, side, price, qty, ts, owner, signal, queue_ahead_at_join):
-        self.order_id = order_id
-        self.side = side
-        self.price = price
-        self.qty = qty
-        self.remaining = qty
-        self.status = "LIVE"
-        self.timestamp = ts
-        self.owner = owner
-        self.metadata = { # used for toxicity ML training
-            "signal": signal,
-            "queue_ahead_at_join": queue_ahead_at_join
+# 1. Binance Broker (REAL API layer) 100–2000ms variable
+class BinanceBroker:
+    def __init__(self, config, params):
+        self.config = config
+
+        self.api_key = params["api"]["api_key"]
+        self.api_secret = params["api"]["api_secret"]
+        self.base_url = params["api"]["base_url"] # "https://testnet.binancefuture.com"
+        self.instrument = params["instrument"].upper()
+
+        self.listen_key = None
+        self.keepalive_running = False
+
+    # -------------------------
+    # listenKey
+    # -------------------------
+    def start_user_stream(self):
+        url = f"{self.base_url}/fapi/v1/listenKey"
+        headers = {"X-MBX-APIKEY": self.api_key}
+
+        r = requests.post(url, headers=headers)
+        self.listen_key = r.json()["listenKey"]
+
+        # start keepalive thread automatically
+        self.start_keepalive_loop()
+
+        return self.listen_key
+    
+    def keepalive_listen_key(self):
+        url = f"{self.base_url}/fapi/v1/listenKey"
+        headers = {"X-MBX-APIKEY": self.api_key}
+
+        requests.put(url, headers=headers, params={"listenKey": self.listen_key}, timeout=5)
+
+    def start_keepalive_loop(self):
+        self.keepalive_running = True
+
+        def loop():
+            while self.keepalive_running:
+                try:
+                    time.sleep(20 * 60)  # 20 minutes (safe margin)
+                    self.keepalive_listen_key()
+
+                    print("keepalive sent")
+
+                except Exception as e:
+                    print("keepalive error:", e)
+
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+
+    def stop_keepalive(self):
+        self.keepalive_running = False
+
+    # -------------------------
+    # REST signing
+    # -------------------------
+    def _sign(self, params: dict):
+        params = {k: v for k, v in params.items() if k != "signature"}
+
+        query_string = urlencode(params, doseq=True)
+
+        return hmac.new(
+            self.api_secret.encode(),
+            query_string.encode(),
+            hashlib.sha256
+        ).hexdigest()
+
+    # -------------------------
+    # Place order
+    # -------------------------
+    def place_limit(self, side, price, size, client_oid, ts):
+
+        params = {
+            "newClientOrderId": client_oid,
+            "symbol": self.instrument,
+            "side": side,
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": format(size, f".4f"),
+            "price": format(price, f".1f"),
+            "timestamp": ts,
+            "recvWindow": 5000
         }
 
-class Execution:
-    def __init__(self, config, state, recorder):
-        self.config = config
-        self.state = state
+        headers = {"X-MBX-APIKEY": self.api_key}
+        query_string = urlencode(params)
+        signature = self._sign(params)
 
-        self.open_orders = {}  # order_id -> Order
-        self.id_counter = itertools.count()
+        url = f"{self.base_url}/fapi/v1/order?{query_string}&signature={signature}"
+        r = requests.post(url, headers=headers)
+
+        return r.json()
+
+    def cancel_order(self, order, ts):
+
+        params = {
+            "origClientOrderId": order.order_id,
+            "symbol": self.instrument,
+            "timestamp": ts
+        }
+
+        headers = {"X-MBX-APIKEY": self.api_key}
+        query_string = urlencode(params)
+        signature = self._sign(params)
+
+        url = f"{self.base_url}/fapi/v1/order?{query_string}&signature={signature}"
+        r = requests.delete(url, headers=headers)
+
+        return r.json()
+    
+    def cancel_all_orders(self):
+
+        params = {
+            "symbol": self.instrument,
+            "timestamp": self.config.now_ms()
+        }
+
+        headers = {"X-MBX-APIKEY": self.api_key}
+        query_string = urlencode(params)
+        signature = self._sign(params)
+
+        url = f"{self.base_url}/fapi/v1/allOpenOrders?{query_string}&signature={signature}"
+        r = requests.delete(url, headers=headers)
+        
+        return r.json()
+    
+    def place_market(self, client_oid, pos, side, ts):
+        if abs(pos) < 1e-12:
+            return {"status": "FLAT"}
+
+        params = {
+            "newClientOrderId": client_oid,
+            "symbol": self.instrument,
+            "side": side,
+            "type": "MARKET",
+            "quantity": format(abs(pos), f".4f"),
+            "reduceOnly": "true",
+            "timestamp": ts,
+            "recvWindow": 5000
+        }
+
+        headers = {"X-MBX-APIKEY": self.api_key}
+        query_string = urlencode(params)
+        signature = self._sign(params)
+
+        url = f"{self.base_url}/fapi/v1/order?{query_string}&signature={signature}"
+        r = requests.post(url, headers=headers)
+
+        return r.json()
+
+    def get_position(self):
+
+        params = {
+            "timestamp": self.config.now_ms()
+        }
+
+        query_string = urlencode(params)
+        signature = self._sign(params)
+        headers = {"X-MBX-APIKEY": self.api_key}
+
+        url = f"{self.base_url}/fapi/v2/positionRisk?{query_string}&signature={signature}"
+        r = requests.get(url, headers=headers)
+        positions = r.json()
+
+        for p in positions:
+            if p["symbol"] == self.instrument:
+                return float(p["positionAmt"])
+
+        return 0.0
+
+# 3. Live Execution Layer (your MM brain)
+class LiveExecution:
+    def __init__(self, config, state, broker, recorder, params):
+        self.config = config
+        self.params = params
+        self.state = state
+        self.broker = broker
+
+        self.open_orders = {}
 
         self.last_bid = None
         self.last_ask = None
         self.current_bid_size = 0.0
         self.current_ask_size = 0.0
 
+        self.last_live_bid = None # for snapshot only
+        self.last_live_ask = None
+
+        self.base_size = self.params["base_size"] # 0.2 because demo margin is max 1.0 for maintenance margin 1.0
+        self.max_inv = self.params["max_inv"]
+
+        self.lock = threading.Lock() # Lock all mutations
+        self.recorder = recorder
+
+    
+    def get_open_order(self, side):
+        return next((o for o in self.open_orders.values() if o.side == side), None)
+    
+    def get_order(self, client_oid, side):
+        order = self.open_orders.get(client_oid, None)
+    
+        if not order:
+            print(f'ORDER with client_oid {client_oid}, side {side} NOT FOUND')
+        
+        return order
+
+    # -------------------------
+    # ORDER MANAGEMENT
+    # -------------------------
+
+    """
+    Now your MM behaves like:
+
+    High volatility → smaller size
+    avoids getting chopped up
+
+    Low volatility → larger size
+    captures spread more aggressively
+
+    High inventory → reduces exposure
+    natural risk balancing
+    """
+
+    def _compute_order_size(self, signal): # Asymmetrical Quoting
+        state = self.state
+
+        inv = state.inventory
+        vol = state.get_vol()
+
+        # -------------------------
+        # 1. volatility scaling
+        # -------------------------
+        vol_penalty = 1 / (1 + 50 * vol)
+
+        # -------------------------
+        # 2. asymmetric inventory pressure
+        # -------------------------
+        inv_scale = 5.0  # sensitivity knob
+
+        # bounded asymmetry in [-1, 1]
+        inv_signal = math.tanh(inv / inv_scale)
+
+        # convert to directional size multiplier
+        # long inventory → sell bias → reduce bid size more than ask
+        bid_multiplier = math.exp(-inv_signal) # scale size relative, 0.684 bid, 1.462 ask
+        ask_multiplier = math.exp(inv_signal)
+
+        # -------------------------
+        # 3. convex risk aversion (kept but softened) risk penalty (quadratic inventory decay)
+        # -------------------------
+        risk_penalty = math.exp(-0.2 * (inv ** 2))
+
+        toxicity_penalty = np.exp(-signal["toxicity"]["k2"] * signal["toxicity"]["tox"])
+
+        # -------------------------
+        # 4. combine
+        # -------------------------
+        base = self.base_size * vol_penalty * risk_penalty
+
+        # optional: keep symmetric size baseline but asymmetric quoting power
+        size = base * toxicity_penalty
+
+        # clamp
+        size = max(0.05, min(size, 2.0))
+
+        bid_size = size * bid_multiplier
+        ask_size = size * ask_multiplier
+
+        order_sizes = {
+            "bid_size": bid_size,
+            "ask_size": ask_size
+        }
+
+        return order_sizes
+
+    # -------------------------
+    # RISK GUARD
+    # -------------------------
+    def can_quote(self, side):
+        inv = self.state.inventory
+
+        if abs(inv) >= self.max_inv:
+            # only allow orders that reduce risk
+            if side == "BUY" and inv < 0:
+                return True
+            
+            if side == "SELL" and inv > 0:
+                return True
+            
+            return False
+
+        return True
+
+    # -------------------------
+    # MAIN QUOTE ENGINE
+    # -------------------------
+    def place_quotes(self, signal):
+
+        """
+        Selective repricing logic:
+        - preserve queue priority when possible
+        - only cancel when necessary
+        """
+
+        desired_bid = signal["my_bid"]
+        desired_ask = signal["my_ask"]
+
+        tick = self.config.tick_size
+
+        order_sizes = self._compute_order_size(signal)
+        ts = self.config.now_ms()
+
+        bid_order = self.get_open_order("BUY")
+        ask_order = self.get_open_order("SELL")
+
+        # bid_change = abs(desired_bid - self.last_bid) >= tick # bid might move 1 tick also, its possible
+        # ask_change = abs(desired_ask - self.last_ask) >= tick
+
+        bid_change = self.last_bid is None or abs(desired_bid - self.last_bid) >= tick
+        ask_change = self.last_ask is None or abs(desired_ask - self.last_ask) >= tick
+
+        self.last_live_bid = desired_bid # for live snapshot only, last_bid is updated at userstream
+        self.last_live_ask = desired_ask
+
+        self.current_bid_size = order_sizes["bid_size"]
+        self.current_ask_size = order_sizes["ask_size"]
+
+        # -------------------------
+        # BID SIDE
+        # -------------------------
+        if bid_order is None and self.can_quote("BUY"):
+            client_oid = f"MM-{uuid.uuid4().hex[:16]}"
+
+            order = Order( # placeholder order to prevent race condition
+                order_id=client_oid, # use client_oid now,
+                side="BUY",
+                price=self.config.to_tick(desired_bid),
+                qty=order_sizes["bid_size"],
+                status="PENDING_NEW",
+                ts=ts,
+                owner="self",
+                signal=signal,
+                queue_ahead_at_join=None,
+                resp=None
+            )
+
+            with self.lock:
+                self.open_orders[client_oid] = order
+
+            order.resp = self.broker.place_limit("BUY", price=desired_bid, size=order_sizes["bid_size"], client_oid=client_oid, ts=ts)
+
+            self.recorder.log_quote(
+                ts=ts,
+                order=order,
+                side="BID",
+                event_type="NEW_SUBMITTED",
+                price=desired_bid,
+            )
+
+        elif bid_change and bid_order.status not in ("PENDING_NEW", "PENDING_CANCEL"): # if we need to requote and our order is currently live already
+            with self.lock:
+                bid_order.status = "PENDING_CANCEL"
+
+            bid_order.resp = self.broker.cancel_order(bid_order, ts=ts)
+
+            self.recorder.log_quote(
+                ts=ts,
+                order=bid_order,
+                side="BID",
+                event_type="CANCEL_SUBMITTED",
+                price=desired_bid,
+            )
+
+        # -------------------------
+        # ASK SIDE
+        # -------------------------
+        if ask_order is None and self.can_quote("SELL"):
+            client_oid = f"MM-{uuid.uuid4().hex[:16]}"
+
+            order = Order(
+                order_id=client_oid,
+                side="SELL",
+                price=self.config.to_tick(desired_ask),
+                qty=order_sizes["ask_size"],
+                status="PENDING_NEW",
+                ts=ts,
+                owner="self",
+                signal=signal,
+                queue_ahead_at_join=None,
+                resp=None
+            )
+
+            with self.lock:
+                self.open_orders[client_oid] = order
+
+            order.resp = self.broker.place_limit("SELL", price=desired_ask, size=order_sizes["ask_size"], client_oid=client_oid, ts=ts)
+
+            self.recorder.log_quote(
+                ts=ts,
+                order=order,
+                side="ASK",
+                event_type="NEW_SUBMITTED",
+                price=desired_ask,
+            )
+
+        elif ask_change and ask_order.status not in ("PENDING_NEW", "PENDING_CANCEL"): # if we need to requote
+            with self.lock:
+                ask_order.status = "PENDING_CANCEL"
+            
+            ask_order.resp = self.broker.cancel_order(ask_order, ts=ts)
+
+            self.recorder.log_quote(
+                ts=ts,
+                order=ask_order,
+                side="ASK",
+                event_type="CANCEL_SUBMITTED",
+                price=desired_ask,
+            )
+
+    def cancel_all_orders(self):
+        self.broker.cancel_all_orders()        
+    
+    def place_market(self):
+
+        book = self.state.market_book
+
+        bid_tick, bid_size = book.best_bid()
+        ask_tick, ask_size = book.best_ask()
+        
+        ts = self.config.now_ms()
+        client_oid = f"MM-{uuid.uuid4().hex[:16]}"
+        pos = self.broker.get_position()
+        side = "SELL" if pos > 0 else "BUY"
+
+        order = Order( # placeholder order to prevent race condition
+            order_id=client_oid,
+            side="SELL" if pos > 0 else "BUY",
+            price=bid_tick if pos > 0 else ask_tick,
+            qty=abs(pos),
+            status="LIVE",
+            ts=ts,
+            owner="self",
+            signal=self.state.last_signal,
+            queue_ahead_at_join=0.0,
+            resp=None
+        )
+
+        with self.lock:
+            self.open_orders[client_oid] = order
+
+        order.resp = self.broker.place_market(client_oid, pos, side, ts)
+
+    # -------------------------
+    # MARKET EVENTS (FILL LOGIC)
+    # -------------------------
+
+    def process_trade(self, trade):
+
+        self.update_trade_flow_buckets(trade)
+        
+        self._update_trade_flow(trade)
+
+        side = "BUY" if trade["side"] == "SELL" else "SELL"
+        price = self.config.to_tick(trade["price"])
+
+        order = next(
+            (o for o in self.open_orders.values()
+            if o.side == side and o.price == price and o.status == "LIVE"),
+            None
+        )
+
+        if not order:
+            return
+        
+        self.state.last_fill_candidate = order
+
+    def _update_trade_flow(self, trade):
+        
+        side = trade["side"]
+        
+        flow = 1 if side == "BUY" else -1
+
+        alpha_flow = 0.2
+
+        self.state.trade_imbalance = alpha_flow * flow + (1 - alpha_flow) * self.state.trade_imbalance # EWMA trade_imbalance
+
+    def update_trade_flow_buckets(self, trade):
+
+        side = trade["side"]
+        price = self.config.to_tick(trade["price"])
+
+        trade_event = {
+            "side": side,
+            "price": price,
+            "size": trade["qty"],
+            "timestamp": trade["timestamp"]
+        }
+
+        trade_bucket = self.state.trade_buckets[side][price]
+        trade_bucket.append(trade_event)
+
+        while trade_bucket and trade_event["timestamp"] - trade_bucket[0]["timestamp"] > self.state.window_ms:
+            trade_bucket.popleft()
+
+# 4. User Data Stream (THIS is what makes it “real”)
+class BinanceUserStream:
+    def __init__(self, config, state, execution, broker, recorder):
+        self.config = config
+        self.state = state
+        self.execution = execution
+        self.broker = broker
+        self.recorder = recorder
+
+        self.connected = threading.Event()
+
+    def on_open(self, ws):
+        self.connected.set()
+
+    def start(self):
+        listen_key = self.broker.start_user_stream()
+
+        url = f"wss://stream.binancefuture.com/ws/{listen_key}"
+
+        ws = websocket.WebSocketApp(
+            url,
+            on_open=self.on_open,
+            on_message=self.on_message
+        )
+
+        threading.Thread(
+            target=ws.run_forever,
+            daemon=True
+        ).start()
+
+        # BLOCK HERE until connection is live
+        self.connected.wait(timeout=10)
+
+        print("USER STREAM CONNECTED")
+
+    def on_message(self, ws, msg):
+        data = json.loads(msg)
+
+        if data["e"] != "ORDER_TRADE_UPDATE":
+            return
+
+        o = data["o"]
+
+        order_id = o["i"]
+        client_oid = o["c"]
+        side = o["S"]
+        status = o["X"]
+        exec_type = o["x"]
+        ts = o["T"]
+        
+        order = self.execution.get_order(client_oid, side)
+
+        # -------------------------
+        # NEW (LIVE CONFIRMATION)
+        # -------------------------
+        if exec_type == "NEW":
+            order.status = "LIVE"
+            price = float(o["p"])
+
+            if side == "BUY": # update last bid here for confirmed live orders
+                self.execution.last_bid = price
+
+            elif side == "SELL":
+                self.execution.last_ask = price
+
+            self.state.last_order_update = order
+
+            # record estimated queue position
+            book_size = self.state.market_book.bids.get(order.price, 0.0)
+            self.state.my_queue_position["bids" if side == "BUY" else "asks"][order.price] = book_size
+            order.queue_ahead_at_join = book_size
+
+            self.recorder.log_quote(
+                ts=ts,
+                order=order,
+                side="BID" if side == "BUY" else "ASK",
+                event_type="NEW",
+                price=price,
+            )
+            #print(f'ts: {ts} - LIVE ORDER {side} with client_oid: {client_oid}')
+
+        elif exec_type == "CANCELED":
+            order.status = "CANCELED"
+
+            self.state.last_order_update = order
+            self.state.reset_queue_ahead("bids" if side == "BUY" else "asks", order.price) # reset queue position and queue flow
+            self.execution.open_orders.pop(client_oid, None)
+            #print(f'CANCELLED {side} with client_oid: {client_oid}')
+        
+        elif exec_type == "REJECTED":
+            order.status = "REJECTED"
+            
+            self.state.last_order_update = order
+            self.execution.open_orders.pop(client_oid, None)
+            #print(f'REJECTED {side} with client_oid: {client_oid}')
+
+        elif exec_type == "TRADE":            
+            fill_price = float(o["L"])
+            fill_qty = float(o["l"])
+            
+            if status == "PARTIALLY_FILLED":
+                order.remaining -= fill_qty
+
+                self.state.on_fill(
+                    price=fill_price,
+                    qty=fill_qty,
+                    side=side
+                )
+                #print(f'PARTIALLY FILLED {side} with client_oid: {client_oid}')
+
+            elif status == "FILLED": # either live order gets filled or pending_cancel order gets filled
+                order.status = "FILLED"
+                order.remaining = 0
+
+                self.state.on_fill(
+                    price=fill_price,
+                    qty=fill_qty,
+                    side=side
+                )
+
+                self.state.reset_queue_ahead("bids" if side == "BUY" else "asks", order.price) # reset queue position and queue flow
+                self.execution.open_orders.pop(client_oid, None)
+                #print(f'FILLED {side} with client_oid: {client_oid}')
+
+            self.state.last_order_update = order                
+            self.recorder.log_fill(qty=fill_qty, order=order, is_maker=True)
+
+            order_type = o["o"]
+            if order_type == "MARKET":
+                print(f"{order.side} | {fill_price:>10.4f} | {fill_qty:>8.6f} | {order.status}")
+
+# Execution Layer
+class Order:
+    def __init__(self, order_id, side, price, qty, status, ts, owner, signal, queue_ahead_at_join, resp=None):
+        self.order_id = order_id
+        self.side = side
+        self.price = price
+        self.qty = qty
+        self.remaining = qty
+        self.status = status
+        self.timestamp = ts
+        self.owner = owner
+        self.resp = resp
+        self.metadata = { # used for toxicity ML training
+            "signal": signal,
+            "queue_ahead_at_join": queue_ahead_at_join
+        }
+
+class Execution:
+    def __init__(self, config, state, recorder, params):
+        self.config = config
+        self.params = params
+        self.state = state
+
+        self.open_orders = {}  # order_id -> Order
+        self.id_counter = itertools.count()
+
+        # self.last_bid = None
+        # self.last_ask = None
+        self.current_bid_size = 0.0
+        self.current_ask_size = 0.0
+
+        self.last_live_bid = None # for live bids and asks, and snapshot
+        self.last_live_ask = None
+
+        self.base_size = self.params["base_size"] # 0.2 because demo margin is max 1.0 for maintenance margin 1.0
+        self.max_inv = self.params["max_inv"]
+
+        self.lock = threading.Lock()
+        self.recorder = recorder
+
         # -------------------------
         # latency model (ms)
-
         # priority queue: (execute_ts, action)
         # -------------------------
         self.latency_ms = 50
         self.latency_queue = []
 
-        self.recorder = recorder
-
-        self.lock = threading.Lock() # Lock all mutations
-
     """
-    Execution-level last_bid/last_ask
+    Execution-level last_live_bid/last_live_ask
 
     Used for:
-
     order state reconciliation
     cancel/replace minimization
     exchange action control
@@ -1573,6 +2462,9 @@ class Execution:
     
     def _new_order_id(self):
         return next(self.id_counter)
+
+    def get_open_order(self, side):
+        return next((o for o in self.open_orders.values() if o.side == side), None)
     
     # =========================================================
     # PUBLIC API (called by Engine)
@@ -1615,8 +2507,6 @@ class Execution:
         inv = state.inventory
         vol = state.get_vol()
 
-        base_size = 1.0
-
         # -------------------------
         # 1. volatility scaling
         # -------------------------
@@ -1645,7 +2535,7 @@ class Execution:
         # -------------------------
         # 4. combine
         # -------------------------
-        base = base_size * vol_penalty * risk_penalty
+        base = self.base_size * vol_penalty * risk_penalty
 
         # optional: keep symmetric size baseline but asymmetric quoting power
         size = base * toxicity_penalty
@@ -1663,6 +2553,24 @@ class Execution:
 
         return order_sizes
     
+    # -------------------------
+    # RISK GUARD
+    # -------------------------
+    def can_quote(self, side):
+        inv = self.state.inventory
+
+        if abs(inv) >= self.max_inv:
+            # only allow orders that reduce risk
+            if side == "BUY" and inv < 0:
+                return True
+            
+            if side == "SELL" and inv > 0:
+                return True
+            
+            return False
+
+        return True
+    
     def place_quotes(self, signal):
         """
         Selective repricing logic:
@@ -1670,8 +2578,8 @@ class Execution:
         - only cancel when necessary
         """
 
-        bid = signal["my_bid"]
-        ask = signal["my_ask"]
+        desired_bid = signal["my_bid"]
+        desired_ask = signal["my_ask"]
 
         order_sizes = self._compute_order_size(signal)
         ts = self.config.now_ms()
@@ -1679,12 +2587,12 @@ class Execution:
         # -------------------------
         # FIRST TIME PLACING
         # -------------------------
-        if self.last_bid is None or self.last_ask is None:
-            bid_order = self._place_limit(side="BUY", price=bid, size=order_sizes["bid_size"], ts=ts, signal=signal)
-            ask_order = self._place_limit(side="SELL", price=ask, size=order_sizes["ask_size"], ts=ts, signal=signal)
+        if self.last_live_bid is None or self.last_live_ask is None:
+            bid_order = self._place_limit(side="BUY", price=desired_bid, size=order_sizes["bid_size"], ts=ts, signal=signal)
+            ask_order = self._place_limit(side="SELL", price=desired_ask, size=order_sizes["ask_size"], ts=ts, signal=signal)
 
-            self.last_bid = bid
-            self.last_ask = ask
+            self.last_live_bid = desired_bid
+            self.last_live_ask = desired_ask
 
             self.current_bid_size = order_sizes["bid_size"]
             self.current_ask_size = order_sizes["ask_size"]
@@ -1694,7 +2602,7 @@ class Execution:
                 order=bid_order,
                 side="BID",
                 event_type="NEW",
-                price=bid,
+                price=desired_bid,
             )
 
             self.recorder.log_quote(
@@ -1702,7 +2610,7 @@ class Execution:
                 order=ask_order,
                 side="ASK",
                 event_type="NEW",
-                price=ask,
+                price=desired_ask,
             )
 
             return
@@ -1712,9 +2620,8 @@ class Execution:
         # -------------------------
         # DETERMINE IF WE NEED TO UPDATE EACH SIDE
         # -------------------------
-
-        bid_change = abs(bid - self.last_bid) >= tick # bid might move 1 tick also, its possible
-        ask_change = abs(ask - self.last_ask) >= tick
+        bid_change = abs(desired_bid - self.last_live_bid) >= tick # bid might move 1 tick also, its possible
+        ask_change = abs(desired_ask - self.last_live_ask) >= tick
 
         # ---------------------------------------------------------------------------
         # CANCEL ONLY WHAT IS NECESSARY, REPLACE ONLY STALE SIDE(S), UPDATE STATE
@@ -1722,36 +2629,38 @@ class Execution:
         if bid_change:
             self._cancel_side("BUY")
 
-            self.state.reset_queue_ahead("bids", self.config.to_tick(self.last_bid)) # reset queue position and queue flow
+            self.state.reset_queue_ahead("bids", self.config.to_tick(self.last_live_bid)) # reset queue position and queue flow
 
-            bid_order = self._place_limit(side="BUY", price=bid, size=order_sizes["bid_size"], ts=ts, signal=signal)
+            if self.can_quote("BUY"):
+                bid_order = self._place_limit(side="BUY", price=desired_bid, size=order_sizes["bid_size"], ts=ts, signal=signal)
 
-            self.last_bid = bid
+                self.last_live_bid = desired_bid
 
-            self.recorder.log_quote(
-                ts=ts,
-                order=bid_order,
-                side="BID",
-                event_type="REPLACE",
-                price=bid,
-            )
+                self.recorder.log_quote(
+                    ts=ts,
+                    order=bid_order,
+                    side="BID",
+                    event_type="REPLACE",
+                    price=desired_bid,
+                )
 
         if ask_change:
             self._cancel_side("SELL")
 
-            self.state.reset_queue_ahead("asks", self.config.to_tick(self.last_ask)) # reset queue position and queue flow
+            self.state.reset_queue_ahead("asks", self.config.to_tick(self.last_live_ask)) # reset queue position and queue flow
 
-            ask_order = self._place_limit(side="SELL", price=ask, size=order_sizes["ask_size"], ts=ts, signal=signal)
+            if self.can_quote("SELL"):
+                ask_order = self._place_limit(side="SELL", price=desired_ask, size=order_sizes["ask_size"], ts=ts, signal=signal)
 
-            self.last_ask = ask
+                self.last_live_ask = desired_ask
 
-            self.recorder.log_quote(
-                ts=ts,
-                order=ask_order,
-                side="ASK",
-                event_type="REPLACE",
-                price=ask,
-            )
+                self.recorder.log_quote(
+                    ts=ts,
+                    order=ask_order,
+                    side="ASK",
+                    event_type="REPLACE",
+                    price=desired_ask,
+                )
 
         self.current_bid_size = order_sizes["bid_size"]
         self.current_ask_size = order_sizes["ask_size"]
@@ -1778,6 +2687,7 @@ class Execution:
             side=side,
             price=tick_price,
             qty=size,
+            status="LIVE",
             ts=ts,
             owner="self",
             signal=signal,
@@ -1797,7 +2707,11 @@ class Execution:
                 self.state.last_order_update = order
 
                 with self.lock:
-                    del self.open_orders[oid]
+                    self.open_orders.pop(oid, None)
+
+    def cancel_all_orders(self):
+        self._cancel_side("BUY")
+        self._cancel_side("SELL")
 
     def place_market(self):
         
@@ -1812,6 +2726,7 @@ class Execution:
             side=side,
             price=None, # market order has no price level
             qty=qty,
+            status="LIVE",
             ts=ts,
             owner="self",
             signal=self.state.last_signal,
@@ -1898,28 +2813,24 @@ class Execution:
             price = self.config.to_tick(trade["price"])
             qty = trade["qty"]
 
-            orders = [
-                o for o in self.open_orders.values()
-                if o.side == side and o.price == price and o.status == "LIVE"
-            ]
+            order = next(
+                (o for o in self.open_orders.values()
+                if o.side == side and o.price == price and o.status == "LIVE"),
+                None
+            )
 
-            if not orders:
+            if not order:
                 return
-            
-            self.state.last_fill_candidate = orders
+
+            self.state.last_fill_candidate = order
+
             # -------------------------
             # Poisson arrival of liquidity, much more stable statistically maybe to hawkes in future
             # -------------------------
-
-            queue_ahead = self.state.compute_queue_ahead( # passive world
-                "bids" if side == "BUY" else "asks",
-                price
-            )
-
+            queue_ahead = self.state.compute_queue_ahead("bids" if side == "BUY" else "asks", price) # passive world
             trade_rate = self.get_trade_rate(trade) # aggressive world
  
             lambda_fill = trade_rate / (queue_ahead + 1e-9) # hazard rate (/ s), stochasitc estimation to model cancels / trades from l2 data
-
             p_fill = 1 - np.exp(-lambda_fill * 0.1) # fill prob of at least 1 event in the next 100ms (dt = 0.1)
 
             if p_fill < random.random():
@@ -1929,32 +2840,24 @@ class Execution:
             # 0 → almost no chance of fill
             # 1 → almost guaranteed fill
 
-            remaining_flow = qty
-
             # ----------------------------------------------------
             # STEP 2: apply fills to your orders
             # ----------------------------------------------------
+            fill = min(order.remaining, qty)
 
-            for order in orders:
-                if remaining_flow <= 0:
-                    break
+            order.remaining -= fill
 
-                fill = min(order.remaining, remaining_flow)
+            self.state.on_fill(self.config.from_tick(order.price), fill, order.side, "maker")
 
-                order.remaining -= fill
-                remaining_flow -= fill
+            self.state.last_order_update = order
 
-                self.state.on_fill(self.config.from_tick(order.price), fill, order.side, "maker")
+            self.recorder.log_fill(qty=fill, order=order, is_maker=True)
 
-                self.state.last_order_update = order
-
-                self.recorder.log_fill(qty=fill, order=order, is_maker=True)
-
-                if order.remaining == 0:
-                    order.status = "FILLED"
-                    del self.open_orders[order.order_id]
-
-                    self.state.reset_queue_ahead("bids" if side == "BUY" else "asks", price) # reset queue position and queue flow
+            if order.remaining == 0:
+                order.status = "FILLED"
+                
+                self.open_orders.pop(order.order_id, None)
+                self.state.reset_queue_ahead("bids" if side == "BUY" else "asks", price) # reset queue position and queue flow
 
     def _execute_market(self, order):
 
@@ -1981,7 +2884,7 @@ class Execution:
                 order.remaining -= fill
 
                 order.price = price # for dashboard UI for market orders
-                self.state.last_fill_candidate = [order]
+                self.state.last_fill_candidate = order
                 self.state.last_order_update = order
 
                 print(f"{order.side} | {self.config.from_tick(price):>10.4f} | {fill:>8.6f} | {order.status}")
@@ -1991,7 +2894,7 @@ class Execution:
                     new_size = book.asks[price] - fill
                     
                     if new_size <= 0:
-                        del book.asks[price]
+                        book.asks.pop(price, None)
 
                     else:
                         book.asks[price] = new_size
@@ -1999,7 +2902,7 @@ class Execution:
                     new_size = book.bids[price] - fill
                     
                     if new_size <= 0:
-                        del book.bids[price]
+                        book.bids.pop(price, None)
 
                     else:
                         book.bids[price] = new_size
@@ -2065,7 +2968,6 @@ class Engine:
         )
 
     def on_trade_event(self, trade):
-
         # Dataset recording
         self.recorder.log_trade(trade=trade, symbol=self.instrument.upper())
 
@@ -2124,6 +3026,7 @@ class Engine:
         spread_multiplier = state.last_signal["spread_multiplier"] if state.last_signal else 0.0
         inventory_target = state.last_signal["inventory_target"] if state.last_signal else 0.0
         signal_quality = state.last_signal["signal_quality"] if state.last_signal else 0.0
+        toxicity = state.last_signal["toxicity"] if state.last_signal else {}
 
         # -------------------------
         # EXECUTION
@@ -2133,26 +3036,14 @@ class Engine:
         bid_pressure = bid_queue / (bid_size + 1e-9)
         ask_pressure = ask_queue / (ask_size + 1e-9)
 
-        with execution.lock: # Another lock
-            orders = sorted(execution.open_orders.values(), key=lambda o: 0 if o.side == "BUY" else 1)
+        buy_order = execution.get_open_order("BUY")
+        sell_order = execution.get_open_order("SELL")
+        buy_order_str = self.fmt(buy_order)
+        sell_order_str = self.fmt(sell_order)
 
-        orders = [f"{o.side:<5} | {self.config.from_tick(o.price):>10.4f} | {o.qty:>8.6f} [{o.status}]" for o in orders]
-        # orders = [f"{o.side:<5} | {(f"{self.config.from_tick(o.price):>10.4f}" if o.price is not None else "MARKET")} | {o.qty:>8.6f} [{o.status}]" for o in orders]
-        orders_str = (orders + ["—", "—"])[:2]
+        last_fill_candidate_str = self.fmt(state.last_fill_candidate)
+        last_order_update_str = self.fmt(state.last_order_update)
 
-        last_fill_candidate_str = "\n".join([f"{o.side:<5} | {self.config.from_tick(o.price):>10.4f} | {o.remaining:>8.6f} [{o.status}]"
-            for o in state.last_fill_candidate
-        ]) or "—"
-
-        # last_fill_candidate_str = "\n".join([f"{o.side:<5} | {(f"{self.config.from_tick(o.price):>10.4f}" if o.price is not None else "MARKET")} | {o.qty:>8.6f} [{o.status}]"
-        #     for o in state.last_fill_candidate
-        # ]) or "—"
-
-        last_order_update = state.last_order_update if state.last_order_update else None
-        last_order_update_str = f"{last_order_update.side:<5} | {self.config.from_tick(last_order_update.price):>10.4f} | {last_order_update.remaining:>8.6f} [{last_order_update.status}]" if last_order_update else "—"
-        # last_order_update_str = f"{last_order_update.side:<5} | {(f"{self.config.from_tick(last_order_update.price):>10.4f}" if last_order_update.price is not None else "MARKET")} | {last_order_update.remaining:>8.6f} [{last_order_update.status}]" if last_order_update else "—"
-
-        state.update_performance() # update sharpe
         # -------------------------
         # SYSTEM
         # -------------------------
@@ -2204,11 +3095,14 @@ class Engine:
                 "spread_multiplier": spread_multiplier,
                 "inventory_target": inventory_target,
                 "signal_quality": signal_quality,
+                "tox" : toxicity.get("tox", 0.0),
+                "k1" : toxicity.get("k1", 0.0),
+                "k2" : toxicity.get("k2", 0.0),
             },
 
             "quotes": {
-                "my_bid": execution.last_bid or 0.0,
-                "my_ask": execution.last_ask or 0.0,
+                "my_bid": execution.last_live_bid or 0.0,
+                "my_ask": execution.last_live_ask or 0.0,
                 "current_bid_size": execution.current_bid_size,
                 "current_ask_size": execution.current_ask_size,
             },
@@ -2218,8 +3112,8 @@ class Engine:
                 "ask_queue": ask_queue,
                 "bid_pressure": bid_pressure,
                 "ask_pressure": ask_pressure,
-                "open_order_one": orders_str[0],
-                "open_order_two": orders_str[1],
+                "buy_order": buy_order_str,
+                "sell_order": sell_order_str,
                 "last_fill_candidate": last_fill_candidate_str,
                 "last_order_update": last_order_update_str
             },
@@ -2321,8 +3215,8 @@ class Engine:
         table.add_row("Queue Pressure / Bid", f"{snapshot["market"]["bid"]:<10.4f} ({snapshot["execution"]["bid_pressure"]:<6.4f})")
         table.add_row("Queue Pressure / Ask", f"{snapshot["market"]["ask"]:<10.4f} ({snapshot["execution"]["ask_pressure"]:<6.4f})")
 
-        table.add_row("Open Orders", snapshot["execution"]["open_order_one"])
-        table.add_row("", snapshot["execution"]["open_order_two"])
+        table.add_row("Open Orders", snapshot["execution"]["buy_order"])
+        table.add_row("", snapshot["execution"]["sell_order"])
         table.add_row("Last Fill Candidate", snapshot["execution"]["last_fill_candidate"])
         table.add_row("Last Order Update", snapshot["execution"]["last_order_update"])
         table.add_row("", "")
@@ -2355,8 +3249,10 @@ class Engine:
             self.live.update(self.render_dashboard())
             self.last_dashboard_update = now
 
-    def color_pnl(self, value):
+    def fmt(self, o):
+        return f"{o.side:<5} | {self.config.from_tick(o.price):>10.4f} | {o.qty:>8.6f} [{o.status}]" if o else "—"
 
+    def color_pnl(self, value):
         if value > 0:
             return f"[green]▲ {value:.4f}[/green]"
         
@@ -2364,10 +3260,9 @@ class Engine:
             return f"[red]▼ {value:.4f}[/red]"
         
         else:
-            return f"— {value:.4f}"
+            return f"{value:.4f}"
         
     def color_risk(self, inventory, limit=10):
-        
         intensity = min(abs(inventory) / limit, 1.0)
 
         if intensity < 0.3:
@@ -2380,7 +3275,6 @@ class Engine:
             return f"[red]▲ {inventory:.4f}[/red]"
 
     def centered_inventory_bar(self, inv, max_inv=10, width=21): 
-
         half = width // 2
         scaled = int((inv / max_inv) * half)
 
@@ -2429,7 +3323,7 @@ class State:
         # Market Data Layer
         self.config = config
         self.params = params
-        self.market_book = OrderBook(config=self.config)
+        self.market_book = OrderBook(config=self.config, params=self.params)
         self.last_mid = None
 
         # Market Regime Layer
@@ -2503,73 +3397,10 @@ class State:
         self.last_mid = mid
 
     def compute_order_imbalance(self):
-
         bid_tick, bid_size = self.market_book.best_bid()
         ask_tick, ask_size = self.market_book.best_ask()
         
         self.order_imbalance = (bid_size - ask_size) / (bid_size + ask_size + 1e-9)
-
-    # def on_fill(self, price, qty, side):
-
-    #     fill_value = price * qty
-
-    #     # -------------------------
-    #     # Snapshot old state FIRST
-    #     # -------------------------
-    #     old_inv = self.inventory
-    #     old_avg = self.avg_entry_price
-
-    #     # -------------------------
-    #     # BUY: you gain inventory
-    #     # -------------------------
-    #     if side == "BUY":
-
-    #         new_inv = old_inv + qty
-
-    #         # If you were short → realize PnL
-    #         if old_inv < 0:
-    #             closed_qty = min(qty, abs(old_inv))
-    #             self.realized_pnl += closed_qty * (old_avg - price)
-
-    #         # update cash
-    #         self.cash -= fill_value
-
-    #         # update inventory
-    #         self.inventory = new_inv
-
-    #         # update avg entry price ONLY if position exists
-    #         if new_inv != 0:
-    #             self.avg_entry_price = (
-    #                 old_avg * old_inv + price * qty
-    #             ) / new_inv
-    #         else:
-    #             self.avg_entry_price = 0.0
-
-    #     # -------------------------
-    #     # SELL: you reduce inventory / go short
-    #     # -------------------------
-    #     else:
-
-    #         new_inv = old_inv - qty
-
-    #         # If you were long → realize PnL
-    #         if old_inv > 0:
-    #             closed_qty = min(qty, old_inv)
-    #             self.realized_pnl += closed_qty * (price - old_avg)
-
-    #         # update cash
-    #         self.cash += fill_value
-
-    #         # update inventory
-    #         self.inventory = new_inv
-
-    #         # update avg entry price ONLY if position exists
-    #         if new_inv != 0:
-    #             self.avg_entry_price = (
-    #                 old_avg * old_inv - price * qty
-    #             ) / new_inv
-    #         else:
-    #             self.avg_entry_price = 0.0
 
     def on_fill(self, price, qty, side, liquidity="maker"):
         """
@@ -2584,9 +3415,7 @@ class State:
         fill_value = price * qty
 
         fee_rate = self.maker_fee_rate if liquidity == "maker" else self.taker_fee_rate # fee rate
-
         fee = fill_value * fee_rate
-
         self.fees_paid += fee
 
         # -----------------------------
@@ -2622,7 +3451,6 @@ class State:
                 self.inventory = new_inv
 
             # cash always decreases on buy
-            # self.cash -= fill_value
             self.cash -= (fill_value + fee) # maker/taker fees
 
         # -----------------------------
@@ -2658,7 +3486,6 @@ class State:
                 self.inventory = new_inv
 
             # cash always increases on sell
-            # self.cash += fill_value
             self.cash += (fill_value - fee) # maker/taker fees
 
         # -----------------------------
@@ -2672,13 +3499,11 @@ class State:
 
     def get_pnl(self):
         mid = self.market_book.mid()
-
         unrealized = self.inventory * (mid - self.avg_entry_price)
 
         return self.realized_pnl + unrealized
     
     def compute_queue_ahead(self, side, price):
-
         my_pos = self.my_queue_position[side].get(price, 0.0) # Initial size ahead of you when you joined
         flow = self.queue_flow.get(side, {}).get(price, 0.0) # Estimated amount of queue depletion since you joined
 
@@ -2687,20 +3512,16 @@ class State:
         return ahead
     
     def reset_queue_ahead(self, side, price): #reset queue position and queue flow for new fill probability estimate
-
         self.my_queue_position[side].pop(price, None)
         self.queue_flow[side].pop(price, None)
     
     def update_queue_from_depth(self, bids, asks):
 
         # Tracks the size reduction, it is a positive number
-
         # -------------------------
         # BIDS
         # -------------------------
-
         for p, q in bids:
-
             tick = self.config.to_tick(float(p))
 
             old = self.market_book.bids.get(tick, 0.0)
@@ -2717,9 +3538,7 @@ class State:
         # -------------------------
         # ASKS
         # -------------------------
-
         for p, q in asks:
-
             tick = self.config.to_tick(float(p))
 
             old = self.market_book.asks.get(tick, 0.0)
@@ -2734,9 +3553,7 @@ class State:
                 )
 
     def update_market_feature_state(self):
-
         mfs = self.market_feature_state
-
         book = self.market_book
 
         bid_tick, bid_size = book.best_bid()
@@ -2775,7 +3592,6 @@ class State:
         mfs.microprice_error.append(mid - microprice)
 
     def get_regime(self):
-
         mfs = self.market_feature_state
 
         regime = {
@@ -2792,15 +3608,12 @@ class State:
         return regime
 
     def update_ml_realization(self):
-
         mfs = self.market_feature_state
-
         now = self.config.now_ms()
 
         while mfs.ml_predictions and now - mfs.ml_predictions[0]["ts"] >= mfs.ml_horizon_ms:
-            
+    
             entry = mfs.ml_predictions.popleft()
-
             realized = np.log(self.last_mid / entry["reservation"])
 
             mfs.ml_signal_log.append({
@@ -2809,7 +3622,6 @@ class State:
             })
 
     def update_performance(self):
-
         bid_tick, bid_size = self.market_book.best_bid()
         ask_tick, ask_size = self.market_book.best_ask()
 
@@ -2820,7 +3632,6 @@ class State:
         ask = self.config.from_tick(ask_tick)
 
         mid = (bid + ask) / 2
-
         equity = self.cash + self.inventory * mid
 
         if self.last_equity is not None and self.last_equity > 0 and equity > 0:
@@ -2833,7 +3644,6 @@ class State:
         self.equity_history.append(equity)
 
     def compute_sharpe(self):
-
         if len(self.return_history) < 30:
             return 0.0
 
@@ -2842,17 +3652,14 @@ class State:
 
         if len(returns) < 30:
             print('SHARPE - len(returns) < 30:', np.nan)
-
             return np.nan
 
         std = np.std(returns)
         if std == 0 or np.isnan(std):
             print('SHARPE - std == 0 / isnan(std):', np.nan)
-
             return np.nan
 
         sharpe_ratio = np.mean(returns) / np.std(returns) + 1e-9
-        
         print('SHARPE:', sharpe_ratio)
         
         return sharpe_ratio
@@ -2868,14 +3675,9 @@ class ReplayFeed:
     """
 
     def __init__(self, state, on_market_data, on_trade_event, logger, params):
-
         self.events = os.path.join(params["folder_path"], params["files"]["replay_events"]["events"])
         self.orderbook_snapshot = os.path.join(params["folder_path"], params["files"]["replay_events"]["orderbook_snapshot"])
         self.state = state
-
-        # -------------------------
-        # IMPORTANT FIX
-        # -------------------------
 
         self.on_market_data = on_market_data
         self.on_trade_event = on_trade_event
@@ -2887,22 +3689,19 @@ class ReplayFeed:
         self.running = False
 
         # optional speed control
-        self.speed_multiplier = 5.0 # to speed up market events for backtesting
+        self.speed_multiplier = 5.0 # to speed up market events for backtesting, can run unlimited, wont harm engine
         self.last_ts = None
 
     # -------------------------
     # CORE LOOP
     # -------------------------
     def start(self):
-
         # -------------------------
         # INITIALIZE RAW EVENTS
         # -------------------------
-
         print("INITIALIZING RAW EVENTS")
 
         events_df = pd.read_parquet(self.events)
-
         events_df = events_df.sort_values("ts")
 
         self.events = events_df.to_dict("records")
@@ -2911,29 +3710,24 @@ class ReplayFeed:
             self.orderbook_snapshot = json.load(f)
 
         self.running = True
-
         print("REPLAY SOCKETS STARTED")
 
         # -------------------------
         # FETCH SNAPSHOT
         # -------------------------
 
-        last_update_id, snapshot = self.state.market_book.set_orderbook_snapshot(self.orderbook_snapshot)
+        snapshot_id, snapshot = self.state.market_book.set_orderbook_snapshot(self.orderbook_snapshot)
 
         self.state.initialized = True
-
         self.log_orderbook_snapshot(snapshot)
 
-        print("SNAPSHOT FETCHED:", last_update_id)
-
+        print("SNAPSHOT FETCHED:", snapshot_id)
         print("BOOK SYNCHRONIZED")
 
         # -------------------------
         # LIVE MODE
         # -------------------------
-
         threading.Thread(target=self.run, daemon=True).start()
-
         print("LIVE BOOK RUNNING")
 
     def stop(self):
@@ -2973,14 +3767,13 @@ class ReplayFeed:
     # -------------------------
     # DEPTH EVENT
     # -------------------------
-
     def _parse_book(self, message):
         bids = [(float(p), float(q)) for p, q in message.get("b", [])]
         asks = [(float(p), float(q)) for p, q in message.get("a", [])]
 
         return bids, asks
     
-    def _on_depth(self, message):
+    def _on_depth(self, message): # for spot
 
         state = self.state
         book = state.market_book
@@ -2989,61 +3782,56 @@ class ReplayFeed:
         u = message["u"]
         last_id = book.last_update_id
 
-        # -----------------------------
-        # 1. FIRST VALIDATION (CRITICAL)
-        # -----------------------------
-        if last_id is None:
-            return  # must wait for snapshot initialization
-
-        # drop outdated updates
         if u <= last_id:
             return
 
         # gap detected → must resync
-        if U > last_id + 1:
-            print("GAP DETECTED — RESYNC REQUIRED")
+        if U > last_id + 1: # we use U = previous message u + 1, since spot doesnt have futures pu
+            print(
+                "GAP DETECTED",
+                "expected", last_id + 1,
+                "got", U
+                )
             state.initialized = False
             return
+    
+        with book.lock:
+            # -----------------------------
+            # APPLY DELTA
+            # -----------------------------
 
-        # -----------------------------
-        # 2. APPLY DELTA
-        # -----------------------------
+            bids, asks = self._parse_book(message)
 
-        bids, asks = self._parse_book(message)
+            self.state.update_queue_from_depth(
+                bids=bids,
+                asks=asks
+            )
 
-        self.state.update_queue_from_depth(
-            bids=bids,
-            asks=asks
-        )
+            book.apply_delta(bids, asks)
 
-        book.apply_delta(bids, asks, self.state)
+            book.last_update_id = u
 
-        book.last_update_id = u
+            # -----------------------------
+            # VOL UPDATE
+            # -----------------------------
+            state.update_vol()
 
-        # -----------------------------
-        # 3. VOL UPDATE
-        # -----------------------------
-        state.update_market_feature_state() # regime update
+            state.compute_order_imbalance()
 
-        state.update_vol()
+            state.update_market_feature_state() # regime update
 
-        state.compute_order_imbalance()
+            state.update_ml_realization() # compute ml signal quality
 
-        state.update_ml_realization() # compute ml signal quality
+            state.update_performance()
 
-        # -----------------------------
-        # 4. INITIALIZATION FIX (SEE BELOW)
-        # -----------------------------
-        if not state.initialized:
-            return
-
-        # -----------------------------
-        # 5. STRATEGY CALL
-        # -----------------------------
+        # -------------------------
+        # STRATEGY ONLY AFTER INIT
+        # -------------------------
         if state.initialized:
             self.on_market_data()
 
     def _on_depth_message(self, ws, message):
+
         msg = json.loads(message)
 
         # -------------------------
@@ -3058,7 +3846,6 @@ class ReplayFeed:
         # -------------------------
         # LIVE PROCESSING
         # -------------------------
-
         self.state.last_depth_ts = msg["E"]
 
         self._on_depth(msg)
@@ -3066,7 +3853,6 @@ class ReplayFeed:
     # -------------------------
     # TRADE EVENT
     # -------------------------
-
     def _parse_trade(self, message):
 
         return {
@@ -3112,7 +3898,6 @@ class DashboardServer:
 
         self.loop = None
         self.thread = None
-
         self._setup_routes()
 
     def _setup_routes(self):
@@ -3178,35 +3963,60 @@ class DashboardServer:
         for ws in dead:
             self.clients.discard(ws)
 
+
 # Intialization and Websocket Handling Layer
 class TradingSystem:
     def __init__(self, params):
+        self.params = params
 
-        # NEW ASYNC
+        # ASYNC
         self.signal_queue = queue.Queue(maxsize=1000) # thread-safe FIFO queue
 
         # Monitoring Layer
-        self.react_dashboard = DashboardServer(params=params)
+        self.react_dashboard = DashboardServer(params=self.params)
         
         # Market Configuration
-        self.config = MarketConfig(params=params)
+        self.config = MarketConfig(params=self.params)
 
         # Strategy Layer
-        self.strategy = MarketMakingStrategy(config=self.config, params=params)
+        self.strategy = MarketMakingStrategy(config=self.config, params=self.params)
 
         # Market State
-        self.state = State(config=self.config, params=params)
+        self.state = State(config=self.config, params=self.params)
         self.state.market_feature_state.ml_horizon_ms = self.strategy.edge_model.horizon_ms if self.strategy.edge_model is not None else 0.0 # for ML signal horizon
 
         # Data Recording Layer
-        self.recorder = DatasetRecorder(config=self.config, state=self.state, params=params)
+        self.recorder = DatasetRecorder(config=self.config, state=self.state, params=self.params)
 
         # Execution Layer
-        self.execution = Execution(
-            config=self.config,
-            state=self.state,
-            recorder=self.recorder
-        )
+        self.user_stream = None
+
+        if self.params["mode"] == "live":
+            self.broker = BinanceBroker(config=self.config, params=self.params)
+
+            self.execution = LiveExecution(
+                config=self.config,
+                state=self.state,
+                broker=self.broker,
+                recorder=self.recorder,
+                params=self.params
+            )
+
+            self.user_stream = BinanceUserStream(
+                config=self.config,
+                state=self.state,
+                execution=self.execution,
+                broker=self.broker,
+                recorder=self.recorder
+            )
+
+        elif self.params["mode"] == "stochastic":
+            self.execution = Execution(
+                config=self.config,
+                state=self.state,
+                recorder=self.recorder,
+                params=self.params
+            )
 
         # Orchestration Layer
         self.engine = Engine(
@@ -3216,17 +4026,18 @@ class TradingSystem:
             execution=self.execution,
             recorder=self.recorder,
             dashboard=self.react_dashboard,
-            params=params,
+            params=self.params,
             signal_queue=self.signal_queue
         )
 
         # Market Data Layer
         FEEDS = {
-            ("live", "binance"): BinanceFeed,
-            ("replay", "binance"): ReplayFeed,
+            "binance_futures": BinanceFuturesFeed,
+            "binance_spot": BinanceSpotFeed,
+            "replay": ReplayFeed,
         }
 
-        FeedClass = FEEDS[(params["mode"], params["exchange"])]
+        FeedClass = FEEDS[self.params["exchange"]]
 
         self.feed = FeedClass(
             state=self.state,
@@ -3236,35 +4047,32 @@ class TradingSystem:
                 "log_event": self.recorder.log_event,
                 "log_orderbook_snapshot": self.recorder.log_orderbook_snapshot
             },
-            params=params
+            params=self.params
         )
 
         # Runtime Control
-        # self.running = False
         self.engine_running = False
         self.dashboard_running = False
         self.threads = []
 
     def start(self):
-        # self.running = True
-
         self.engine_running = True
         self.dashboard_running = True
-        
         self.react_dashboard.start()
-
         self.engine.start_rich_dashboard()
+
         self.feed.start()
 
-        self.start_execution_loop()
+        if self.user_stream is not None:
+            self.user_stream.start()
 
+        self.start_execution_loop()
         self.start_react_dashboard_loop()
         self.start_rich_dashboard_loop()
 
     def start_execution_loop(self): # EVENT DRIVEN
 
         def exec_loop():
-            # while self.running:
             while self.engine_running:
                 try:
                     signal = self.signal_queue.get(timeout=0.1)
@@ -3285,7 +4093,6 @@ class TradingSystem:
     def start_rich_dashboard_loop(self):
 
         def rich_loop():
-            # while self.running:
             while self.dashboard_running:
                 self.engine.update_dashboard()
                 time.sleep(0.02) # 50Hz dashboard refresh
@@ -3297,7 +4104,6 @@ class TradingSystem:
     def start_react_dashboard_loop(self):
 
         def react_loop():
-            # while self.running:
             while self.dashboard_running:
                 snapshot = self.engine.build_snapshot()
 
@@ -3313,7 +4119,6 @@ class TradingSystem:
         self.threads.append(t)
 
     def run_forever(self):
-
         try:
             # while self.running:
             while self.engine_running:
@@ -3326,32 +4131,23 @@ class TradingSystem:
             self.shutdown()
 
     def shutdown(self):
-
         # 1. stop feed
-        # self.running = False
-
         self.engine_running = False
-
         self.feed.stop()
 
-        # # 2. stop signal flow
-        # self.signal_queue = queue.Queue()
-
-        # 3. cancel all orders
+        # 2. cancel all orders
         print("CLOSING OPEN POSITIONS")
         print("")
-        self.execution._cancel_side("BUY")
-        self.execution._cancel_side("SELL")
+        self.execution.cancel_all_orders()
 
-        # 4. wait for fill completion
+        # 3. wait for fill completion
         while self.execution.open_orders:
             time.sleep(0.05)
 
-        # 5. flatten inventory
+        # 4. flatten inventory
         self.execution.place_market()
-        print("")
 
-        # IMPORTANT: allow fills to settle
+        # allow fills to settle
         while abs(self.state.inventory) > 1e-9: 
             time.sleep(0.05)
 
@@ -3360,7 +4156,9 @@ class TradingSystem:
         for t in self.threads:
             t.join(timeout=1)
 
-        # 6. final stats
+        print("")
+
+        # 5. final stats
         self.recorder.export_run()
 
 def load_manifest(path):
@@ -3368,14 +4166,10 @@ def load_manifest(path):
         return json.load(f)
     
 if __name__ == "__main__":
-    # params = load_manifest(r"data\manifest_live.json")
-    # params = load_manifest(r"data\runs\run_20260601_122340\manifest_replay.json")
     path = input("Enter manifest path: ").strip('"').strip("'")
     params = load_manifest(path)
-    # params = load_manifest(r"data\runs\run_20260606_031617\manifest_replay_mid_microsignal_fees.json")
     
     system = TradingSystem(params=params)
     
     system.start()
-
     system.run_forever()

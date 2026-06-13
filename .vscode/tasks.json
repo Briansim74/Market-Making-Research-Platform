@@ -24,6 +24,27 @@
 		},
 		{
 			"type": "cppbuild",
+			"label": "Build with g++ Zenbook",
+			"command": "C:\\Program Files (x86)\\msys64\\mingw64\\bin\\g++.exe",
+			"args": [
+				"-std=c++23",
+				"-fdiagnostics-color=always",
+				"-g",
+				"${file}",
+				"-o",
+				"${fileDirname}\\${fileBasenameNoExtension}.exe"
+			],
+			"options": {
+				"cwd": "C:\\Program Files (x86)\\msys64\\mingw64\\bin"
+			},
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build",
+			"detail": "compiler: C:\\Program Files (x86)\\msys64\\mingw64\\bin\\g++.exe"
+		},
+		{
+			"type": "cppbuild",
 			"label": "Build with clang++",
 			"command": "D:\\msys64\\mingw64\\bin\\clang++.exe",
 			"args": [
@@ -43,6 +64,28 @@
 			],
 			"group": "build",
 			"detail": "compiler: D:\\msys64\\mingw64\\bin\\clang++.exe"
+		},
+		{
+			"type": "cppbuild",
+			"label": "Build with clang++ Zenbook",
+			"command": "C:\\Program Files (x86)\\msys64\\mingw64\\bin\\clang++.exe",
+			"args": [
+				"-std=c++23",
+				"-fcolor-diagnostics",
+				"-fansi-escape-codes",
+				"-g",
+				"${file}",
+				"-o",
+				"${fileDirname}\\${fileBasenameNoExtension}.exe"
+			],
+			"options": {
+				"cwd": "C:\\Program Files (x86)\\msys64\\mingw64\\bin"
+			},
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build",
+			"detail": "compiler: C:\\Program Files (x86)\\msys64\\mingw64\\bin\\clang++.exe"
 		}
 	]
 }

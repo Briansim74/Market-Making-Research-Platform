@@ -76,6 +76,11 @@ export default function Dashboard() {
           />
 
           <Row
+            label="Microprice"
+            value={m.microprice.toFixed(4)}
+          />
+
+          <Row
             label="Spread"
             value={m.spread.toFixed(4)}
           />
@@ -127,6 +132,26 @@ export default function Dashboard() {
           <Section title="SIGNALS" />
 
           <Row
+            label="Spread Multiplier"
+            value={s.spread_multiplier.toFixed(2)}
+          />
+
+          <Row
+            label="Inventory Target"
+            value={s.inventory_target.toFixed(2)}
+          />
+
+          <Row
+            label="Alpha Order Imb"
+            value={s.alpha_order_imb.toFixed(2)}
+          />
+
+          <Row
+            label="Alpha Trade Imb"
+            value={s.alpha_trade_imb.toFixed(2)}
+          />
+
+          <Row
             label="Fair Value"
             value={s.fair_value.toFixed(4)}
           />
@@ -137,28 +162,23 @@ export default function Dashboard() {
           />
 
           <Row
-            label="Reservation"
-            value={s.reservation.toFixed(4)}
-          />
-
-          <Row
-            label="Alpha Imb"
-            value={s.alpha_imb.toFixed(2)}
-          />
-
-          <Row
-            label="Alpha FLow"
-            value={s.alpha_flow.toFixed(2)}
-          />
-
-          <Row
             label="Alpha Struct"
             value={s.alpha_struct.toFixed(2)}
           />
 
           <Row
-            label="Signal Quality"
+            label="ML Signal Quality"
             value={s.signal_quality.toFixed(2)}
+          />
+
+          <Row
+            label="Toxicity"
+            value={s.tox.toFixed(2)}
+          />
+
+          <Row
+            label="Reservation"
+            value={s.reservation.toFixed(4)}
           />
 
           {/* QUOTES */}
@@ -180,40 +200,32 @@ export default function Dashboard() {
 
           <Row
             label="Queue Ahead / Bid"
-            // value={e.bid_queue.toFixed(4)}
-            // value={`${e.bid_queue.toFixed(4)} (${q.my_bid.toFixed(4)})`}
             value={`${q.my_bid.toFixed(4)} (${e.bid_queue.toFixed(4)})`}
           />
 
           <Row
             label="Queue Ahead / Ask"
-            // value={e.ask_queue.toFixed(4)}
-            // value={`${e.ask_queue.toFixed(4)} (${q.my_ask.toFixed(4)})`}
             value={`${q.my_ask.toFixed(4)} (${e.ask_queue.toFixed(4)})`}
           />
 
           <Row
             label="Queue Pressure / Bid"
-            // value={e.bid_pressure.toFixed(4)}
-            // value={`${e.bid_pressure.toFixed(4)} (${q.my_bid.toFixed(4)})`}
             value={`${q.my_bid.toFixed(4)} (${e.bid_pressure.toFixed(4)})`}
           />
 
           <Row
             label="Queue Pressure / Ask"
-            // value={e.ask_pressure.toFixed(4)}
-            // value={`${e.ask_pressure.toFixed(4)} (${q.my_ask.toFixed(4)})`}
             value={`${q.my_ask.toFixed(4)} (${e.ask_pressure.toFixed(4)})`}
           />
 
           <Row
             label="Open Orders"
-            value={e.open_order_one}
+            value={e.buy_order}
           />
 
           <Row
             label=""
-            value={e.open_order_two}
+            value={e.sell_order}
           />
 
           <Row
@@ -247,6 +259,13 @@ export default function Dashboard() {
             label="Unrealized PnL"
             value={
               <PnL value={r.unrealized_pnl} />
+            }
+          />
+
+          <Row
+            label="Fees Paid"
+            value={
+              <PnL value={-r.fees_paid} />
             }
           />
 

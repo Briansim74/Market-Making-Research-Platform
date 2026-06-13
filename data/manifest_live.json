@@ -8,11 +8,14 @@
     "regime_model": "",
     "toxicity_model": ""
   },
-  "exchange": "binance",
+  "exchange": "binance_futures",
   "instrument": "btcusdt",
   "tick_size": 0.01,
+  "step_size": 0.0001,
   "gamma": 0.1,
-  "fees" : {
+  "base_size": 0.2,
+  "max_inv": 0.8,
+  "fees": {
     "maker_fee_rate": 0.0002,
     "taker_fee_rate": 0.0002
   },
@@ -37,5 +40,10 @@
     "fees_paid": 0.0,
     "fees_per_fill": 0.0,
     "pnl_per_fill": 0.0
+  },
+  "api": {
+    "api_key": "",
+    "api_secret": "",
+    "base_url": "https://testnet.binancefuture.com"
   }
 }
