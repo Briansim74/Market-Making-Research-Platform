@@ -206,19 +206,19 @@ The platform includes a full live execution layer on Binance Futures Testnet, cl
 ### Execution Stack
 - Broker Layer (BinanceBroker)
   - REST order placement/cancel with HMAC authentication
-  - User data stream (listenKey) for order lifecycle tracking
-  - Position reconciliation via positionRisk
-  - Session keepalive and recovery handling
+  - user data stream (listenKey) for order lifecycle tracking
+  - position reconciliation via positionRisk
+  - session keepalive and recovery handling
 - Execution Engine (LiveExecution)
-  - Inventory- and volatility-adjusted asymmetric quoting
-  - Toxicity-aware participation and sizing
-  - Queue-aware cancel/replace logic
-  - Real-time trade-flow ingestion for state updates
+  - inventory- and volatility-adjusted asymmetric quoting
+  - toxicity-aware participation and sizing
+  - queue-aware cancel/replace logic
+  - real-time trade-flow ingestion for state updates
 - User Stream Handler (BinanceUserStream)
   - WebSocket ORDER_TRADE_UPDATE processing
-  - Handles NEW / TRADE / CANCELED / REJECTED states
-  - Maintains queue position estimates at entry
-  - Synchronizes internal execution state with exchange events
+  - handles NEW / TRADE / CANCELED / REJECTED states
+  - maintains queue position estimates at entry
+  - synchronizes internal execution state with exchange events
 
 ## Key Live Findings
 ####  1. Latency is structural (~600-700ms end-to-end)
