@@ -99,7 +99,7 @@ Behavior:
 ## Toxicity Model (Execution Risk)
 Predicts expected markout conditional on execution:
 ```
-T(x) = E[ future markout_h ∣ fill, state ]
+T(x) = E[future markout_h ∣ fill, state]
 ```
 
 Inputs:
@@ -200,11 +200,87 @@ The dominant improvement lever is not stronger signals, but tighter coupling bet
 - adverse selection filtering
 - regime-aware participation
 
+## Live Execution (Binance Futures Testnet)
+The platform includes a full live execution layer on Binance Futures Testnet, closing the loop from signal generation → quoting → execution → fills → PnL, and validating microstructure assumptions against real exchange behavior.
+
+### Execution Stack
+- Broker Layer (BinanceBroker)
+  - REST order placement/cancel with HMAC authentication
+  - User data stream (listenKey) for order lifecycle tracking
+  - Position reconciliation via positionRisk
+  - Session keepalive and recovery handling
+- Execution Engine (LiveExecution)
+  - Inventory- and volatility-adjusted asymmetric quoting
+  - Toxicity-aware participation and sizing
+  - Queue-aware cancel/replace logic
+  - Real-time trade-flow ingestion for state updates
+- User Stream Handler (BinanceUserStream)
+  - WebSocket ORDER_TRADE_UPDATE processing
+  - Handles NEW / TRADE / CANCELED / REJECTED states
+  - Maintains queue position estimates at entry
+  - Synchronizes internal execution state with exchange events
+
+## Key Live Findings
+####  1. Latency (~600-700ms end-to-end)
+Signal → exchange confirmation exhibits ~600-700ms latency, dominated by REST gateway overhead, network RTT, and WebSocket propagation.
+
+Implication:
+- Latency is a first-order state variable; REST execution is not HFT-competitive and must be explicitly modeled in fill and queue dynamics.
+
+####  2. Market Data is Bursty (~150-300ms updates)
+Order book updates arrive in irregular bursts rather than fixed intervals due to event-driven book changes and batched WebSocket delivery.
+
+Implication:
+- L2 data is intrinsically asynchronous; fixed-timestep assumptions distort microstructure inference.
+
+####  3. Execution Dominates Signal Quality
+Live results confirm that queue position, cancellation timing, and latency differentials materially impact execution outcomes.
+
+Most theoretical alpha is reshaped or destroyed by execution mechanics rather than prediction error.
+
+####  4. Alpha-Execution Decomposition Holds
+- Alpha models correctly identify directional bias
+- Toxicity model predicts adverse selection risk
+- Execution layer determines realized PnL
+
+Short-horizon variance is dominated by execution noise rather than signal quality.
+
+####  5. Queue State is First-Class Signal
+Queue position at order entry, cancellation dynamics, and trade-driven depletion are critical drivers of fill probability.
+
+This validates explicit modeling of:
+- queue-ahead estimation
+- cancellation-induced queue resets
+- trade-flow-based depletion
+
+## Updated Core Takeaway (Reinforced)
+Market making is not constrained by predictive signal quality.
+
+It is constrained by:
+- latency uncertainty
+- queue position randomness
+- execution path dependence
+- regime-dependent liquidity fragility
+
+In live conditions, execution dynamics dominate alpha, and the primary optimization problem becomes:
+- selective participation under microstructure and latency constraints, not prediction.
+
+## Future Directions
+- Exchange-specific latency and acknowledgement modeling.
+- Hawkes-process based order-flow forecasting.
+- C++ execution engine for low-latency simulation.
+- Live paper-trading and liquidity-provision deployment. (completed)
+- Live validation for:
+  - fill probability estimates
+  - toxicity predictions
+  - regime classifications
+
+against real Binance executions under small-capital deployment.
 
 ## Example Output
 Below are sample outputs illustrating the engine decision mechanics.
 
-### Trading Terminal Dashboard with Market Data and Strategy Parameters
+### Trading Terminal Dashboard with L2 Market Data and Strategy Parameters
 <img width="700" height="1300" alt="React Trading Terminal" src="https://github.com/Briansim74/Market-Making-Research-Platform/blob/main/react.png"/>
 
 </br></br></br>
@@ -466,7 +542,7 @@ Rather than forecasting future prices, the objective is to estimate the expected
 
 Formally:
 ```
-T(x) = E[ future markout_h ∣ fill, state ]
+T(x) = E[future markout_h ∣ fill, state]
 ```
 
 where:
@@ -683,14 +759,14 @@ while maintaining competitive quotes.
 | Mid + Struct_delta + Micro signal + Residual + Regime + Toxicity | +444.46	| -0.0082 | +0.4601    | 0.1155      | Full conditional system, fewer but higher quality fills         |
 
 ## Key Updated Findings
-### 1. Alpha and Execution Are Distinct Sources of Edge
+#### 1. Alpha and Execution Are Distinct Sources of Edge
 The research suggests that profitability comes from two separate mechanisms:
 - Alpha models determine where future price movement is likely to occur.
 - Execution models determine whether that edge is actually captured.
 
 Microprice and structural alpha generate the majority of directional profitability, while toxicity, fill modeling, and regime classification determine how efficiently that edge is realized.
 
-### 2. Micro + Structural Alpha Remain the Core Predictive Signals
+#### 2. Micro + Structural Alpha Remain the Core Predictive Signals
 Across all configurations, the largest improvements over baseline originate from:
 - microprice alpha
 - structural alpha
@@ -699,7 +775,7 @@ Structural alpha consistently outperforms microprice individually, while the com
 
 This suggests that short-horizon order-book pressure and slower market-state information contain complementary predictive information.
 
-### 3. Regimes Concentrate Alpha Rather Than Create It
+#### 3. Regimes Concentrate Alpha Rather Than Create It
 Regime conditioning is one of the strongest improvements observed in the research.
 
 However, regimes do not create directional edge on their own:
@@ -717,7 +793,7 @@ The primary role of regimes is therefore:
 
 Regimes define when edge is available, not where it comes from.
 
-### 4. Toxicity Is an Execution Model, Not an Alpha Model
+#### 4. Toxicity Is an Execution Model, Not an Alpha Model
 The toxicity model produced some of the strongest predictive statistics in the project:
 - positive IC across all horizons
 - rank IC up to ~0.43
@@ -734,7 +810,7 @@ Its primary effect is:
 
 The toxicity model therefore behaves more like a risk filter than a profit-maximizing signal.
 
-### 5. Residual ML Captures the Hardest Remaining Signal
+#### 5. Residual ML Captures the Hardest Remaining Signal
 After:
 - microprice alpha
 - structural alpha
@@ -752,7 +828,7 @@ This suggests the residual model is solving a substantially harder problem than 
 
 Rather than generating a new source of edge, it acts as a residual drift estimator and execution-quality filter.
 
-### 6. Execution Costs Materially Alter Strategy Economics
+#### 6. Execution Costs Materially Alter Strategy Economics
 Introducing maker and taker fees changed both realized profitability and strategy rankings.
 
 The results show that:
@@ -768,18 +844,6 @@ This confirms that realistic execution modeling requires:
 
 Ignoring fees materially overstates market-making profitability.
 
-## Future Directions
-- Exchange-specific latency and acknowledgement modeling.
-- Hawkes-process based order-flow forecasting.
-- C++ execution engine for low-latency simulation.
-- Live paper-trading and liquidity-provision deployment.
-- Live validation for:
-  - fill probability estimates
-  - toxicity predictions
-  - regime classifications
-
-against real Binance executions under small-capital deployment.
-
 ## Core Takeaway
 Market making is not a spread-capture problem and it is not purely a forecasting problem.
 
@@ -792,6 +856,137 @@ It is a conditional execution problem where:
 
 The strongest result of the research is that profitability increasingly comes from selective participation rather than stronger prediction.
 
+## Live Execution (Binance Futures Testnet)
+The platform has been extended with a fully live execution layer connected to Binance Futures Testnet, enabling end-to-end validation of the market-making stack from signal → quote → execution → fill → PnL.
+
+This closes the loop between theoretical microstructure modeling and real exchange behavior.
+
+### Execution Architecture
+The live system is composed of three tightly coupled components:
+- Broker Layer (BinanceBroker)
+  - REST-based order placement and cancellation
+  - HMAC-signed authenticated requests
+  - User data stream (listenKey) for order lifecycle tracking
+  - Position reconciliation via positionRisk endpoint
+  - Keepalive thread to maintain session validity
+- Execution Engine (LiveExecution)
+  - Asymmetric quoting based on:
+    - volatility scaling
+    - inventory risk skew
+    - toxicity-aware sizing
+  - Queue-aware order management (cancel/replace logic)
+  - Inventory-bounded risk guardrails
+  - Trade-flow ingestion for microstructure state updates
+- User Stream Handler (BinanceUserStream)
+  - WebSocket-based order lifecycle tracking (ORDER_TRADE_UPDATE)
+  - Handles:
+    - NEW (order accepted + live)
+    - TRADE (partial / full fills)
+    - CANCELED / REJECTED states
+  - Maintains queue position estimates at join time
+  - Synchronizes execution state with exchange-confirmed events
+
+## Key Live Findings
+#### 1. End-to-End Order Latency (Signal → Live Confirmation)
+Observed delay between order submission and exchange “LIVE” confirmation:
+```
+~600-700ms typical round-trip latency
+```
+
+This includes:
+- network RTT (client → Binance API)
+- API gateway validation (auth, margin, filters)
+- WebSocket event propagation delay
+- local system scheduling + processing
+
+#### Interpretation
+This latency is not abnormal for REST-based market making on Binance Futures.
+
+It confirms:
+- REST execution is not HFT-grade
+- microsecond-level assumptions do not hold in this mode
+- execution modeling must explicitly include latency as a state variable
+
+#### 2. Market Data Update Cadence (~200ms bursts)
+After isolating the execution engine, depth updates were still observed at:
+```
+~150-300ms burst intervals
+```
+#### Key Insight
+This is not system-induced latency.
+
+It reflects natural characteristics of the exchange feed, specifically:
+- order book updates are event-driven, not periodic
+- updates arrive only when top-of-book changes
+- low activity periods produce bursty diffusion patterns
+- WebSocket delivery is batched for efficiency
+
+#### Interpretation
+What appears as a “fixed 200ms tick” is actually:
+```
+sparse microstructure activity + batched propagation
+```
+
+This is important because it invalidates any assumption of uniform temporal resolution in L2 data.
+
+#### 3. Execution Reality vs Model Assumptions
+The live system confirms a key design assumption of the platform:
+```
+Most theoretical alpha is destroyed or reshaped by execution mechanics rather than signal quality.
+```
+
+Observed effects:
+- queue position changes dominate fill probability
+- small latency differences materially affect execution priority
+- cancellation timing significantly impacts realized spread capture
+
+#### 4. Alpha vs Execution Separation Holds
+Empirically validated decomposition:
+- Alpha stack correctly identifies directional bias
+- Toxicity model strongly predicts adverse selection risk
+- Execution layer determines whether alpha survives
+
+However:
+- execution noise often dominates short-horizon PnL variability
+
+This reinforces the system design principle:
+- Market making performance is primarily an execution filtering problem, not a prediction problem.
+
+#### 5. Queue Dynamics Are First-Class State
+Live behavior confirms:
+- queue position at join time is a meaningful latent variable
+- cancellations reset queue assumptions entirely
+- fills are highly sensitive to micro-tick positioning and churn
+
+This validates explicit modeling of:
+- queue ahead estimation
+- cancellation-driven queue decay
+- trade-flow-induced depletion
+
+## Updated Core Takeaway (Reinforced)
+Market making is not constrained by signal generation quality.
+
+It is constrained by:
+- latency uncertainty
+- queue position randomness
+- execution path dependency
+- regime-dependent liquidity fragility
+
+Final empirical takeaway:
+- In live conditions, execution dynamics dominate alpha quality.
+- The dominant optimization surface is not prediction — it is participation timing under microstructure constraints.
+
+## Future Directions
+- Exchange-specific latency and acknowledgement modeling.
+- Hawkes-process based order-flow forecasting.
+- C++ execution engine for low-latency simulation.
+- Live paper-trading and liquidity-provision deployment. (completed)
+- Live validation for:
+  - fill probability estimates
+  - toxicity predictions
+  - regime classifications
+
+against real Binance executions under small-capital deployment.
 
 ## Example Output
 Below are sample outputs illustrating how the engine behaves.
