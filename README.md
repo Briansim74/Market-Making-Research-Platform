@@ -221,37 +221,25 @@ The platform includes a full live execution layer on Binance Futures Testnet, cl
   - Synchronizes internal execution state with exchange events
 
 ## Key Live Findings
-####  1. Latency (~600-700ms end-to-end)
-Signal → exchange confirmation exhibits ~600-700ms latency, dominated by REST gateway overhead, network RTT, and WebSocket propagation.
+####  1. Latency is structural (~600-700ms end-to-end)
+- signal → execution exhibits ~600-700ms latency dominated by REST gateway, network RTT, and WebSocket propagation.
+- latency is a first-order state variable; it must be explicitly modeled in fill probability and queue dynamics.
 
-Implication:
-- Latency is a first-order state variable; REST execution is not HFT-competitive and must be explicitly modeled in fill and queue dynamics.
+####  2. Market data is asynchronous (~150-300ms bursty updates)
+- order book updates arrive in event-driven bursts rather than fixed intervals due to batched WebSocket delivery.
+- L2 data is intrinsically irregular; fixed-timestep assumptions distort microstructure inference.
 
-####  2. Market Data is Bursty (~150-300ms updates)
-Order book updates arrive in irregular bursts rather than fixed intervals due to event-driven book changes and batched WebSocket delivery.
+####  3. Execution dominates signal quality
+- queue position, cancellation timing, and latency differentials materially affect realized outcomes.
+- most theoretical alpha is reshaped by execution mechanics rather than prediction error.
 
-Implication:
-- L2 data is intrinsically asynchronous; fixed-timestep assumptions distort microstructure inference.
+####  4. Alpha-execution decomposition holds in practice
+- alpha identifies directional bias, toxicity captures adverse selection risk, and execution determines realized PnL.
+- short-horizon variance is dominated by execution noise rather than signal quality.
 
-####  3. Execution Dominates Signal Quality
-Live results confirm that queue position, cancellation timing, and latency differentials materially impact execution outcomes.
-
-Most theoretical alpha is reshaped or destroyed by execution mechanics rather than prediction error.
-
-####  4. Alpha-Execution Decomposition Holds
-- Alpha models correctly identify directional bias
-- Toxicity model predicts adverse selection risk
-- Execution layer determines realized PnL
-
-Short-horizon variance is dominated by execution noise rather than signal quality.
-
-####  5. Queue State is First-Class Signal
-Queue position at order entry, cancellation dynamics, and trade-driven depletion are critical drivers of fill probability.
-
-This validates explicit modeling of:
-- queue-ahead estimation
-- cancellation-induced queue resets
-- trade-flow-based depletion
+####  5. Queue state is first-class signal
+- queue position, cancellation dynamics, and trade-driven depletion are primary drivers of fill probability.
+- validates explicit modeling of queue-ahead, cancellation resets, and trade-flow-based depletion.
 
 ## Updated Core Takeaway (Reinforced)
 Market making is not constrained by predictive signal quality.
