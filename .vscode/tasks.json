@@ -23,6 +23,25 @@
 			"detail": "compiler: D:\\msys64\\mingw64\\bin\\g++.exe"
 		},
 		{
+		"label": "Build mmpy with MSVC",
+		"type": "shell",
+		"command": "D:\\OneDrive\\Trading\\Market Making\\external\\build_msvc.bat",
+		"args": [
+			"${file}"
+		],
+		"options": {
+			"shell": {
+			"executable": "C:\\Windows\\System32\\cmd.exe",
+			"args": ["/d", "/c"]
+			}
+		},
+		"group": {
+			"kind": "build",
+			"isDefault": true
+		},
+		"problemMatcher": []
+		},
+		{
 			"type": "cppbuild",
 			"label": "Build with g++ Zenbook",
 			"command": "C:\\Program Files (x86)\\msys64\\mingw64\\bin\\g++.exe",

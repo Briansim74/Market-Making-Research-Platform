@@ -87,12 +87,12 @@ export default function Dashboard() {
 
           <Row
             label="Best Bid / Size"
-            value={`${m.bid.toFixed(4)} (${m.bid_size.toFixed(4)})`}
+            value={`${m.best_bid.toFixed(4)} (${m.bid_size.toFixed(4)})`}
           />
 
           <Row
             label="Best Ask / Size"
-            value={`${m.ask.toFixed(4)} (${m.ask_size.toFixed(4)})`}
+            value={`${m.best_ask.toFixed(4)} (${m.ask_size.toFixed(4)})`}
           />
 
           <Row
@@ -153,7 +153,7 @@ export default function Dashboard() {
 
           <Row
             label="Fair Value"
-            value={s.fair_value.toFixed(4)}
+            value={s.fair.toFixed(4)}
           />
 
           <Row
@@ -345,7 +345,7 @@ function Section({ title, value }) {
 
 function PnL({ value }) {
 
-  let color = "#ffffff";
+  let color = "#c1c1c1f4";
   let prefix = "";
 
   if (value > 0) {
@@ -361,8 +361,7 @@ function PnL({ value }) {
   return (
     <span
       style={{
-        color,
-        fontWeight: "bold",
+        color
       }}
     >
       {prefix}
@@ -396,8 +395,7 @@ function InventoryRisk({ inventory, limit = 10 }) {
   return (
     <span
       style={{
-        color,
-        fontWeight: "bold",
+        color
       }}
     >
       {prefix}

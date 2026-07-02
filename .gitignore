@@ -1,0 +1,26 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Build outputs
+Debug/
+Release/
+x64/
+x86/
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.dll
+*.lib
+
+# Data / logs (VERY important)
+*.log
+*.csv
+*.parquet
+*.bin
+
+# OS junk
+.DS_Store
+Thumbs.db
