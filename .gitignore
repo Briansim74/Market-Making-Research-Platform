@@ -18,7 +18,7 @@ x86/
 # Data / logs (VERY important)
 *.log
 *.csv
-*.parquet
+# *.parquet
 *.bin
 
 # OS junk
