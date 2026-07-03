@@ -3499,7 +3499,7 @@ class State:
 
     def get_pnl(self):
         mid = self.market_book.mid()
-        unrealized = self.inventory * (mid - self.avg_entry_price)
+        unrealized = self.inventory * (mid - self.avg_entry_price) - self.fees_paid
 
         return self.realized_pnl + unrealized
     

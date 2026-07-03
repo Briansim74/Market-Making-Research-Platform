@@ -96,6 +96,40 @@ struct Regime {
     double microprice_error;
 };
 
+struct Features {
+    double mid;
+    double fair;
+    double skew;
+    double microprice;
+    double microprice_dev;
+    double spread;
+
+    double order_imbalance;
+    double trade_imbalance;
+    double inventory;
+    double volatility;
+
+    double queue_ahead_bid;
+    double queue_ahead_ask;
+};
+
+struct Policy {
+    std_string regime = "no_model";
+    int regime_id = -1;
+    double regime_prob = 0.0;
+
+    double alpha_order_imb = 0.2;
+    double alpha_trade_imb = 0.05;
+    double alpha_struct = 0.3;
+
+    double spread_multiplier = 1.0;
+    double k0 = 0.5;
+    double inventory_target = 0.0;
+
+    double residual_mid = 0.0;
+    double micro_residual = 0.0;
+};
+
 struct Toxicity {
     double tox = 0.0;
     double k1 = 0.2;

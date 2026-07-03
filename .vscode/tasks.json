@@ -25,7 +25,7 @@
 		{
 		"label": "Build mmpy with MSVC",
 		"type": "shell",
-		"command": "D:\\OneDrive\\Trading\\Market Making\\external\\build_msvc.bat",
+		"command": "D:\\OneDrive\\Trading\\Market Making\\build\\build_msvc.bat",
 		"args": [
 			"${file}"
 		],

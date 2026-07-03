@@ -1,11 +1,16 @@
+set BUILD_DIR=D:\OneDrive\Trading\Market Making\build
+
 call "D:\VSS Code\Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
 
 cl ^
  /nologo ^
+ /bigobj ^
  /std:c++latest ^
  /EHsc ^
  /Zi ^
  /MD ^
+ /Fd"%BUILD_DIR%\vc140.pdb" ^
+ /Fo"%BUILD_DIR%\\" ^
  "%~1" ^
  "D:\OneDrive\Trading\Market Making\external\simdjson\src\simdjson.cpp" ^
  /I"D:\OneDrive\Trading\Market Making\external\simdjson\include" ^
@@ -16,6 +21,8 @@ cl ^
  /DWIN32_LEAN_AND_MEAN ^
  /D_WIN32_WINNT=0x0A00 ^
  /link ^
+ /INCREMENTAL:NO ^
+ /PDB:"%BUILD_DIR%\%~n1.pdb" ^
  /LIBPATH:"D:\OneDrive\Trading\Market Making\external\xgboost\lib" ^
  /LIBPATH:"D:\vcpkg\installed\x64-windows\lib" ^
 
