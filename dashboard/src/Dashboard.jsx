@@ -32,13 +32,12 @@ export default function Dashboard() {
 
       {/* TITLE */}
       <div style={styles.title}>
-        <span style={styles.italic}>{t.struct_model}</span>
-        {" | "}
-        <span style={styles.italic}>{t.mode}</span>
-        {" | "}
-        <span style={styles.italic}>{t.exchange}</span>
-        {" | "}
-        <span style={styles.italic}>{t.instrument}</span>
+        {t.header.split(" | ").map((part, i) => (
+          <span key={i}>
+            {i > 0 && " | "}
+            <span style={styles.italic}>{part}</span>
+          </span>
+        ))}
         {" | "}
         <span style={styles.italic}>{t.regime}</span>
         {" | "}
@@ -152,6 +151,11 @@ export default function Dashboard() {
           />
 
           <Row
+            label="Alpha Struct"
+            value={s.alpha_struct.toFixed(2)}
+          />
+
+          <Row
             label="Fair Value"
             value={s.fair.toFixed(4)}
           />
@@ -162,12 +166,7 @@ export default function Dashboard() {
           />
 
           <Row
-            label="Alpha Struct"
-            value={s.alpha_struct.toFixed(2)}
-          />
-
-          <Row
-            label="ML Signal Quality"
+            label="Residual Signal Quality"
             value={s.signal_quality.toFixed(2)}
           />
 
@@ -464,7 +463,7 @@ function CenteredInventoryBar({
         {left}
       </span>
 
-      <span style={{ color: "#ffffff" }}>
+      <span style={{ color: "#c1c1c1f4" }}>
         {center}
       </span>
 

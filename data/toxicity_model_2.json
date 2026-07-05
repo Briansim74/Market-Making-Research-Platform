@@ -1,0 +1,16 @@
+{
+    "model_name": "toxicity_model_2",
+    "target": "markout_100ms",
+    "model_file": "data/toxicity_model_2_xgb.json",
+    "horizon_ms": 100,
+    "feature_cols": [
+        "microprice_dev",
+        "order_imbalance",
+        "trade_imbalance",
+        "volatility",
+        "spread",
+        "queue_ahead_bid",
+        "queue_ahead_ask"
+    ],
+    "feature_dim": 7
+}

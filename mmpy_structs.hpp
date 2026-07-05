@@ -85,6 +85,12 @@ struct Depth {
     vector<pair<int64_t, double>> ask_delta;
 };
 
+struct EventNotifier {
+    mutex signal_mtx;
+    condition_variable signal_cv;
+    bool signal_pending = false;
+};
+
 struct Regime {
     double volatility;
     double spread;
@@ -114,7 +120,7 @@ struct Features {
 };
 
 struct Policy {
-    std_string regime = "no_model";
+    std_string regime = "no_regime_model";
     int regime_id = -1;
     double regime_prob = 0.0;
 
@@ -162,7 +168,7 @@ struct Signal {
     double skew;
     double struct_delta;
     double micro_signal_delta;
-    double ml_delta;
+    double residual_delta;
     double reservation;
 
     std_string regime;
@@ -231,10 +237,7 @@ struct EventsRow {
 
 struct Snapshot {
     struct {
-        std_string struct_model;
-        std_string mode;
-        std_string exchange;
-        std_string instrument;
+        std_string header;
         std_string regime;
         double pnl_pct;
     } title;
@@ -339,7 +342,7 @@ struct SnapshotRow {
     double skew;
     double struct_delta;
     double micro_signal_delta;
-    double ml_delta;
+    double residual_delta;
     double reservation;
 
     std_string regime;
@@ -442,7 +445,7 @@ struct QuoteRow {
     double skew;
     double struct_delta;
     double micro_signal_delta;
-    double ml_delta;
+    double residual_delta;
     double reservation;
 
     std_string regime;
@@ -505,7 +508,7 @@ struct FillRow {
     double skew;
     double struct_delta;
     double micro_signal_delta;
-    double ml_delta;
+    double residual_delta;
     double reservation;
 
     std_string regime;

@@ -295,7 +295,7 @@ public:
         row.skew = signal.skew;
         row.struct_delta = signal.struct_delta;
         row.micro_signal_delta = signal.micro_signal_delta;
-        row.ml_delta = signal.ml_delta;
+        row.residual_delta = signal.residual_delta;
         row.reservation = signal.reservation;
 
         row.regime = signal.regime;
@@ -372,7 +372,7 @@ public:
         DoubleBuilder skew_b(pool);
         DoubleBuilder struct_delta_b(pool);
         DoubleBuilder micro_signal_delta_b(pool);
-        DoubleBuilder ml_delta_b(pool);
+        DoubleBuilder residual_delta_b(pool);
         DoubleBuilder reservation_b(pool);
         
         StringBuilder regime_b(pool);
@@ -438,7 +438,7 @@ public:
             skew_b.Append(r.skew);
             struct_delta_b.Append(r.struct_delta);
             micro_signal_delta_b.Append(r.micro_signal_delta);
-            ml_delta_b.Append(r.ml_delta);
+            residual_delta_b.Append(r.residual_delta);
             reservation_b.Append(r.reservation);
 
             regime_b.Append(r.regime);
@@ -479,7 +479,7 @@ public:
         shared_ptr<Array> order_imbalance_arr, trade_imbalance_arr, volatility_arr;
         shared_ptr<Array> queue_ahead_bid_arr, queue_ahead_ask_arr;
         shared_ptr<Array> inventory_arr, realized_pnl_arr, unrealized_pnl_arr, total_pnl_arr, equity_arr;
-        shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, ml_delta_arr, reservation_arr;
+        shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr;
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
         shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
         shared_ptr<Array> k0_arr, spread_multiplier_arr, inventory_target_arr;
@@ -520,7 +520,7 @@ public:
         skew_b.Finish(&skew_arr);
         struct_delta_b.Finish(&struct_delta_arr);
         micro_signal_delta_b.Finish(&micro_signal_delta_arr);
-        ml_delta_b.Finish(&ml_delta_arr);
+        residual_delta_b.Finish(&residual_delta_arr);
         reservation_b.Finish(&reservation_arr);
         
         regime_b.Finish(&regime_arr);
@@ -586,7 +586,7 @@ public:
             field("skew", float64()),
             field("struct_delta", float64()),
             field("micro_signal_delta", float64()),
-            field("ml_delta", float64()),
+            field("residual_delta", float64()),
             field("reservation", float64()),
             
             field("regime", utf8()),
@@ -628,7 +628,7 @@ public:
             order_imbalance_arr, trade_imbalance_arr, volatility_arr,
             queue_ahead_bid_arr, queue_ahead_ask_arr,
             inventory_arr, realized_pnl_arr, unrealized_pnl_arr, total_pnl_arr, equity_arr,
-            fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, ml_delta_arr, reservation_arr,
+            fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr,
             regime_arr, regime_id_arr, regime_prob_arr,
             alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,
             k0_arr, spread_multiplier_arr, inventory_target_arr,
@@ -938,7 +938,7 @@ public:
         row.skew = order.signal.skew;
         row.struct_delta = order.signal.struct_delta;
         row.micro_signal_delta = order.signal.micro_signal_delta;
-        row.ml_delta = order.signal.ml_delta;
+        row.residual_delta = order.signal.residual_delta;
         row.reservation = order.signal.reservation;
         
         row.regime = order.signal.regime;
@@ -1005,7 +1005,7 @@ public:
         DoubleBuilder skew_b(pool);
         DoubleBuilder struct_delta_b(pool);
         DoubleBuilder micro_signal_delta_b(pool);
-        DoubleBuilder ml_delta_b(pool);
+        DoubleBuilder residual_delta_b(pool);
         DoubleBuilder reservation_b(pool);
 
         StringBuilder regime_b(pool);
@@ -1060,7 +1060,7 @@ public:
             skew_b.Append(r.skew);
             struct_delta_b.Append(r.struct_delta);
             micro_signal_delta_b.Append(r.micro_signal_delta);
-            ml_delta_b.Append(r.ml_delta);
+            residual_delta_b.Append(r.residual_delta);
             reservation_b.Append(r.reservation);
 
             regime_b.Append(r.regime);
@@ -1095,7 +1095,7 @@ public:
         shared_ptr<Array> distance_to_mid_arr, distance_to_touch_arr, inventory_arr;
 
         shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr;
-        shared_ptr<Array> micro_signal_delta_arr, ml_delta_arr, reservation_arr;
+        shared_ptr<Array> micro_signal_delta_arr, residual_delta_arr, reservation_arr;
         
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
         shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
@@ -1136,7 +1136,7 @@ public:
         skew_b.Finish(&skew_arr);
         struct_delta_b.Finish(&struct_delta_arr);
         micro_signal_delta_b.Finish(&micro_signal_delta_arr);
-        ml_delta_b.Finish(&ml_delta_arr);
+        residual_delta_b.Finish(&residual_delta_arr);
         reservation_b.Finish(&reservation_arr);
 
         regime_b.Finish(&regime_arr);
@@ -1191,7 +1191,7 @@ public:
             field("skew", float64()),
             field("struct_delta", float64()),
             field("micro_signal_delta", float64()),
-            field("ml_delta", float64()),
+            field("residual_delta", float64()),
             field("reservation", float64()),
 
             field("regime", utf8()),
@@ -1222,7 +1222,7 @@ public:
             queue_ahead_bid_arr, queue_ahead_ask_arr,
             distance_to_mid_arr, distance_to_touch_arr, inventory_arr,
             fair_arr, skew_arr, struct_delta_arr,
-            micro_signal_delta_arr, ml_delta_arr, reservation_arr,
+            micro_signal_delta_arr, residual_delta_arr, reservation_arr,
             regime_arr, regime_id_arr, regime_prob_arr,
             alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,
             k0_arr, spread_multiplier_arr, inventory_target_arr,
@@ -1297,7 +1297,7 @@ public:
         row.skew = order.signal.skew;
         row.struct_delta = order.signal.struct_delta;
         row.micro_signal_delta = order.signal.micro_signal_delta;
-        row.ml_delta = order.signal.ml_delta;
+        row.residual_delta = order.signal.residual_delta;
         row.reservation = order.signal.reservation;
 
         row.regime = order.signal.regime;
@@ -1383,7 +1383,7 @@ public:
         DoubleBuilder skew_b(pool);
         DoubleBuilder struct_delta_b(pool);
         DoubleBuilder micro_signal_delta_b(pool);
-        DoubleBuilder ml_delta_b(pool);
+        DoubleBuilder residual_delta_b(pool);
         DoubleBuilder reservation_b(pool);
 
         StringBuilder regime_b(pool);
@@ -1458,7 +1458,7 @@ public:
             skew_b.Append(r.skew);
             struct_delta_b.Append(r.struct_delta);
             micro_signal_delta_b.Append(r.micro_signal_delta);
-            ml_delta_b.Append(r.ml_delta);
+            residual_delta_b.Append(r.residual_delta);
             reservation_b.Append(r.reservation);
 
             regime_b.Append(r.regime);
@@ -1504,7 +1504,7 @@ public:
         shared_ptr<Array> order_imbalance_arr, trade_imbalance_arr, volatility_arr, volatility_bps_arr;
         shared_ptr<Array> queue_ahead_bid_arr, queue_ahead_ask_arr, inventory_arr;
         
-        shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, ml_delta_arr, reservation_arr;
+        shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr;
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
         shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
         shared_ptr<Array> k0_arr, spread_multiplier_arr, inventory_target_arr;
@@ -1558,7 +1558,7 @@ public:
         skew_b.Finish(&skew_arr);
         struct_delta_b.Finish(&struct_delta_arr);
         micro_signal_delta_b.Finish(&micro_signal_delta_arr);
-        ml_delta_b.Finish(&ml_delta_arr);
+        residual_delta_b.Finish(&residual_delta_arr);
         reservation_b.Finish(&reservation_arr);
         
         regime_b.Finish(&regime_arr);
@@ -1632,7 +1632,7 @@ public:
             field("skew", float64()),
             field("struct_delta", float64()),
             field("micro_signal_delta", float64()),
-            field("ml_delta", float64()),
+            field("residual_delta", float64()),
             field("reservation", float64()),
             
             field("regime", utf8()),
@@ -1674,7 +1674,7 @@ public:
             spread_arr, best_bid_arr, best_ask_arr, best_bid_tick_arr, best_ask_tick_arr,
             order_imbalance_arr, trade_imbalance_arr, volatility_arr, volatility_bps_arr,
             queue_ahead_bid_arr, queue_ahead_ask_arr, inventory_arr,
-            fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, ml_delta_arr, reservation_arr,
+            fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr,
             regime_arr, regime_id_arr, regime_prob_arr,
             alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,
             k0_arr, spread_multiplier_arr, inventory_target_arr,

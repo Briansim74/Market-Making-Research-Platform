@@ -167,19 +167,43 @@ public:
             });
         };
 
+        auto make_title = [](const Snapshot& snap){
+            vector<std_string> parts;
+
+            auto add = [&](const std_string& s){
+                if(!s.empty()) parts.push_back(s);
+            };
+
+            stringstream ss(snap.title.header);
+            std_string item;
+
+            while(getline(ss, item, '|')){
+                // trim spaces
+                item.erase(0, item.find_first_not_of(" "));
+                item.erase(item.find_last_not_of(" ") + 1);
+                add(item);
+            }
+
+            ftxui::Elements rendered;
+
+            for(size_t i = 0; i < parts.size(); i++){
+                if(i > 0) rendered.push_back(text(" | ") | dim);
+                rendered.push_back(text(parts[i]) | italic);
+            }
+
+            rendered.push_back(text(" | ") | dim);
+            rendered.push_back(text(snap.title.regime) | italic);
+            rendered.push_back(text(" | ") | dim);
+            rendered.push_back(text("pnl=") | italic);
+            rendered.push_back(text((snap.title.pnl_pct > 0 ? "+" : "") + format("{:.4f}", snap.title.pnl_pct) + "%") | italic);
+
+            return hbox(move(rendered)) | color(Color::GrayLight) | center;
+        };
+
         return ftxui::Renderer([&]{
             Snapshot snap = snapshot_store.get();
 
-            auto title = hbox({
-                text(snap.title.struct_model) | italic, text(" | ") | dim,
-                text(snap.title.mode) | italic, text(" | ") | dim,
-                text(snap.title.exchange) | italic, text(" | ") | dim,
-                text(snap.title.instrument) | italic, text(" | ") | dim,
-                text(snap.title.regime) | italic, text(" | ") | dim,
-                text("pnl=") | italic,
-                text((snap.title.pnl_pct > 0 ? "+" : "") + format("{:.4f}", snap.title.pnl_pct)) | italic,
-                text("%") | italic
-            }) | color(Color::GrayLight) | center;
+            auto title = make_title(snap);
 
             auto header = hbox({
                 text(" "), text("Metric") | bold | color(Color::White) | size(WIDTH, EQUAL, 30),
@@ -189,6 +213,7 @@ public:
             auto market = vbox({
                 row_title("MARKET", ""),
                 row_text("Mid", format("{:<15.4f}", snap.market.mid)),
+                row_text("Microprice", format("{:<15.4f}", snap.market.microprice)),
                 row_text("Spread", format("{:<15.4f}", snap.market.spread)),
                 row_text("Best Bid / Size", format("{:<10.4f}", snap.market.best_bid) + " (" + format("{:<6.4f}", snap.market.bid_size) + ")"),
                 row_text("Best Ask / Size", format("{:<10.4f}", snap.market.best_ask) + " (" + format("{:<6.4f}", snap.market.bid_size) + ")"),
@@ -209,11 +234,17 @@ public:
 
             auto signals = vbox({
                 row_title("SIGNALS", ""),
+                row_text("Spread Multiplier", format("{:<15.4f}", snap.signals.spread_multiplier)),
+                row_text("Inventory Target", format("{:<15.2f}", snap.signals.inventory_target)),
+                row_text("Alpha Order Imb", format("{:<15.2f}", snap.signals.alpha_order_imb)),
+                row_text("Alpha Trade Imb", format("{:<15.2f}", snap.signals.alpha_trade_imb)),
+                row_text("Alpha Struct", format("{:<15.2f}", snap.signals.alpha_struct)),
                 row_text("Fair Value", format("{:<15.4f}", snap.signals.fair)),
                 row_text("Inventory Skew", format("{:<15.4f}", snap.signals.skew)),
+                row_text("Residual Signal Quality", format("{:<15.2f}", snap.signals.signal_quality)),
+                row_text("Toxicity", format("{:<15.2f}", snap.signals.tox)),
                 row_text("Reservation", format("{:<15.4f}", snap.signals.reservation)),
-                row_text("Alpha Struct", format("{:<15.2f}", snap.signals.alpha_struct)),
-                row_text("ML Signal Quality", format("{:<15.2f}", snap.signals.signal_quality)),
+                
                 row_text("", "")
             });
             
@@ -258,7 +289,7 @@ public:
 
             auto content = vbox({title, separator(), header, separator(), market, regime, signals, 
                     quotes, execution, risk, system, separator()});
-
+        
             return content | border | color(Color::GrayLight);
         });
     };
@@ -387,10 +418,7 @@ public:
     json snapshot_to_json(const Snapshot& snap){
         return {
             {"title", {
-                {"struct_model", snap.title.struct_model},
-                {"mode", snap.title.mode},
-                {"exchange", snap.title.exchange},
-                {"instrument", snap.title.instrument},
+                {"header", snap.title.header},
                 {"regime", snap.title.regime},
                 {"pnl_pct", snap.title.pnl_pct}
             }},

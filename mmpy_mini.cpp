@@ -81,6 +81,9 @@ public:
     using Vec = vector<double>;
     using Mat = vector<vector<double>>;
 
+    std_string model_name;
+    std_string target;
+
     Mat means;
     vector<Mat> cov_inv;
 
@@ -90,32 +93,39 @@ public:
     Vec scaler_mean;
     Vec scaler_scale;
 
+    int n_regimes;
+    int horizon_ms;
+    vector<std_string> feature_cols;
     vector<std_string> regime_labels;
 
     int K;
     int D;
 
     // reusable buffers (IMPORTANT OPTIMIZATION)
+    Vec x_input;
     Vec x_scaled;
     Vec diff;
-
-    Vec x_input;
     Vec scores;
 
     static constexpr double LOG_2PI = 1.8378770664093453;
 
-    RegimeModel(const json& a){
+    RegimeModel(const json& artifact){
+        model_name = artifact["model_name"].get<std_string>();
+        target = artifact["target"].get<std_string>();
 
-        means = a["means"].get<Mat>();
-        cov_inv = a["cov_inv"].get<vector<Mat>>();
+        means = artifact["means"].get<Mat>();
+        cov_inv = artifact["cov_inv"].get<vector<Mat>>();
 
-        log_det_cov = a["log_det_cov"].get<Vec>();
-        log_weights = a["log_weights"].get<Vec>();
+        log_det_cov = artifact["log_det_cov"].get<Vec>();
+        log_weights = artifact["log_weights"].get<Vec>();
+   
+        scaler_mean = artifact["scaler_mean"].get<Vec>();
+        scaler_scale = artifact["scaler_scale"].get<Vec>();
 
-        scaler_mean = a["scaler_mean"].get<Vec>();
-        scaler_scale = a["scaler_scale"].get<Vec>();
-
-        regime_labels = a["regime_labels"].get<vector<std_string>>();
+        n_regimes = artifact["n_regimes"].get<int>();
+        horizon_ms = artifact["horizon_ms"].get<int>();
+        feature_cols = artifact["feature_cols"].get<vector<std_string>>();
+        regime_labels = artifact["regime_labels"].get<vector<std_string>>();
 
         K = means.size();
         D = means[0].size();
@@ -125,72 +135,64 @@ public:
         x_scaled.resize(D);
         diff.resize(D);
         scores.resize(K);
+
+        cout << "INITIALIZED: " << model_name << " target: " << target << "\n";
     }
 
-    inline void scale(const Vec& X) {
-        for (int i = 0; i < D; i++) {
-            x_scaled[i] = (X[i] - scaler_mean[i]) / scaler_scale[i];
+    void pack_features(const Regime& regime){
+        x_input[0] = regime.volatility;
+        x_input[1] = regime.spread;
+        x_input[2] = regime.order_imbalance;
+        x_input[3] = regime.trade_imbalance;
+        x_input[4] = regime.quote_churn;
+        x_input[5] = regime.inventory;
+        x_input[6] = regime.inventory_vol;
+        x_input[7] = regime.microprice_error;
+    }
+
+    void scale(){
+        for(int i = 0; i < D; i++){
+            x_scaled[i] = (x_input[i] - scaler_mean[i]) / scaler_scale[i];
         }
-    }
-
-    inline void pack_features(const Regime& r, std::vector<double>& X) {
-        X[0] = r.volatility;
-        X[1] = r.spread;
-        X[2] = r.order_imbalance;
-        X[3] = r.trade_imbalance;
-        X[4] = r.quote_churn;
-        X[5] = r.inventory;
-        X[6] = r.inventory_vol;
-        X[7] = r.microprice_error;
     }
 
     tuple<std_string, int, double> predict(const Regime& regime){
 
-        pack_features(regime, x_input);
-        scale(x_input);
+        pack_features(regime);
+        scale();
 
-        int best_k = 0;
-        double best_score = -1e300;
+        int best_k = -1; //gaussian component regime
+        double best_score = -numeric_limits<double>::infinity();
 
-        // std::vector<double> scores(K);
-
-        for (int k = 0; k < K; k++) {
-
+        for(int k = 0; k < K; k++){
             const auto& mu = means[k];
             const auto& inv = cov_inv[k];
 
             // compute diff = x - mu
-            for (int i = 0; i < D; i++) {
+            for(int i = 0; i < D; i++){
                 diff[i] = x_scaled[i] - mu[i];
             }
 
             // symmetric quadratic form (OPTIMIZED)
             double quad = 0.0;
 
-            for (int i = 0; i < D; i++) {
-
+            for(int i = 0; i < D; i++){
                 double di = diff[i];
                 const double* row = inv[i].data();
 
                 quad += di * row[i] * di;
 
-                for (int j = i + 1; j < D; j++) {
+                for(int j = i + 1; j < D; j++){
                     double dj = diff[j];
                     quad += 2.0 * di * row[j] * dj;
                 }
             }
 
-            double logp =
-                log_weights[k]
-                - 0.5 * (
-                    D * LOG_2PI +
-                    log_det_cov[k] +
-                    quad
-                );
+            double logp = log_weights[k] - 0.5 * (D * LOG_2PI + log_det_cov[k] + quad);
 
             scores[k] = logp;
 
-            if (logp > best_score){
+            if(logp > best_score){
                 best_score = logp;
                 best_k = k;
             }
@@ -198,163 +200,218 @@ public:
 
         // log-sum-exp normalization (stable softmax)
         double max_log = best_score;
-
         double sum = 0.0;
-        for (double s : scores)
-            sum += exp(s - max_log);
+
+        for(double s : scores) sum += exp(s - max_log);
 
         double log_norm = max_log + log(sum);
-
         double prob = exp(scores[best_k] - log_norm);
 
-        return {
-            regime_labels[best_k],
-            best_k,
-            prob
-        };
+        return {regime_labels[best_k], best_k, prob};
     }
 };
 class MicroSignalModel {
 public:
-    std_string model;
-    double target;
+    std_string model_name;
+    std_string target;
+
     double horizon_ms;
+    double intercept;
     double beta;
+
     double ic;
+    double rank_ic;
 
     MicroSignalModel(const json& artifact){
-        model = artifact["model"];
-        target = artifact["target"];
-        horizon_ms = artifact["horizon_ms"];
-        beta = artifact["beta"];
-        ic = artifact["ic"];
+        model_name = artifact["model_name"].get<std_string>();
+        target = artifact["target"].get<std_string>();
+        horizon_ms = artifact["horizon_ms"].get<double>();
+        intercept = artifact["intercept"].get<double>();
+        beta = artifact["beta"].get<double>();
+        ic = artifact["ic"].get<double>();
+        rank_ic = artifact["rank_ic"].get<double>();
+
+        cout << "INITIALIZED: " << model_name << " target: " << target << "\n";
     }
 
     double predict(const Features& features){
         double micro_signal = features.microprice_dev / features.mid;
-        double fair_bias = ic * beta * micro_signal;
-        return fair_bias;
-    }
-};
-using Getter = function<double(const Features&)>;
-
-struct FeatureRegistry {
-    static const unordered_map<std::string, Getter>& map() {
-        static const unordered_map<std::string, Getter> m = {
-            {"mid", [](const Features& f){ return f.mid; }},
-            {"fair", [](const Features& f){ return f.fair; }},
-            {"skew", [](const Features& f){ return f.skew; }},
-            {"microprice", [](const Features& f){ return f.microprice; }},
-            {"microprice_dev", [](const Features& f){ return f.microprice_dev; }},
-            {"spread", [](const Features& f){ return f.spread; }},
-            {"order_imbalance", [](const Features& f){ return f.order_imbalance; }},
-            {"trade_imbalance", [](const Features& f){ return f.trade_imbalance; }},
-            {"inventory", [](const Features& f){ return f.inventory; }},
-            {"volatility", [](const Features& f){ return f.volatility; }},
-            {"queue_ahead_bid", [](const Features& f){ return f.queue_ahead_bid; }},
-            {"queue_ahead_ask", [](const Features& f){ return f.queue_ahead_ask; }},
-        };
-    return m;
+        // double fair_bias = ic * beta * micro_signal; // using λ = IC is a heuristic, but it is not what linear regression estimates.
+        return intercept + beta * micro_signal;
     }
 };
 
-class MLModel {
+class ResidualModel {
 public:
-    // BoosterHandle booster;
-    std_string model;
+    std_string model_name;
+    std_string target;
+
+    BoosterHandle booster;
     vector<std_string> feature_cols;
-    int target;
     int horizon_ms;
+    int D;
+    vector<float> x_input;
+    DMatrixHandle dmat = nullptr;
 
-    MLModel(const json& artifact){
-        // XGBoosterCreate(nullptr, 0, &booster);
-        // XGBoosterLoadModel(booster, model_path.c_str());
-        
-        model = artifact["model"];
-        feature_cols = artifact["feature_cols"];
-        target = artifact["target"];
-        horizon_ms = artifact["horizon_ms"];
+    ~ResidualModel(){
+        if(dmat) XGDMatrixFree(dmat);
     }
 
-    vector<double> build_vector(const Features& features, const vector<std_string>& feature_cols){
-        const auto& reg = FeatureRegistry::map();
 
-        vector<double> out;
-        out.reserve(feature_cols.size());
+    ResidualModel(const json& artifact){
 
-        for(const auto& name: feature_cols){
-            auto it = reg.find(name);
-            
-            if(it == reg.end()) throw runtime_error("Unknown feature: " + name);
+        model_name = artifact["model_name"].get<std_string>();
+        feature_cols = artifact["feature_cols"].get<vector<std_string>>();
+        target = artifact["target"].get<std_string>();
+        horizon_ms = artifact["horizon_ms"].get<int>();
+        D = artifact["feature_dim"].get<int>();
 
-            out.push_back(it->second(features));
-        }
+        if(D < 7) throw runtime_error("feature_dim too small");
+        x_input.resize(D);
 
-        return out;
+        std_string model_file = artifact["model_file"].get<std_string>();
+        XGBoosterCreate(nullptr, 0, &booster);
+        XGBoosterLoadModel(booster, model_file.c_str());
+
+        cout << "INITIALIZED: " << model_name << " target: " << target << "\n";
     }
 
-    double predict(const Features& features) const {
-        // auto vec = build_vector(features, feature_cols);
+    void pack_features(const Features& f){
+        x_input[0] = f.spread;
+        x_input[1] = f.order_imbalance;
+        x_input[2] = f.trade_imbalance;
+        x_input[3] = f.inventory;
+        x_input[4] = f.volatility;
+        x_input[5] = f.queue_ahead_bid;
+        x_input[6] = f.queue_ahead_ask;
+    }
 
-        // DMatrixHandle dmat;
-        // XGDMatrixCreateFromMat(
-        //     vec.data(),
-        //     1,
-        //     vec.size(),
-        //     NAN,
-        //     &dmat
-        // );
+    double predict(const Features& f){
+        pack_features(f);
 
-        // bst_ulong out_len;
-        // const double* out_result;
+        if(dmat) XGDMatrixFree(dmat);
+        XGDMatrixCreateFromMat(x_input.data(), 1, D, NAN, &dmat);
 
-        // XGBoosterPredict(booster, dmat, 0, 0, &out_len, &out_result);
+        bst_ulong out_len;
+        const float* out_result;
 
-        // double pred = out_result[0];
-        // XGDMatrixFree(dmat);
+        XGBoosterPredict(
+            booster,
+            dmat,
+            0,          // option_mask
+            0,          // ntree_limit
+            0,          // training = false (IMPORTANT)
+            &out_len,
+            &out_result
+        );
 
-        // return pred;
-        return 0.0;
+        return out_result[0];
     }
 };
+
+class ToxicityModel {
+public:
+    std_string model_name;
+    std_string target;
+
+    BoosterHandle booster;
+    vector<std_string> feature_cols;
+    int horizon_ms;
+    int D;
+    vector<float> x_input;
+    DMatrixHandle dmat = nullptr;
+
+    ~ToxicityModel(){
+        if(dmat) XGDMatrixFree(dmat);
+    }
+
+    ToxicityModel(const json& artifact){
+
+        model_name = artifact["model_name"].get<std_string>();
+        feature_cols = artifact["feature_cols"].get<vector<std_string>>();
+        target = artifact["target"].get<std_string>();
+        horizon_ms = artifact["horizon_ms"].get<int>();
+        D = artifact["feature_dim"].get<int>();
+        
+        if(D < 7) throw runtime_error("feature_dim too small");
+        x_input.resize(D);
+
+        std_string model_file = artifact["model_file"].get<std_string>();
+        XGBoosterCreate(nullptr, 0, &booster);
+        XGBoosterLoadModel(booster, model_file.c_str());
+        // if(XGBoosterLoadModel(booster, model_file.c_str()) != 0){
+        //     throw runtime_error("Failed to load model");
+        // }
+
+        cout << "INITIALIZED: " << model_name << ", target: " << target << "\n";
+    }
+
+    void pack_features(const Features& f){
+        x_input[0] = f.microprice_dev;
+        x_input[1] = f.order_imbalance;
+        x_input[2] = f.trade_imbalance;
+        x_input[3] = f.volatility;
+        x_input[4] = f.spread;
+        x_input[5] = f.queue_ahead_bid;
+        x_input[6] = f.queue_ahead_ask;
+    }
+
+    double predict(const Features& f){
+        pack_features(f);
+
+        if(dmat) XGDMatrixFree(dmat);
+        XGDMatrixCreateFromMat(x_input.data(), 1, D, NAN, &dmat);
+
+        bst_ulong out_len;
+        const float* out_result;
+
+        XGBoosterPredict(
+            booster,
+            dmat,
+            0,          // option_mask
+            0,          // ntree_limit
+            0,          // training = false (IMPORTANT)
+            &out_len,
+            &out_result
+        );
+
+        return out_result[0];
+    }
+};
+
 class MarketMakingStrategy {
 public:
     MarketConfig& config;
     const json& params;
     double gamma;
+    std_string folder_path;
 
     // Models
     std_string struct_model;
-    unique_ptr<MicroSignalModel> micro_signal_model;
-    unique_ptr<MLModel> edge_model;
     unique_ptr<RegimeModel> regime_model;
-    unique_ptr<MLModel> toxicity_model;
-
-    std_string folder_path;
+    unique_ptr<MicroSignalModel> micro_signal_model;
+    unique_ptr<ResidualModel> residual_model;
+    unique_ptr<ToxicityModel> toxicity_model;
 
     MarketMakingStrategy(MarketConfig& config, const json& params)
         : config(config), params(params){
         gamma = params["gamma"].get<double>();
         folder_path = params["folder_path"].get<std_string>();
 
-        struct_model = params["models"]["struct_model"];
-        micro_signal_model = load_model<MicroSignalModel>("micro_signal_model");
-        edge_model         = load_model<MLModel>("edge_model");
+        struct_model = params["models"]["struct_model"].get<std_string>();
         regime_model       = load_model<RegimeModel>("regime_model");
-        toxicity_model     = load_model<MLModel>("toxicity_model");
+        micro_signal_model = load_model<MicroSignalModel>("micro_signal_model");
+        residual_model     = load_model<ResidualModel>("residual_model");
+        toxicity_model     = load_model<ToxicityModel>("toxicity_model");
     }
 
-    template<typename T> unique_ptr<T> load_model(const std_string& model_name){
-        if(params["models"][model_name].get<std_string>().empty()) return nullptr;
+    template<typename T> unique_ptr<T> load_model(const std_string& model){
+        if(params["models"][model].get<std_string>().empty()) return nullptr;
 
-        cout << model_name << " found...\n";
-        std_string file = folder_path + "/" + params["models"][model_name].get<std_string>() + ".json";
-
+        std_string file = folder_path + "/" + params["models"][model].get<std_string>() + ".json";
         ifstream f(file);
         json artifact;
         f >> artifact;
-
-        cout << "INITIALIZED " << model_name << "\n";
 
         return make_unique<T>(artifact);
     }
@@ -516,7 +573,7 @@ public:
         return 0.3 + 1.4 * ((signal_quality + 1.0) / 2.0);
     }
 
-    auto detect_regime(const Regime& regime){
+    Policy detect_regime(const Regime& regime){
         
         Policy policy;
         
@@ -542,7 +599,7 @@ public:
             policy.alpha_struct = 0.4;
             policy.spread_multiplier = 1.5;
             policy.k0 = 0.5;
-            policy.inventory_target = 0.7;
+            policy.inventory_target = 0.0;
         }
         else{ // low_vol / normal / competitive
             policy.alpha_order_imb = 0.15;
@@ -577,25 +634,25 @@ public:
         return micro_signal_delta;
     }
 
-    pair<double, double> compute_ml_delta(State& state, double struct_delta, 
-                                        double micro_signal_delta, const Features& features, const Policy& policy){
+    pair<double, double> compute_residual_delta(State& state, double struct_delta, double micro_signal_delta, 
+                                            const Features& features, const Policy& policy){
         
-        if(edge_model == nullptr) return {0.0, 0.0};
+        if(residual_model == nullptr) return {0.0, 0.0};
 
         double reservation = features.mid + struct_delta + micro_signal_delta;
-        double expected_return = edge_model->predict(features);
+        double expected_return = residual_model->predict(features);
         double signal_quality = compute_signal_quality(state);
 
-        MLPred ml_pred;
-        ml_pred.ts = state.last_depth_ts;
-        ml_pred.pred = expected_return;
-        ml_pred.reservation = reservation;
-        state.market_feature_state.ml_predictions.push_back(ml_pred);
+        MLPred residual_pred;
+        residual_pred.ts = state.last_depth_ts;
+        residual_pred.pred = expected_return;
+        residual_pred.reservation = reservation;
+        state.market_feature_state.ml_predictions.push_back(residual_pred);
 
         double effective_k = policy.k0 * signal_quality;
-        double ml_center = reservation * exp(expected_return * effective_k);
+        double residual_center = reservation * exp(expected_return * effective_k);
 
-        return {ml_center - reservation, signal_quality};
+        return {residual_center - reservation, signal_quality};
     }
 
     Toxicity compute_toxicity(const Features& features){
@@ -652,9 +709,9 @@ public:
 
         double micro_signal_delta = compute_micro_signal_delta(features);
 
-        auto [ml_delta, signal_quality] = compute_ml_delta(state, struct_delta, micro_signal_delta, features, policy);
+        auto [residual_delta, signal_quality] = compute_residual_delta(state, struct_delta, micro_signal_delta, features, policy);
 
-        double center = mid + struct_delta + micro_signal_delta + ml_delta;
+        double center = mid + struct_delta + micro_signal_delta + residual_delta;
         Toxicity toxicity = compute_toxicity(features);
 
         double spread = compute_spread(features, policy, toxicity);
@@ -704,7 +761,7 @@ public:
         signal.skew = features.skew;
         signal.struct_delta = struct_delta;
         signal.micro_signal_delta = micro_signal_delta;
-        signal.ml_delta = ml_delta;
+        signal.residual_delta = residual_delta;
         signal.reservation = center;
 
         signal.regime = policy.regime;
@@ -760,27 +817,14 @@ public:
     Execution& execution;
     DatasetRecorder& recorder;
 
-    mutex& signal_mtx;
-    condition_variable& signal_cv;
-    bool& signal_pending;
+    EventNotifier& execution_event;
+    EventNotifier& dashboard_event;
+    std_string header;
 
-    std_string struct_model;
-    std_string edge_model;
-    std_string mode;
-    std_string exchange;
-    std_string instrument;
-
-    Engine(MarketConfig& config, State& state, MarketMakingStrategy& strategy, Execution& execution, DatasetRecorder& recorder,
-            mutex& signal_mtx, condition_variable& signal_cv, bool& signal_pending, const json& params)
+    Engine(MarketConfig& config, State& state, MarketMakingStrategy& strategy, Execution& execution,
+            DatasetRecorder& recorder, EventNotifier& execution_event, EventNotifier& dashboard_event, const json& params)
         : config(config), state(state), strategy(strategy), execution(execution), recorder(recorder),
-        signal_mtx(signal_mtx), signal_cv(signal_cv), signal_pending(signal_pending), params(params)
-    {
-        struct_model = params["models"]["struct_model"].get<std_string>();
-        edge_model   = params["models"]["edge_model"].get<std_string>();
-        mode         = params["mode"].get<std_string>();
-        exchange     = params["exchange"].get<std_string>();
-        instrument   = params["instrument"].get<std_string>();
-    }
+        execution_event(execution_event), dashboard_event(dashboard_event), params(params) {build_header();}
 
     void on_trade_event(const Trade& trade){
         recorder.log_trade(trade);
@@ -794,11 +838,18 @@ public:
         recorder.log_snapshot(signal);
 
         {
-            lock_guard<mutex> lock(signal_mtx);
+            lock_guard<mutex> lock(execution_event.signal_mtx);
             state.last_signal = signal;
-            signal_pending = true;
+            execution_event.signal_pending = true;
         }
-        signal_cv.notify_one();
+
+        {
+            lock_guard<mutex> lock(dashboard_event.signal_mtx);
+            dashboard_event.signal_pending = true;
+        }
+
+        execution_event.signal_cv.notify_one();
+        dashboard_event.signal_cv.notify_one();
         // cout << "signal sending, locking..., ts: " << signal.ts << "\n";
     }
 
@@ -829,10 +880,7 @@ public:
         double bid_queue = state.compute_queue_ahead("bids", config.to_tick(best_bid));
         double ask_queue = state.compute_queue_ahead("asks", config.to_tick(best_ask));
 
-        snap.title.struct_model = struct_model;
-        snap.title.mode = mode;
-        snap.title.exchange = exchange;
-        snap.title.instrument = instrument;
+        snap.title.header = header;
         snap.title.regime = state.last_signal ? state.last_signal->regime : "";
         snap.title.pnl_pct = state.get_pnl(mid) / state.initial_cash * 100;
 
@@ -860,6 +908,7 @@ public:
         snap.signals.k0 = state.last_signal ? state.last_signal->k0 : 0.0;
         snap.signals.spread_multiplier = state.last_signal ? state.last_signal->spread_multiplier : 0.0;
         snap.signals.inventory_target = state.last_signal ? state.last_signal->inventory_target : 0.0;
+        snap.signals.signal_quality = state.last_signal ? state.last_signal->signal_quality : 0.0;
         snap.signals.tox = state.last_signal ? state.last_signal->toxicity.tox : 0.0;
         snap.signals.k1 = state.last_signal ? state.last_signal->toxicity.k1 : 0.0;
         snap.signals.k2 = state.last_signal ? state.last_signal->toxicity.k2 : 0.0;
@@ -890,22 +939,40 @@ public:
 
         return snap;
     }
+
+    void build_header(){
+        std_string parts;
+
+        auto add = [&](const std_string& s){
+            if(s.empty()) return;
+            if(!parts.empty()) parts += " | ";
+            parts += s;
+        };
+
+        add(params["models"]["struct_model"].get<std_string>());
+        add(params["models"]["regime_model"].get<std_string>());
+        add(params["models"]["micro_signal_model"].get<std_string>());
+        add(params["models"]["residual_model"].get<std_string>());
+        add(params["models"]["toxicity_model"].get<std_string>());
+        add(params["mode"].get<std_string>());
+        add(params["exchange"].get<std_string>());
+        add(params["instrument"].get<std_string>());
+
+        header = parts;
+    }
 };
 
 class TradingSystem {
 public:
     const json& params;
-
-    mutex signal_mtx;
-    condition_variable signal_cv;
-    bool signal_pending = false;
-
     MarketConfig config;
     State state;
 
     MarketMakingStrategy strategy;
     DatasetRecorder recorder;
 
+    EventNotifier dashboard_event;
+    EventNotifier execution_event;
     SnapshotStore snapshot_store;
     DashboardTerminal dashboard_terminal;
     DashboardServer dashboard_server;
@@ -938,8 +1005,7 @@ public:
             execution = make_unique<PaperExecution>(config, state, recorder, params);
         }
 
-        engine = make_unique<Engine>(config, state, strategy, *execution, recorder, 
-            signal_mtx, signal_cv, signal_pending, params);
+        engine = make_unique<Engine>(config, state, strategy, *execution, recorder, execution_event, dashboard_event, params);
 
         std_string exchange = params["exchange"].get<std_string>();
         auto on_trade_event = [this](const Trade& trade) {engine->on_trade_event(trade);};
@@ -985,36 +1051,45 @@ public:
         recorder.export_event_parquet();
     }
 
-    void start_dashboard_loop(){
-        threads.emplace_back([this](){
-            while(dashboard_running){
-                Snapshot snap = engine->build_snapshot();
-                snapshot_store.set(snap);
-
-                // dashboard_terminal.refresh();
-                dashboard_server.publish();
-
-                this_thread::sleep_for(milliseconds(20));
-            }
-        });
-    }
-
     void start_execution_loop(){
         threads.emplace_back([this](){
             while(engine_running){
                 Signal signal;
                 
                 {
-                    unique_lock<mutex> lock(signal_mtx);
-                    signal_cv.wait(lock, [this]{ return signal_pending || !engine_running;});
+                    unique_lock<mutex> lock(execution_event.signal_mtx);
+                    execution_event.signal_cv.wait(lock, [this]{
+                        return execution_event.signal_pending || !engine_running;});
 
                     if(!engine_running) break;
 
                     signal = *state.last_signal;
-                    signal_pending = false;
+                    execution_event.signal_pending = false;
                 }
                 // execution->place_quotes(signal);
-                // cout << "signal received, unlocking... ts: " << signal.ts << "\n";
+                // cout << "execution signal received, unlocking... ts: " << signal.ts << "\n";
+            }
+        });
+    }
+
+    void start_dashboard_loop(){
+        threads.emplace_back([this](){
+            while(dashboard_running){
+                {
+                    unique_lock<mutex> lock(dashboard_event.signal_mtx);
+                    dashboard_event.signal_cv.wait(lock, [this]{
+                        return dashboard_event.signal_pending || !dashboard_running;});
+
+                    if(!dashboard_running) break;
+                    dashboard_event.signal_pending = false;
+                }
+
+                Snapshot snap = engine->build_snapshot();
+                snapshot_store.set(snap);
+
+                // dashboard_terminal.refresh();
+                dashboard_server.publish();
+                // cout << "dashboard signal received, unlocking... ts: " << snap.system.last_depth_ts << "\n";
             }
         });
     }
@@ -1050,8 +1125,8 @@ int main(){
         return 1;
     }
 
-    std_string path = "D:\\OneDrive\\Trading\\manifest_live.json";
-    // std_string path = "D:\\OneDrive\\Trading\\manifest_replay.json";
+    // std_string path = "D:\\OneDrive\\Trading\\manifest_live.json";
+    std_string path = "D:\\OneDrive\\Trading\\manifest_replay.json";
     
     
     // cout << "Enter manifest path: ";

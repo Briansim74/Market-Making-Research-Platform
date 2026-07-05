@@ -1,0 +1,9 @@
+{
+    "model_name": "micro_signal_model_4",
+    "target": "(microprice - mid) / mid",
+    "horizon_ms": 100,
+    "intercept": 9.824148104968269e-08,
+    "beta": 1.8394571133179365,
+    "ic": 0.09997042063672913,
+    "rank_ic": 0.28142722222857924
+}

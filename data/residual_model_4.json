@@ -1,0 +1,16 @@
+{
+    "model_name": "residual_model_4",
+    "target": "log(future_mid/(mid + struct_delta + micro_signal_delta))",
+    "model_file": "data/residual_model_4_xgb.json",
+    "horizon_ms": 1000,
+    "feature_cols": [
+        "spread",
+        "order_imbalance",
+        "trade_imbalance",
+        "inventory",
+        "volatility",
+        "queue_ahead_bid",
+        "queue_ahead_ask"
+    ],
+    "feature_dim": 7
+}
