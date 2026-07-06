@@ -393,8 +393,9 @@ public:
         state.update_vol();
         state.compute_order_imbalance();
         state.update_market_feature_state();
-        state.update_ml_realization();
+        state.update_residual_realization();
         state.update_performance();
+        // state.update_toxicity_realization();
 
         // -----------------------------
         // STRATEGY ONLY AFTER INIT
@@ -715,8 +716,9 @@ public:
         state.update_vol();
         state.compute_order_imbalance();
         state.update_market_feature_state();
-        state.update_ml_realization();
+        state.update_residual_realization();
         state.update_performance();
+        // state.update_toxicity_realization();
 
         // -----------------------------
         // STRATEGY ONLY AFTER INIT
@@ -982,8 +984,9 @@ public:
         state.update_vol();
         state.compute_order_imbalance();
         state.update_market_feature_state();
-        state.update_ml_realization();
+        state.update_residual_realization();
         state.update_performance();
+        // state.update_toxicity_realization();
 
         // -----------------------------
         // STRATEGY ONLY AFTER INIT
@@ -1249,8 +1252,9 @@ public:
         state.update_vol();
         state.compute_order_imbalance();
         state.update_market_feature_state();
-        state.update_ml_realization();
+        state.update_residual_realization();
         state.update_performance();
+        // state.update_toxicity_realization();
 
         // -----------------------------
         // STRATEGY ONLY AFTER INIT

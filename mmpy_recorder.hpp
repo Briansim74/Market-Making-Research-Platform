@@ -1261,6 +1261,7 @@ public:
         row.qty = qty;
 
         row.is_maker = is_maker;
+        row.fill_sign = (order.side == "BUY") ? 1 : -1;
         row.fill_type = (order.side == "BUY") ? "BID_HIT" : "ASK_LIFT";
         row.fill_status = (order.remaining > 0.0) ? "PARTIAL" : "FULL";
         row.queue_ahead_at_join = order.queue_ahead_at_join;
@@ -1347,6 +1348,7 @@ public:
         DoubleBuilder qty_b(pool);
 
         BooleanBuilder is_maker_b(pool);
+        Int32Builder fill_sign_b(pool);
         StringBuilder fill_type_b(pool);
         StringBuilder fill_status_b(pool);
         DoubleBuilder queue_ahead_at_join_b(pool);
@@ -1422,6 +1424,7 @@ public:
             qty_b.Append(r.qty);
 
             is_maker_b.Append(r.is_maker);
+            fill_sign_b.Append(r.fill_sign);
             fill_type_b.Append(r.fill_type);
             fill_status_b.Append(r.fill_status);
             queue_ahead_at_join_b.Append(r.queue_ahead_at_join);
@@ -1491,7 +1494,7 @@ public:
         // -------------------------
         shared_ptr<Array> ts_arr, symbol_arr, side_arr;
         shared_ptr<Array> price_arr, price_tick_arr, qty_arr;
-        shared_ptr<Array> is_maker_arr, fill_type_arr, fill_status_arr, queue_ahead_at_join_arr;
+        shared_ptr<Array> is_maker_arr, fill_sign_arr, fill_type_arr, fill_status_arr, queue_ahead_at_join_arr;
         
         shared_ptr<Array> mid_at_fill_arr, microprice_at_fill_arr, microprice_dev_at_fill_arr, microprice_error_at_fill_arr;
         shared_ptr<Array> spread_at_fill_arr, best_bid_at_fill_arr, best_ask_at_fill_arr;
@@ -1522,6 +1525,7 @@ public:
         qty_b.Finish(&qty_arr);
 
         is_maker_b.Finish(&is_maker_arr);
+        fill_sign_b.Finish(&fill_sign_arr);
         fill_type_b.Finish(&fill_type_arr);
         fill_status_b.Finish(&fill_status_arr);
         queue_ahead_at_join_b.Finish(&queue_ahead_at_join_arr);
@@ -1596,6 +1600,7 @@ public:
             field("price_tick", int64()),
             field("qty", float64()),
             field("is_maker", boolean()),
+            field("fill_sign", int32()),
             field("fill_type", utf8()),
             field("fill_status", utf8()),
             field("queue_ahead_at_join", float64()),
@@ -1666,7 +1671,7 @@ public:
         auto table = arrow::Table::Make(schema, {
             ts_arr, symbol_arr, side_arr,
             price_arr, price_tick_arr, qty_arr,
-            is_maker_arr, fill_type_arr, fill_status_arr, queue_ahead_at_join_arr,
+            is_maker_arr, fill_sign_arr, fill_type_arr, fill_status_arr, queue_ahead_at_join_arr,
             mid_at_fill_arr, microprice_at_fill_arr, microprice_dev_at_fill_arr, microprice_error_at_fill_arr,
             spread_at_fill_arr, best_bid_at_fill_arr, best_ask_at_fill_arr,
             volatility_at_fill_arr, volatility_at_fill_bps_arr,

@@ -140,6 +140,7 @@ struct Toxicity {
     double tox = 0.0;
     double k1 = 0.2;
     double k2 = 0.357;
+    double pred = 0.0;
 };
 
 struct Signal {
@@ -205,10 +206,20 @@ struct Order {
     double queue_ahead_at_join;
 };
 
-struct MLPred {
-    double ts;
+struct ResidualPred {
+    uint64_t ts;
+    uint64_t horizon_ms;
     double pred;
     double reservation;
+    double realized;
+};
+
+struct ToxicityPred {
+    uint64_t ts;
+    uint64_t horizon_ms;
+    double pred;
+    double fill_price;
+    int fill_sign;
     double realized;
 };
 
@@ -221,9 +232,11 @@ struct MarketFeatureState {
     deque<double> inventory;
     deque<double> microprice_error;
 
-    deque<MLPred> ml_predictions;
-    deque<MLPred> ml_signal_log;
-    double ml_horizon_ms = 0.0;
+    deque<ResidualPred> residual_predictions;
+    deque<ResidualPred> residual_signal_log;
+
+    deque<ToxicityPred> toxicity_predictions;
+    deque<ToxicityPred> toxicity_signal_log;
 
     double prev_best_bid = 0.0;
     double prev_best_ask = 0.0;
@@ -472,6 +485,7 @@ struct FillRow {
     double qty;
 
     bool is_maker;
+    int fill_sign;
     std_string fill_type;
     std_string fill_status;
     double queue_ahead_at_join;

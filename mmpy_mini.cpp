@@ -56,7 +56,7 @@
 #include "mmpy_config_orderbook.hpp" //market config & orderbook
 #include "mmpy_dashboard.hpp" //dashboard classes
 #include "mmpy_feed.hpp" // feeds
-#include "mmpy_state.hpp" //state & market_feature_state
+#include "mmpy_state.hpp" //state & market feature state
 #include "mmpy_recorder.hpp" //dataset recorder
 
 using std::cout;
@@ -248,7 +248,7 @@ public:
 
     BoosterHandle booster;
     vector<std_string> feature_cols;
-    int horizon_ms;
+    uint64_t horizon_ms;
     int D;
     vector<float> x_input;
     DMatrixHandle dmat = nullptr;
@@ -257,13 +257,12 @@ public:
         if(dmat) XGDMatrixFree(dmat);
     }
 
-
     ResidualModel(const json& artifact){
 
         model_name = artifact["model_name"].get<std_string>();
         feature_cols = artifact["feature_cols"].get<vector<std_string>>();
         target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<int>();
+        horizon_ms = artifact["horizon_ms"].get<uint64_t>();
         D = artifact["feature_dim"].get<int>();
 
         if(D < 7) throw runtime_error("feature_dim too small");
@@ -316,7 +315,7 @@ public:
 
     BoosterHandle booster;
     vector<std_string> feature_cols;
-    int horizon_ms;
+    uint64_t horizon_ms;
     int D;
     vector<float> x_input;
     DMatrixHandle dmat = nullptr;
@@ -330,7 +329,7 @@ public:
         model_name = artifact["model_name"].get<std_string>();
         feature_cols = artifact["feature_cols"].get<vector<std_string>>();
         target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<int>();
+        horizon_ms = artifact["horizon_ms"].get<uint64_t>();
         D = artifact["feature_dim"].get<int>();
         
         if(D < 7) throw runtime_error("feature_dim too small");
@@ -461,111 +460,121 @@ public:
         return -effective_inventory * gamma * sigma * mid;
     }
 
-    double compute_signal_quality(State& state){
-        auto& log = state.market_feature_state.ml_signal_log;
+    double compute_signal_quality(const auto& log){
 
-        if(log.size() < 20)
-            return 1.0;
+        const size_t n = log.size();
 
-        vector<double> p, r;
-        p.reserve(log.size());
-        r.reserve(log.size());
+        if(n < 20) return 1.0;
+        // if(n < 10) return 0.0; trust or no trust?
 
-        for(auto& x: log){
-            p.push_back(x.pred);
-            r.push_back(x.realized);
+        vector<double> pred_arr, realized_arr;
+        pred_arr.reserve(n);
+        realized_arr.reserve(n);
+
+        for(const auto& x: log){
+            pred_arr.push_back(x.pred);
+            realized_arr.push_back(x.realized);
         }
 
         auto mean = [](const vector<double>& v){
-            double s = 0.0;
-            for(double x: v) s += x;
-            return s / v.size();
+            double sum = 0.0;
+            for(double x: v) sum += x;
+            return sum / v.size();
         };
 
-        double mp = mean(p);
-        double mr = mean(r);
+        double mean_pred = mean(pred_arr);
+        double mean_realized = mean(realized_arr);
 
         // -----------------------------
         // Pearson IC
         // -----------------------------
-        double cov = 0.0, vp = 0.0, vr = 0.0;
+        double cov = 0.0, var_pred = 0.0, var_realized = 0.0;
 
-        for(size_t i = 0; i < p.size(); i++){
-            double dp = p[i] - mp;
-            double dr = r[i] - mr;
+        for(size_t i = 0; i < n; i++){
+            double dev_pred = pred_arr[i] - mean_pred;
+            double dev_realized = realized_arr[i] - mean_realized;
 
-            cov += dp * dr;
-            vp  += dp * dp;
-            vr  += dr * dr;
+            cov += dev_pred * dev_realized;
+            var_pred += dev_pred * dev_pred;
+            var_realized += dev_realized * dev_realized;
         }
 
         double ic = 0.0;
-        if(vp > 1e-12 && vr > 1e-12)
-            ic = cov / sqrt(vp * vr);
+        if(var_pred > 1e-12 && var_realized > 1e-12)
+            ic = cov / sqrt(var_pred * var_realized);
 
-        if(isnan(ic))
-            ic = 0.0;
+        if(isnan(ic)) ic = 0.0;
 
         // -----------------------------
         // Rank IC (Spearman)
         // -----------------------------
-        vector<size_t> idx(p.size());
-        iota(idx.begin(), idx.end(), 0);
-
         auto rank = [&](const vector<double>& v){
-            vector<size_t> id(v.size());
-            iota(id.begin(), id.end(), 0);
+            vector<size_t> id_arr(n);
+            vector<double> rank_arr(n);
 
-            sort(id.begin(), id.end(), [&](size_t a, size_t b){ return v[a] < v[b]; });
+            iota(id_arr.begin(), id_arr.end(), 0);
+            sort(id_arr.begin(), id_arr.end(), [&](const size_t& a, const size_t& b){
+                if (v[a] < v[b]) return true;
+                if (v[a] > v[b]) return false;
+                return a < b;
+            });
 
-            vector<double> rnk(v.size());
-            for(size_t i = 0; i < id.size(); i++)
-                rnk[id[i]] = static_cast<double>(i);
+            size_t i = 0;
+            while(i < n){
+                size_t j = i;
 
-            return rnk;
+                // find tie group
+                while (j + 1 < n && abs(v[id_arr[j + 1]] - v[id_arr[i]]) < 1e-12) j++;
+        
+                // average rank for ties
+                double avg_rank = (i + j) / 2.0;
+
+                for(size_t k = i; k <= j; k++) rank_arr[id_arr[k]] = avg_rank;
+
+                i = j + 1;
+            }
+            return rank_arr;
         };
 
-        vector<double> rp = rank(p);
-        vector<double> rr = rank(r);
+        vector<double> rank_pred = rank(pred_arr);
+        vector<double> rank_realized = rank(realized_arr);
 
-        double mp_r = mean(rp);
-        double mr_r = mean(rr);
+        double mean_pred_rank = mean(rank_pred);
+        double mean_realized_rank = mean(rank_realized);
 
-        double cov_r = 0.0, vp_r = 0.0, vr_r = 0.0;
+        double cov_rank = 0.0, var_pred_rank = 0.0, var_realized_rank = 0.0;
 
-        for(size_t i = 0; i < rp.size(); i++){
-            double dp = rp[i] - mp_r;
-            double dr = rr[i] - mr_r;
+        for(size_t i = 0; i < n; i++){
+            double dev_pred_rank = rank_pred[i] - mean_pred_rank;
+            double dev_realized_rank = rank_realized[i] - mean_realized_rank;
 
-            cov_r += dp * dr;
-            vp_r  += dp * dp;
-            vr_r  += dr * dr;
+            cov_rank += dev_pred_rank * dev_realized_rank;
+            var_pred_rank  += dev_pred_rank * dev_pred_rank;
+            var_realized_rank  += dev_realized_rank * dev_realized_rank;
         }
 
         double rank_ic = 0.0;
-        if(vp_r > 1e-12 && vr_r > 1e-12)
-            rank_ic = cov_r / sqrt(vp_r * vr_r);
+        if(var_pred_rank > 1e-12 && var_realized_rank > 1e-12)
+            rank_ic = cov_rank / sqrt(var_pred_rank * var_realized_rank);
 
-        if(isnan(rank_ic))
-            rank_ic = 0.0;
+        if(isnan(rank_ic)) rank_ic = 0.0;
 
         // -----------------------------
         // Directional accuracy
         // -----------------------------
         double hits = 0.0;
-        for(size_t i = 0; i < p.size(); i++){
-            if((p[i] > 0) == (r[i] > 0))
-                hits += 1.0;
+        for(size_t i = 0; i < n; i++){
+            if((pred_arr[i] > 0) == (realized_arr[i] > 0)) hits += 1.0;
         }
 
-        double hit_rate = hits / p.size();
+        double hit_rate = hits / n;
         double directional_score = (hit_rate - 0.5) * 2.0;  // [-1, 1]
 
         // -----------------------------
-        // 5. final score
+        // Final score
         // -----------------------------
-        double pred_vol = sqrt(vp / p.size());
-        double stability_penalty = exp(-pred_vol * 50.0);
+        double vol_pred = sqrt(var_pred / n);
+        double stability_penalty = exp(-vol_pred * 50.0);
 
         double raw = 0.5 * ic + 0.3 * rank_ic + 0.2 * directional_score;
         double signal_quality = stability_penalty * tanh(3.0 * raw);
@@ -635,24 +644,25 @@ public:
     }
 
     pair<double, double> compute_residual_delta(State& state, double struct_delta, double micro_signal_delta, 
-                                            const Features& features, const Policy& policy){
+                                                const Features& features, const Policy& policy){
         
         if(residual_model == nullptr) return {0.0, 0.0};
 
         double reservation = features.mid + struct_delta + micro_signal_delta;
         double expected_return = residual_model->predict(features);
-        double signal_quality = compute_signal_quality(state);
+        double residual_signal_quality = compute_signal_quality(state.mfs.residual_signal_log);
 
-        MLPred residual_pred;
+        ResidualPred residual_pred;
         residual_pred.ts = state.last_depth_ts;
+        residual_pred.horizon_ms = residual_model->horizon_ms;
         residual_pred.pred = expected_return;
         residual_pred.reservation = reservation;
-        state.market_feature_state.ml_predictions.push_back(residual_pred);
+        state.mfs.residual_predictions.push_back(residual_pred);
 
-        double effective_k = policy.k0 * signal_quality;
+        double effective_k = policy.k0 * residual_signal_quality;
         double residual_center = reservation * exp(expected_return * effective_k);
 
-        return {residual_center - reservation, signal_quality};
+        return {residual_center - reservation, residual_signal_quality};
     }
 
     Toxicity compute_toxicity(const Features& features){
@@ -662,7 +672,12 @@ public:
         if(toxicity_model == nullptr) return toxicity;
 
         double prediction = toxicity_model->predict(features);
-        toxicity.tox = -prediction;
+        // double signal_quality = compute_toxicity_signal_quality(state.mfs.toxicity_signal_log);
+
+        toxicity.tox = -prediction; //trained on future markout, negative markout = toxic
+        // toxicity.k1 *= signal_quality;
+        // toxicity.k2 *= signal_quality;
+        // toxicity.pred = prediction;
 
         return toxicity;
     }
@@ -709,7 +724,7 @@ public:
 
         double micro_signal_delta = compute_micro_signal_delta(features);
 
-        auto [residual_delta, signal_quality] = compute_residual_delta(state, struct_delta, micro_signal_delta, features, policy);
+        auto [residual_delta, residual_signal_quality] = compute_residual_delta(state, struct_delta, micro_signal_delta, features, policy);
 
         double center = mid + struct_delta + micro_signal_delta + residual_delta;
         Toxicity toxicity = compute_toxicity(features);
@@ -732,8 +747,8 @@ public:
         bid = config.round_price(bid);
         ask = config.round_price(ask);
 
-        double bid_delta = abs(best_bid - state.market_feature_state.prev_best_bid);
-        double ask_delta = abs(best_ask - state.market_feature_state.prev_best_ask);
+        double bid_delta = abs(best_bid - state.mfs.prev_best_bid);
+        double ask_delta = abs(best_ask - state.mfs.prev_best_ask);
 
         Signal signal;
         signal.ts = state.last_depth_ts;
@@ -773,7 +788,7 @@ public:
         signal.k0 = policy.k0;
         signal.spread_multiplier = policy.spread_multiplier;
         signal.inventory_target = policy.inventory_target;
-        signal.signal_quality = signal_quality;
+        signal.signal_quality = residual_signal_quality;
         signal.toxicity = toxicity;
 
         signal.bid_delta = bid_delta;
@@ -829,6 +844,12 @@ public:
     void on_trade_event(const Trade& trade){
         recorder.log_trade(trade);
         // execution.process_trade(trade);
+
+        {
+            lock_guard<mutex> lock(dashboard_event.signal_mtx);
+            dashboard_event.signal_pending = true;
+        }
+        dashboard_event.signal_cv.notify_one();
     }
 
     void on_depth_event(){

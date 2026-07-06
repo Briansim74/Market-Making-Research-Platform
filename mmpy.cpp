@@ -1072,6 +1072,20 @@ public:
 
     void on_fill(const double& price, double qty, const std_string& side, const std_string& liquidity){
 
+        // if (toxicity_model) {
+            //     ToxicityPrediction p;
+
+            //     p.ts = state.last_depth_ts;   // or ts, but be consistent with your system clock
+            //     p.horizon_ms = toxicity_model->horizon_ms;
+
+            //     p.pred = order.last_signal.cached_toxicity_pred;  // IMPORTANT: computed at quote time
+            //     p.fill_price = fill_price;
+
+            //     p.fill_sign = (side == "BUY") ? 1 : -1;
+
+            //     state.market_feature_state.toxicity_predictions.push_back(std::move(p));
+            // }
+
         double old_inv = inventory;
         double old_avg = avg_entry_price;
 
@@ -2755,6 +2769,7 @@ public:
         row.ts = state.last_trade_ts;
         row.symbol = instrument_upper;
         row.side = order.side;
+        row.side_sign = (order.side == "BUY") ? 1 : -1;
         row.price = config.from_tick(order.price_tick);
         row.price_tick = order.price_tick;
         row.qty = qty;
@@ -5068,6 +5083,21 @@ public:
 
         // ---------------- TRADE ----------------
         else if(exec_type == "TRADE"){
+
+            // if (toxicity_model) {
+            //     ToxicityPrediction p;
+
+            //     p.ts = state.last_depth_ts;   // or ts, but be consistent with your system clock
+            //     p.horizon_ms = toxicity_model->horizon_ms;
+
+            //     p.pred = order.last_signal.cached_toxicity_pred;  // IMPORTANT: computed at quote time
+            //     p.fill_price = fill_price;
+
+            //     p.side = (side == "BUY") ? +1 : -1;
+
+            //     state.market_feature_state.toxicity_predictions.push_back(std::move(p));
+            // }
+
             double fill_price = stod(o["L"].get<std_string>());
             double fill_qty = stod(o["l"].get<std_string>());
 

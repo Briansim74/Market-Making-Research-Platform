@@ -77,11 +77,10 @@ public:
     MarketConfig& config;
     const json& params;
     OrderBook market_book;
-    double last_mid = 0.0;
-    MarketFeatureState market_feature_state;
-
+    MarketFeatureState mfs;
     optional<Signal> last_signal;
 
+    double last_mid = 0.0;
     double order_imbalance = 0.0;
     double trade_imbalance = 0.0;
     double ewma_var = 0.0;
@@ -103,11 +102,11 @@ public:
     unordered_map<std_string, unordered_map<int64_t, double>> queue_flow;
     unordered_map<std_string, unordered_map<int64_t, double>> my_queue_position;
     unordered_map<double, deque<Trade>> trade_buckets;
-    double window_ms = 1000;
+    uint64_t window_ms = 1000; // for trade flow buckets
 
-    double last_trade_ts = 0;
+    uint64_t last_trade_ts = 0;
     optional<Trade> last_trade;
-    double last_depth_ts = 0;
+    uint64_t last_depth_ts = 0;
     Order* last_fill_candidate = nullptr;
     Order* last_order_update = nullptr;
 
@@ -265,7 +264,6 @@ public:
     }
 
     void update_market_feature_state(){
-        auto& mfs = market_feature_state;
         auto& book = market_book;
 
         auto [bid_tick, bid_size] = book.best_bid();
@@ -278,14 +276,11 @@ public:
         double spread = best_ask - best_bid;
         double microprice = (best_ask * bid_size + best_bid * ask_size) /(bid_size + ask_size + 1e-9);
 
+        double mid_return = (last_mid != 0.0) ? (mid - last_mid) / last_mid : 0.0;
         last_mid = mid;
-        double mid_return = (mid - last_mid) / last_mid;
-        
-        double quote_churn;
-        if(mfs.prev_best_bid == 0.0 && mfs.prev_best_ask == 0.0){
-            quote_churn = 0.0;
-        }
-        else{
+
+        double quote_churn = 0.0;
+        if(mfs.prev_best_bid != 0.0 && mfs.prev_best_ask != 0.0){
             double bid_delta = abs(best_bid - mfs.prev_best_bid);
             double ask_delta = abs(best_ask - mfs.prev_best_ask);
             quote_churn = bid_delta + ask_delta;
@@ -304,7 +299,6 @@ public:
     }
 
     Regime get_regime(){
-        auto& mfs = market_feature_state;
 
         auto mean = [](const deque<double>& q){
             if(q.empty()) return 0.0;
@@ -337,18 +331,32 @@ public:
         return regime;
     }
 
-    void update_ml_realization(){
-        auto& mfs = market_feature_state;
-        double now = config.now_ms();
+    void update_residual_realization(){
 
-        while(!mfs.ml_predictions.empty() && now - mfs.ml_predictions.front().ts >= mfs.ml_horizon_ms){
-            auto& entry = mfs.ml_predictions.front();
-            mfs.ml_predictions.pop_front();
+        while(!mfs.residual_predictions.empty() && 
+        last_depth_ts - mfs.residual_predictions.front().ts >= mfs.residual_predictions.front().horizon_ms){
+            
+            auto& entry = mfs.residual_predictions.front();
+            mfs.residual_predictions.pop_front();
             
             entry.realized = log(last_mid / entry.reservation);
-            mfs.ml_signal_log.push_back(entry);
+            push_limited(mfs.residual_signal_log, entry, 2000); //2000 in queue, 200s window
         }
     }
+
+    // void update_toxicity_realization(){
+    //        uint64_t now = std::max(last_depth_ts, last_trade_ts);
+    //     while(!mfs.toxicity_predictions.empty() && 
+    //     now - mfs.toxicity_predictions.front().ts >= mfs.toxicity_predictions.front().horizon_ms){
+    //         auto& entry = mfs.toxicity_predictions.front();
+    //         mfs.toxicity_predictions.pop_front();
+
+            
+            
+    //         entry.realized = p.fill_sign * (last_mid - entry.fill_price);
+    //         push_limited(mfs.toxicity_signal_log, entry, 2000);
+    //     }
+    // }
 
     void update_performance(){
         auto [bid_tick, bid_size] = market_book.best_bid();
@@ -405,5 +413,47 @@ public:
         cout << "SHARPE: " << sharpe_ratio << "\n";
 
         return sharpe_ratio;
+    }
+
+    double compute_sortino(){
+        if(return_history.size() < 30) return 0.0;
+
+        vector<double> returns;
+        returns.reserve(return_history.size());
+
+        for(double r : return_history){
+            if(isfinite(r)) returns.push_back(r);
+        }
+
+        if(returns.size() < 30){
+            return NAN;
+        }
+
+        // mean return
+        double mean = 0.0;
+        for(double r : returns) mean += r;
+        mean /= returns.size();
+
+        // downside variance only
+        double downside_var = 0.0;
+        int count = 0;
+
+        for(double r : returns){
+            double downside = min(r, 0.0);  // MAR = 0
+            downside_var += downside * downside;
+            count++;
+        }
+
+        double downside_std = sqrt(downside_var / count);
+
+        if(downside_std == 0.0 || isnan(downside_std)){
+            return NAN;
+        }
+
+        double sortino = mean / (downside_std + 1e-9);
+
+        cout << "SORTINO: " << sortino << "\n";
+
+        return sortino;
     }
 };
