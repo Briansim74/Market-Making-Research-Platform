@@ -86,8 +86,8 @@ public:
     double ewma_var = 0.0;
 
     double inventory = 0.0;
-    double cash = 100000.0;
-    double initial_cash = 100000.0;
+    double cash;
+    double initial_cash;
     double realized_pnl = 0.0;
     double avg_entry_price = 0.0;
 
@@ -101,21 +101,29 @@ public:
 
     unordered_map<std_string, unordered_map<int64_t, double>> queue_flow;
     unordered_map<std_string, unordered_map<int64_t, double>> my_queue_position;
-    unordered_map<double, deque<Trade>> trade_buckets;
-    uint64_t window_ms = 1000; // for trade flow buckets
+    unordered_map<std_string, unordered_map<int64_t, deque<Trade>>> trade_buckets;
+    uint64_t trade_flow_window_ms = 1000; // for trade flow buckets
 
-    uint64_t last_trade_ts = 0;
+    double dt = 0.0;
+    uint64_t last_fill_match_ts = 0;
+
     optional<Trade> last_trade;
+    uint64_t last_trade_ts = 0;
     uint64_t last_depth_ts = 0;
-    Order* last_fill_candidate = nullptr;
-    Order* last_order_update = nullptr;
+    shared_ptr<Order> last_fill_candidate;
+    shared_ptr<Order> last_order_update;
+    // optional<Order> last_fill_candidate;
+    // optional<Order> last_order_update;
 
     bool initialized = false;
 
     State(MarketConfig& config, const json& params)
-        : config(config), params(params), market_book(config, params),
-        maker_fee_rate(params["fees"]["maker_fee_rate"].get<double>()),
-        taker_fee_rate(params["fees"]["taker_fee_rate"].get<double>()) {}
+        : config(config), params(params), market_book(config, params){
+            cash = params["cash"].get<double>();
+            initial_cash = params["initial_cash"].get<double>();
+            maker_fee_rate = params["fees"]["maker_fee_rate"].get<double>();
+            taker_fee_rate = params["fees"]["taker_fee_rate"].get<double>();
+        }
 
     double get_vol(){
         return sqrt(ewma_var);
@@ -139,32 +147,46 @@ public:
         order_imbalance = (bid_size - ask_size) / (bid_size + ask_size + 1e-9);
     }
 
-    void on_fill(const double& price, double qty, const std_string& side, const std_string& liquidity){
+    void on_fill(const double& price, double fill_qty, const std_string& side, const std_string& liquidity){
+
+        // if (toxicity_model) {
+            //     ToxicityPrediction p;
+
+            //     p.ts = state.last_depth_ts;   // or ts, but be consistent with your system clock
+            //     p.horizon_ms = toxicity_model->horizon_ms;
+
+            //     p.pred = order.last_signal.cached_toxicity_pred;  // IMPORTANT: computed at quote time
+            //     p.fill_price = fill_price;
+
+            //     p.fill_sign = (side == "BUY") ? 1 : -1;
+
+            //     state.market_feature_state.toxicity_predictions.push_back(std::move(p));
+            // }
 
         double old_inv = inventory;
         double old_avg = avg_entry_price;
 
-        double fill_value = price * qty;
+        double fill_value = price * fill_qty;
         double fee_rate = (liquidity == "maker") ? maker_fee_rate : taker_fee_rate;
         double fee = fill_value * fee_rate;
         fees_paid += fee;
 
         if(side == "BUY"){
             if(old_inv < 0){
-                double close_qty = min(qty, abs(old_inv));
+                double close_qty = min(fill_qty, abs(old_inv));
                 realized_pnl += close_qty * (old_avg - price);
 
                 old_inv += close_qty;
-                qty -= close_qty;
+                fill_qty -= close_qty;
             }
 
             inventory = old_inv;
 
-            if(qty > 0){
-                double new_inv = old_inv + qty;
+            if(fill_qty > 0){
+                double new_inv = old_inv + fill_qty;
 
                 if(old_inv > 0){
-                    avg_entry_price = (old_avg * old_inv + price * qty) / new_inv;
+                    avg_entry_price = (old_avg * old_inv + price * fill_qty) / new_inv;
                 }
                 else avg_entry_price = price;
 
@@ -175,20 +197,20 @@ public:
 
         else{ // SELL
             if(old_inv > 0){
-                double close_qty = min(qty, old_inv);
+                double close_qty = min(fill_qty, old_inv);
                 realized_pnl += close_qty * (price - old_avg);
 
                 old_inv -= close_qty;
-                qty -= close_qty;
+                fill_qty -= close_qty;
             }
 
             inventory = old_inv;
 
-            if(qty > 0){
-                double new_inv = old_inv - qty;
+            if(fill_qty > 0){
+                double new_inv = old_inv - fill_qty;
 
                 if(old_inv < 0){
-                    avg_entry_price = (old_avg * abs(old_inv) + price * qty) / abs(new_inv);
+                    avg_entry_price = (old_avg * abs(old_inv) + price * fill_qty) / abs(new_inv);
                 }
                 else avg_entry_price = price;
 
@@ -205,30 +227,50 @@ public:
     }
 
     double get_pnl(double mid){
-        return realized_pnl + inventory * (mid - avg_entry_price) - fees_paid;
+        return realized_pnl + get_unrealized_pnl(mid) - fees_paid;
     }
 
-    double get_value(auto& m, const std_string& side, const int64_t& price){
+    double get_value(auto& m, const std_string& side, const int64_t& price_tick){
         auto it1 = m.find(side);
         if(it1 == m.end()) return 0.0;
 
-        auto it2 = it1->second.find(price);
+        auto it2 = it1->second.find(price_tick);
         if(it2 == it1->second.end()) return 0.0;
 
         return it2->second;
     }
 
     double compute_queue_ahead(const std_string& side, const int64_t& price_tick){
-        double my_pos = get_value(my_queue_position, side, price_tick);
-        double flow   = get_value(queue_flow, side, price_tick);
 
-        double ahead = my_pos - flow;
+        std_string book_side = (side == "BUY") ? "bids" : "asks";
+        double my_queue_pos = get_value(my_queue_position, book_side, price_tick);
+        double flow   = get_value(queue_flow, book_side, price_tick);
+
+        double ahead = my_queue_pos - flow;
         return max(0.0, ahead);
     }
 
     void reset_queue_ahead(const std_string& side, const int64_t& price_tick){
-        my_queue_position[side].erase(price_tick);
-        queue_flow[side].erase(price_tick);
+        
+        std_string book_side = (side == "BUY") ? "bids" : "asks";
+        my_queue_position[book_side].erase(price_tick);
+        queue_flow[book_side].erase(price_tick);
+    }
+
+    double set_queue_position(const std_string& side, const int64_t& price_tick) {
+
+        double book_size = 0.0;
+        if(side == "BUY"){
+            auto it = market_book.bids.find(price_tick);
+            if(it != market_book.bids.end()) book_size = it->second;
+        }
+        else{
+            auto it = market_book.asks.find(price_tick);
+            if(it != market_book.asks.end()) book_size = it->second;
+        }
+
+        my_queue_position[(side == "BUY") ? "bids" : "asks"][price_tick] = book_size;
+        return book_size;
     }
 
     void update_queue_from_depth(const Depth& entry){
@@ -380,8 +422,8 @@ public:
         equity_history.push_back(equity);
     }
 
-    double compute_sharpe(){
-        if(return_history.size() < 30) return 0.0;
+    PerformanceMetrics compute_performance(){
+        PerformanceMetrics performance;
 
         vector<double> returns;
         returns.reserve(return_history.size());
@@ -391,69 +433,64 @@ public:
         }
 
         if(returns.size() < 30){
-            cout << "SHARPE - len(returns) < 30:" << NAN << "\n";
-            return NAN;
+            cout << "PERFORMANCE - insufficient returns: " << returns.size() << "\n";
+            return performance;
         }
 
+        // -------------------------
+        // Mean return
+        // -------------------------
         double mean = 0.0;
+
         for(double r: returns) mean += r;
+
         mean /= returns.size();
 
+        // -------------------------
+        // Variance + downside variance
+        // -------------------------
         double var = 0.0;
-        for(double r: returns) var += (r - mean) * (r - mean);
+        double downside_var = 0.0;
+
+        for(double r: returns){
+            double diff = r - mean;
+            var += diff * diff;
+
+            double downside = min(r, 0.0); // MAR = 0
+            downside_var += downside * downside;
+        }
+
         var /= returns.size();
+        downside_var /= returns.size();
 
         double std = sqrt(var);
-        if(std == 0.0 || isnan(std)){
-            cout << "SHARPE - std == 0 / isnan(std):" << NAN << "\n";
-            return NAN;
+        double downside_std = sqrt(downside_var);
+
+        // -------------------------
+        // Sharpe
+        // -------------------------
+        double annualization_factor = sqrt(10 * 60 * 60 * 24 * 365);
+
+        if(std > 0.0 && isfinite(std)){
+            double sharpe = mean / (std + 1e-9);
+            performance.sharpe = sharpe;
+            performance.annualized_sharpe = sharpe * annualization_factor;
         }
 
-        double sharpe_ratio = mean / (std + 1e-9);
-        cout << "SHARPE: " << sharpe_ratio << "\n";
-
-        return sharpe_ratio;
-    }
-
-    double compute_sortino(){
-        if(return_history.size() < 30) return 0.0;
-
-        vector<double> returns;
-        returns.reserve(return_history.size());
-
-        for(double r : return_history){
-            if(isfinite(r)) returns.push_back(r);
+        // -------------------------
+        // Sortino
+        // -------------------------
+        if(downside_std > 0.0 && isfinite(downside_std)){
+            double sortino = mean / (downside_std + 1e-9);
+            performance.sortino = sortino;
+            performance.annualized_sortino = sortino * annualization_factor;
         }
 
-        if(returns.size() < 30){
-            return NAN;
-        }
+        cout << "SHARPE: " << performance.sharpe
+            << " Annualized SHARPE: " << performance.annualized_sharpe
+            << " SORTINO: " << performance.sortino
+            << " Annualized SORTINO: " << performance.annualized_sortino << "\n";
 
-        // mean return
-        double mean = 0.0;
-        for(double r : returns) mean += r;
-        mean /= returns.size();
-
-        // downside variance only
-        double downside_var = 0.0;
-        int count = 0;
-
-        for(double r : returns){
-            double downside = min(r, 0.0);  // MAR = 0
-            downside_var += downside * downside;
-            count++;
-        }
-
-        double downside_std = sqrt(downside_var / count);
-
-        if(downside_std == 0.0 || isnan(downside_std)){
-            return NAN;
-        }
-
-        double sortino = mean / (downside_std + 1e-9);
-
-        cout << "SORTINO: " << sortino << "\n";
-
-        return sortino;
+        return performance;
     }
 };

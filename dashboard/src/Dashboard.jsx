@@ -167,7 +167,7 @@ export default function Dashboard() {
 
           <Row
             label="Residual Signal Quality"
-            value={s.signal_quality.toFixed(2)}
+            value={s.residual_signal_quality.toFixed(2)}
           />
 
           <Row
@@ -298,6 +298,11 @@ export default function Dashboard() {
           <Row
             label="Last Depth ts"
             value={sys.last_depth_ts}
+          />
+
+          <Row
+            label="Latency"
+            value={sys.latency_ms}
           />
 
         </tbody>

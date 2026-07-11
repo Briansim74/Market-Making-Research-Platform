@@ -57,12 +57,6 @@
 #include "mmpy_dashboard.hpp" //dashboard classes
 #include "mmpy_feed.hpp" // feeds
 #include "mmpy_state.hpp" //state & market_feature_state
-#include "mmpy_recorder.hpp" //dataset recorder
-#include "mmpy_strategy.hpp" // models & strategy
-
-#include <boost/uuid/random_generator.hpp>
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_io.hpp>
 
 using std::cout;
 using json = nlohmann::json;
@@ -80,507 +74,6 @@ namespace ssl = asio::ssl;
 using tcp = asio::ip::tcp;
 using ssl_stream = boost::asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
-
-struct Trade {
-    std_string side;
-    double price;
-    double qty;
-    uint64_t ts;
-};
-
-struct Depth {
-    uint64_t ts;
-    uint64_t U;
-    uint64_t u;
-    uint64_t pu;
-    vector<pair<int64_t, double>> bid_delta;
-    vector<pair<int64_t, double>> ask_delta;
-};
-
-struct EventNotifier {
-    mutex signal_mtx;
-    condition_variable signal_cv;
-    bool signal_pending = false;
-};
-
-struct Regime {
-    double volatility;
-    double spread;
-    double order_imbalance;
-    double trade_imbalance;
-    double quote_churn;
-    double inventory;
-    double inventory_vol;
-    double microprice_error;
-};
-
-struct Features {
-    double mid;
-    double fair;
-    double skew;
-    double microprice;
-    double microprice_dev;
-    double spread;
-
-    double order_imbalance;
-    double trade_imbalance;
-    double inventory;
-    double volatility;
-
-    double queue_ahead_bid;
-    double queue_ahead_ask;
-};
-
-struct Policy {
-    std_string regime = "no_regime_model";
-    int regime_id = -1;
-    double regime_prob = 0.0;
-
-    double alpha_order_imb = 0.2;
-    double alpha_trade_imb = 0.05;
-    double alpha_struct = 0.3;
-
-    double spread_multiplier = 1.0;
-    double k0 = 0.5;
-    double inventory_target = 0.0;
-
-    double residual_mid = 0.0;
-    double micro_residual = 0.0;
-};
-
-struct Toxicity {
-    double tox = 0.0;
-    double k1 = 0.2;
-    double k2 = 0.357;
-    double pred = 0.0;
-};
-
-struct Signal {
-    uint64_t ts;
-    double mid;
-    double microprice;
-    double microprice_dev;
-    double microprice_error;
-    double spread;
-    double best_bid;
-    double best_ask;
-
-    double order_imbalance;
-    double trade_imbalance;
-    double volatility;
-    double queue_ahead_bid;
-    double queue_ahead_ask;
-
-    double inventory;
-    double realized_pnl;
-    double unrealized_pnl;
-    double total_pnl;
-    double equity;
-
-    double fair;
-    double skew;
-    double struct_delta;
-    double micro_signal_delta;
-    double residual_delta;
-    double reservation;
-
-    std_string regime;
-    int regime_id;
-    double regime_prob;
-    double alpha_order_imb;
-    double alpha_trade_imb;
-    double alpha_struct;
-    double k0;
-    double spread_multiplier;
-    double inventory_target;
-    double residual_signal_quality;
-    Toxicity toxicity;
-
-    double bid_delta;
-    double ask_delta;
-    double quote_churn;
-
-    double my_bid;
-    double my_ask;
-};
-
-struct Order {
-    std_string client_oid; // changed to client_oid from order_id
-    std_string side;
-    int64_t price_tick;
-    double qty;
-    double remaining;
-    std_string status;
-    uint64_t ts;
-    std_string owner;
-    json resp;
-    Signal signal;
-    double queue_ahead_at_join;
-};
-
-struct ResidualPred {
-    uint64_t ts;
-    uint64_t horizon_ms;
-    double pred;
-    double reservation;
-    double realized;
-};
-
-struct ToxicityPred {
-    uint64_t ts;
-    uint64_t horizon_ms;
-    double pred;
-    double fill_price;
-    int fill_sign;
-    double realized;
-};
-
-struct MarketFeatureState {
-    deque<double> mid_returns;
-    deque<double> spread;
-    deque<double> order_imbalance;
-    deque<double> trade_imbalance;
-    deque<double> quote_churn;
-    deque<double> inventory;
-    deque<double> microprice_error;
-
-    deque<ResidualPred> residual_predictions;
-    deque<ResidualPred> residual_signal_log;
-
-    deque<ToxicityPred> toxicity_predictions;
-    deque<ToxicityPred> toxicity_signal_log;
-
-    double prev_best_bid = 0.0;
-    double prev_best_ask = 0.0;
-};
-
-struct LatencyEvent {
-    uint64_t execute_ts;
-    std_string type;
-    Signal signal;
-};
-
-struct Compare {
-    bool operator()(const LatencyEvent& a, const LatencyEvent& b){
-        return a.execute_ts > b.execute_ts; // "Does a have lower priority than b?" -> min heap
-    }
-};
-
-struct EventsRow {
-    std_string type;
-    uint64_t ts;
-    std_string msg;   // raw JSON string (same as Python)
-};
-
-struct Snapshot {
-    struct {
-        std_string header;
-        std_string regime;
-        double pnl_pct;
-    } title;
-
-    struct {
-        double mid;
-        double microprice;
-        double spread;
-        double best_bid;
-        double best_ask;
-        double bid_size;
-        double ask_size;
-        double ewma_vol;
-        double order_imbalance;
-        double trade_imbalance;
-        std_string trade;
-    } market;
-
-    struct {
-        std_string regime;
-        double confidence;
-    } regime;
-
-    struct {
-        double fair;
-        double skew;
-        double reservation;
-        double alpha_order_imb;
-        double alpha_trade_imb;
-        double alpha_struct;
-        double k0;
-        double spread_multiplier;
-        double inventory_target;
-        double residual_signal_quality;
-        double tox;
-        double k1;
-        double k2;
-    } signals;
-
-    struct {
-        double my_bid;
-        double my_ask;
-        double current_bid_size;
-        double current_ask_size;
-    } quotes;
-
-    struct {
-        double bid_queue;
-        double ask_queue;
-        double bid_pressure;
-        double ask_pressure;
-        std_string buy_order;
-        std_string sell_order;
-        std_string last_fill_candidate;
-        std_string last_order_update;
-    } execution;
-
-    struct {
-        double inventory;
-        double realized_pnl;
-        double unrealized_pnl;
-        double fees_paid;
-        double total_pnl;
-    } risk;
-
-    struct {
-        std_string time;
-        std_string last_trade_ts;
-        std_string last_depth_ts;
-        std_string latency_ms;
-    } system;
-};
-
-struct SnapshotRow {
-    uint64_t ts;
-    std_string symbol;
-
-    double mid;
-    int64_t mid_tick;
-    double spread;
-    double microprice;
-    double microprice_dev;
-    double microprice_error;
-
-    double best_bid;
-    double best_ask;
-    int64_t best_bid_tick;
-    int64_t best_ask_tick;
-
-    double order_imbalance;
-    double trade_imbalance;
-    double volatility;
-    double queue_ahead_bid;
-    double queue_ahead_ask;
-
-    double inventory;
-    double realized_pnl;
-    double unrealized_pnl;
-    double total_pnl;
-    double equity;
-
-    double fair;
-    double skew;
-    double struct_delta;
-    double micro_signal_delta;
-    double residual_delta;
-    double reservation;
-
-    std_string regime;
-    int regime_id;
-    double regime_prob;
-    double alpha_order_imb;
-    double alpha_trade_imb;
-    double alpha_struct;
-    double k0;
-    double spread_multiplier;
-    double inventory_target;
-    double residual_signal_quality;
-    double tox;
-    double k1;
-    double k2;
-
-    double my_bid;
-    double my_ask;
-    int64_t my_bid_tick;
-    int64_t my_ask_tick;
-
-    double bid_distance_touch;
-    double ask_distance_touch;
-    double bid_distance_spread;
-    double ask_distance_spread;
-
-    double bid_delta;
-    double ask_delta;
-    double quote_churn;
-};
-
-struct TradeRow {
-    int64_t ts;
-    std_string symbol;
-
-    double price;
-    int64_t price_tick;
-    double qty;
-    std_string side;
-    bool is_buyer_maker;
-
-    double mid;
-    double microprice;
-    double microprice_dev;
-    double microprice_error;
-    double spread;
-    double best_bid;
-    double best_ask;
-    int64_t best_bid_tick;
-    int64_t best_ask_tick;
-
-    double bid_size;
-    double ask_size;
-
-    double trade_to_mid;
-    double trade_to_microprice;
-    double price_to_best_bid;
-    double price_to_best_ask;
-
-    std_string trade_side;
-    int trade_sign;
-
-    double notional;
-    double log_notional;
-    double intensity;
-};
-
-struct QuoteRow {
-    int64_t ts;
-    std_string symbol;
-    std_string client_oid;
-    std_string side;
-    std_string event_type;
-
-    double price;
-    int64_t price_tick;
-    double qty;
-
-    double mid;
-    double microprice;
-    double microprice_dev;
-    double microprice_error;
-    double spread;
-    double best_bid;
-    double best_ask;
-    int64_t best_bid_tick;
-    int64_t best_ask_tick;
-    
-    double order_imbalance;
-    double trade_imbalance;
-    double volatility;
-    double queue_ahead_bid;
-    double queue_ahead_ask;
-
-    double distance_to_mid;
-    double distance_to_touch;
-    double inventory;
-
-    double fair;
-    double skew;
-    double struct_delta;
-    double micro_signal_delta;
-    double residual_delta;
-    double reservation;
-
-    std_string regime;
-    int regime_id;
-    double regime_prob;
-    double alpha_order_imb;
-    double alpha_trade_imb;
-    double alpha_struct;
-    double k0;
-    double spread_multiplier;
-    double inventory_target;
-    double residual_signal_quality;
-    double tox;
-    double k1;
-    double k2;
-};
-
-struct FillRow {
-    int64_t ts;
-    std_string symbol;
-    std_string side;
-    double price;
-    int64_t price_tick;
-    double qty;
-
-    bool is_maker;
-    int fill_sign;
-    std_string fill_type;
-    std_string fill_status;
-    double queue_ahead_at_join;
-
-    double mid_at_fill;
-    double microprice_at_fill;
-    double microprice_dev_at_fill;
-    double microprice_error_at_fill;
-    double spread_at_fill;
-    double best_bid_at_fill;
-    double best_ask_at_fill;
-    double volatility_at_fill;
-    double volatility_at_fill_bps;
-
-    double mid;
-    double microprice;
-    double microprice_dev;
-    double microprice_error;
-    double spread;
-    double best_bid;
-    double best_ask;
-    int64_t best_bid_tick;
-    int64_t best_ask_tick;
-
-    double order_imbalance;
-    double trade_imbalance;
-    double volatility;
-    double volatility_bps;
-    double queue_ahead_bid;
-    double queue_ahead_ask;
-    double inventory;
-
-    double fair;
-    double skew;
-    double struct_delta;
-    double micro_signal_delta;
-    double residual_delta;
-    double reservation;
-
-    std_string regime;
-    int regime_id;
-    double regime_prob;
-    double alpha_order_imb;
-    double alpha_trade_imb;
-    double alpha_struct;
-    double k0;
-    double spread_multiplier;
-    double inventory_target;
-    double residual_signal_quality;
-    double tox;
-    double k1;
-    double k2;
-
-    double my_bid;
-    double my_ask;
-    int64_t my_bid_tick;
-    int64_t my_ask_tick;
-
-    double bid_distance_touch;
-    double ask_distance_touch;
-    double bid_distance_spread;
-    double ask_distance_spread;
-};
-
-struct PerformanceMetrics {
-    double sharpe = NAN;
-    double annualized_sharpe = NAN;
-    double sortino = NAN;
-    double annualized_sortino = NAN;
-};
 
 // =========================
 // MARKET MICROSTRUCTURE UTILS
@@ -686,6 +179,7 @@ public:
     }
 };
 
+// Market Data Layer
 class OrderBook {
 public:
     MarketConfig& config; // pointer to avoid copies
@@ -799,119 +293,45 @@ public:
 
 class RegimeModel {
 public:
-    using Vec = vector<double>;
-    using Mat = vector<vector<double>>;
-
-    std_string model_name;
-    std_string target;
-    uint64_t horizon_ms;
-
-    Mat means;
-    vector<Mat> cov_inv;
-
-    Vec log_det_cov;
-    Vec log_weights;
-
-    Vec scaler_mean;
-    Vec scaler_scale;
-
-    int n_regimes;
-    vector<std_string> feature_cols;
+    vector<vector<float>> means; // [K][D]
+    vector<vector<vector<float>>> cov_inv; // [K][D][D]
+    vector<float> log_det_cov; // [K]
+    vector<float> log_weights;
     vector<std_string> regime_labels;
-
     int K;
     int D;
 
-    // reusable buffers (IMPORTANT OPTIMIZATION)
-    Vec x_input;
-    Vec x_scaled;
-    Vec diff;
-    Vec scores;
-
-    static constexpr double LOG_2PI = 1.8378770664093453;
-
     RegimeModel(const json& artifact){
-        model_name = artifact["model_name"].get<std_string>();
-        target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<uint64_t>();
-
-        means = artifact["means"].get<Mat>();
-        cov_inv = artifact["cov_inv"].get<vector<Mat>>();
-
-        log_det_cov = artifact["log_det_cov"].get<Vec>();
-        log_weights = artifact["log_weights"].get<Vec>();
-   
-        scaler_mean = artifact["scaler_mean"].get<Vec>();
-        scaler_scale = artifact["scaler_scale"].get<Vec>();
-
-        n_regimes = artifact["n_regimes"].get<int>();
-        feature_cols = artifact["feature_cols"].get<vector<std_string>>();
+        means = artifact["means"].get<vector<vector<float>>>();
+        cov_inv = artifact["cov_inv"].get<vector<vector<vector<float>>>>();
+        log_det_cov = artifact["log_det_cov"].get<vector<float>>();
+        log_weights = artifact["log_weights"].get<vector<float>>();
         regime_labels = artifact["regime_labels"].get<vector<std_string>>();
 
         K = means.size();
         D = means[0].size();
-
-        // allocate once
-        x_input.resize(D);
-        x_scaled.resize(D);
-        diff.resize(D);
-        scores.resize(K);
-
-        cout << "INITIALIZED: " << model_name << " target: " << target << "\n";
     }
 
-    void pack_features(const Regime& regime){
-        x_input[0] = regime.volatility;
-        x_input[1] = regime.spread;
-        x_input[2] = regime.order_imbalance;
-        x_input[3] = regime.trade_imbalance;
-        x_input[4] = regime.quote_churn;
-        x_input[5] = regime.inventory;
-        x_input[6] = regime.inventory_vol;
-        x_input[7] = regime.microprice_error;
-    }
+    tuple<std_string, int, float> predict(const vector<float>& X) const{
 
-    void scale(){
-        for(int i = 0; i < D; i++){
-            x_scaled[i] = (x_input[i] - scaler_mean[i]) / scaler_scale[i];
-        }
-    }
-
-    tuple<std_string, int, double> predict(const Regime& regime){
-
-        pack_features(regime);
-        scale();
-
-        int best_k = -1; //gaussian component regime
-        double best_score = -numeric_limits<double>::infinity();
+        float best_score = -1e30f;
+        int best_k = 0;
 
         for(int k = 0; k < K; k++){
+            float logp = log_weights[k] - 0.5f * log_det_cov[k];
+
             const auto& mu = means[k];
             const auto& inv = cov_inv[k];
 
-            // compute diff = x - mu
+            // (x - mu)^T Σ^-1 (x - mu)
             for(int i = 0; i < D; i++){
-                diff[i] = x_scaled[i] - mu[i];
-            }
+                float diff_i = X[i] - mu[i];
 
-            // symmetric quadratic form (OPTIMIZED)
-            double quad = 0.0;
-
-            for(int i = 0; i < D; i++){
-                double di = diff[i];
-                const double* row = inv[i].data();
-
-                quad += di * row[i] * di;
-
-                for(int j = i + 1; j < D; j++){
-                    double dj = diff[j];
-                    quad += 2.0 * di * row[j] * dj;
+                for(int j = 0; j < D; j++){
+                    float diff_j = X[j] - mu[j];
+                    logp -= 0.5f * diff_i * inv[i][j] * diff_j;
                 }
             }
-
-            double logp = log_weights[k] - 0.5 * (D * LOG_2PI + log_det_cov[k] + quad);
-
-            scores[k] = logp;
 
             if(logp > best_score){
                 best_score = logp;
@@ -919,14 +339,8 @@ public:
             }
         }
 
-        // log-sum-exp normalization (stable softmax)
-        double max_log = best_score;
-        double sum = 0.0;
-
-        for(double s: scores) sum += exp(s - max_log);
-
-        double log_norm = max_log + log(sum);
-        double prob = exp(scores[best_k] - log_norm);
+        // soft proxy probability (not normalized softmax, but stable ranking signal)
+        float prob = exp(best_score);
 
         return {regime_labels[best_k], best_k, prob};
     }
@@ -934,169 +348,207 @@ public:
 
 class MicroSignalModel {
 public:
-    std_string model_name;
-    std_string target;
-    uint64_t horizon_ms;
-
-    double intercept;
+    std_string model;
+    double target;
+    double horizon_ms;
     double beta;
     double ic;
-    double rank_ic;
 
     MicroSignalModel(const json& artifact){
-        model_name = artifact["model_name"].get<std_string>();
-        target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<uint64_t>();
-        intercept = artifact["intercept"].get<double>();
-        beta = artifact["beta"].get<double>();
-        ic = artifact["ic"].get<double>();
-        rank_ic = artifact["rank_ic"].get<double>();
-
-        cout << "INITIALIZED: " << model_name << " target: " << target << "\n";
+        model = artifact["model"];
+        target = artifact["target"];
+        horizon_ms = artifact["horizon_ms"];
+        beta = artifact["beta"];
+        ic = artifact["ic"];
     }
 
-    double predict(const Features& features){
-        double micro_signal = features.microprice_dev / features.mid; // (microprice - mid) / mid;
-        double micro_signal_delta = features.mid * (intercept + beta * micro_signal);
-        
-        return micro_signal_delta;
+    double predict(const Features& features) const{
+        double micro_signal = features.microprice_dev / features.mid;
+        double fair_bias = ic * beta * micro_signal;
+        return fair_bias;
     }
 };
 
-class ResidualModel {
-public:
-    std_string model_name;
-    std_string target;
-    uint64_t horizon_ms;
+using Getter = function<double(const Features&)>;
 
-    BoosterHandle booster;
-    vector<std_string> feature_cols;
-    int D;
-    
-    vector<float> x_input;
-    DMatrixHandle dmat = nullptr;
-
-    ~ResidualModel(){
-        if(dmat) XGDMatrixFree(dmat);
-    }
-
-    ResidualModel(const json& artifact){
-
-        model_name = artifact["model_name"].get<std_string>();
-        target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<uint64_t>();
-        feature_cols = artifact["feature_cols"].get<vector<std_string>>();
-        D = artifact["feature_dim"].get<int>();
-
-        if(D < 7) throw runtime_error("feature_dim too small");
-        x_input.resize(D);
-
-        std_string model_file = artifact["model_file"].get<std_string>();
-        XGBoosterCreate(nullptr, 0, &booster);
-        XGBoosterLoadModel(booster, model_file.c_str());
-
-        cout << "INITIALIZED: " << model_name << " target: " << target << "\n";
-    }
-
-    void pack_features(const Features& f){
-        x_input[0] = f.spread;
-        x_input[1] = f.order_imbalance;
-        x_input[2] = f.trade_imbalance;
-        x_input[3] = f.inventory;
-        x_input[4] = f.volatility;
-        x_input[5] = f.queue_ahead_bid;
-        x_input[6] = f.queue_ahead_ask;
-    }
-
-    double predict(const Features& f){
-        pack_features(f);
-
-        if(dmat) XGDMatrixFree(dmat);
-        XGDMatrixCreateFromMat(x_input.data(), 1, D, NAN, &dmat);
-
-        bst_ulong out_len;
-        const float* out_result;
-
-        XGBoosterPredict(
-            booster,
-            dmat,
-            0,          // option_mask
-            0,          // ntree_limit
-            0,          // training = false (IMPORTANT)
-            &out_len,
-            &out_result
-        );
-
-        return out_result[0];
+struct FeatureRegistry {
+    static const unordered_map<std::string, Getter>& map() {
+        static const unordered_map<std::string, Getter> m = {
+            {"mid", [](const Features& f){ return f.mid; }},
+            {"fair", [](const Features& f){ return f.fair; }},
+            {"skew", [](const Features& f){ return f.skew; }},
+            {"microprice", [](const Features& f){ return f.microprice; }},
+            {"microprice_dev", [](const Features& f){ return f.microprice_dev; }},
+            {"spread", [](const Features& f){ return f.spread; }},
+            {"order_imbalance", [](const Features& f){ return f.order_imbalance; }},
+            {"trade_imbalance", [](const Features& f){ return f.trade_imbalance; }},
+            {"inventory", [](const Features& f){ return f.inventory; }},
+            {"volatility", [](const Features& f){ return f.volatility; }},
+            {"queue_ahead_bid", [](const Features& f){ return f.queue_ahead_bid; }},
+            {"queue_ahead_ask", [](const Features& f){ return f.queue_ahead_ask; }},
+        };
+    return m;
     }
 };
 
-class ToxicityModel {
+class MLModel {
 public:
-    std_string model_name;
-    std_string target;
-    uint64_t horizon_ms;
-
-    BoosterHandle booster;
+    // BoosterHandle booster;
+    std_string model;
     vector<std_string> feature_cols;
-    int D;
+    int target;
+    int horizon_ms;
 
-    vector<float> x_input;
-    DMatrixHandle dmat = nullptr;
-
-    ~ToxicityModel(){
-        if(dmat) XGDMatrixFree(dmat);
-    }
-
-    ToxicityModel(const json& artifact){
-
-        model_name = artifact["model_name"].get<std_string>();
-        target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<uint64_t>();
-        feature_cols = artifact["feature_cols"].get<vector<std_string>>();
-        D = artifact["feature_dim"].get<int>();
+    MLModel(const json& artifact){
+        // XGBoosterCreate(nullptr, 0, &booster);
+        // XGBoosterLoadModel(booster, model_path.c_str());
         
-        if(D < 7) throw runtime_error("feature_dim too small");
-        x_input.resize(D);
-
-        std_string model_file = artifact["model_file"].get<std_string>();
-        XGBoosterCreate(nullptr, 0, &booster);
-        XGBoosterLoadModel(booster, model_file.c_str());
-
-        cout << "INITIALIZED: " << model_name << ", target: " << target << "\n";
+        model = artifact["model"];
+        feature_cols = artifact["feature_cols"];
+        target = artifact["target"];
+        horizon_ms = artifact["horizon_ms"];
     }
 
-    void pack_features(const Features& f){
-        x_input[0] = f.microprice_dev;
-        x_input[1] = f.order_imbalance;
-        x_input[2] = f.trade_imbalance;
-        x_input[3] = f.volatility;
-        x_input[4] = f.spread;
-        x_input[5] = f.queue_ahead_bid;
-        x_input[6] = f.queue_ahead_ask;
+    vector<double> build_vector(const Features& features, const vector<std_string>& feature_cols){
+        const auto& reg = FeatureRegistry::map();
+
+        vector<double> out;
+        out.reserve(feature_cols.size());
+
+        for(const auto& name: feature_cols){
+            auto it = reg.find(name);
+            
+            if(it == reg.end()) throw runtime_error("Unknown feature: " + name);
+
+            out.push_back(it->second(features));
+        }
+
+        return out;
     }
 
-    double predict(const Features& f){
-        pack_features(f);
+    double predict(const Features& features) const {
+        // auto vec = build_vector(features, feature_cols);
 
-        if(dmat) XGDMatrixFree(dmat);
-        XGDMatrixCreateFromMat(x_input.data(), 1, D, NAN, &dmat);
+        // DMatrixHandle dmat;
+        // XGDMatrixCreateFromMat(
+        //     vec.data(),
+        //     1,
+        //     vec.size(),
+        //     NAN,
+        //     &dmat
+        // );
 
-        bst_ulong out_len;
-        const float* out_result;
+        // bst_ulong out_len;
+        // const double* out_result;
 
-        XGBoosterPredict(
-            booster,
-            dmat,
-            0,          // option_mask
-            0,          // ntree_limit
-            0,          // training = false (IMPORTANT)
-            &out_len,
-            &out_result
-        );
+        // XGBoosterPredict(booster, dmat, 0, 0, &out_len, &out_result);
 
-        return out_result[0];
+        // double pred = out_result[0];
+        // XGDMatrixFree(dmat);
+
+        // return pred;
+        return 0.0;
     }
+};
+
+struct Policy {
+    std_string regime = "no_model";
+    int regime_id = -1.0;
+    double regime_prob = 0.0;
+
+    double alpha_order_imb = 0.2;
+    double alpha_trade_imb = 0.05;
+    double alpha_struct = 0.3;
+
+    double spread_multiplier = 1.0;
+    double k0 = 0.5;
+    double inventory_target = 0.0;
+
+    double residual_mid = 0.0;
+    double micro_residual = 0.0;
+};
+
+struct Features {
+    double mid;
+    double fair;
+    double skew;
+    double microprice;
+    double microprice_dev;
+    double spread;
+
+    double order_imbalance;
+    double trade_imbalance;
+    double inventory;
+    double volatility;
+
+    double queue_ahead_bid;
+    double queue_ahead_ask;
+};
+
+struct Toxicity {
+    double tox = 0.0;
+    double k1 = 0.2;
+    double k2 = 0.357;
+};
+
+struct Signal {
+    uint64_t ts;
+    double mid;
+    double microprice;
+    double microprice_dev;
+    double microprice_error;
+    double spread;
+    double best_bid;
+    double best_ask;
+
+    double order_imbalance;
+    double trade_imbalance;
+    double volatility;
+    double queue_ahead_bid;
+    double queue_ahead_ask;
+
+    double inventory;
+    double realized_pnl;
+    double unrealized_pnl;
+    double total_pnl;
+    double equity;
+
+    double fair;
+    double skew;
+    double struct_delta;
+    double micro_signal_delta;
+    double ml_delta;
+    double reservation;
+
+    std_string regime;
+    int regime_id;
+    double regime_prob;
+    double alpha_order_imb;
+    double alpha_trade_imb;
+    double alpha_struct;
+    double k0;
+    double spread_multiplier;
+    double inventory_target;
+    double signal_quality;
+    Toxicity toxicity;
+
+    double bid_delta;
+    double ask_delta;
+    double quote_churn;
+
+    double my_bid;
+    double my_ask;
+};
+
+struct Regime {
+    double volatility;
+    double spread;
+    double order_imbalance;
+    double trade_imbalance;
+    double quote_churn;
+    double inventory;
+    double inventory_vol;
+    double microprice_error;
 };
 
 class MarketMakingStrategy {
@@ -1104,82 +556,59 @@ public:
     MarketConfig& config;
     const json& params;
     double gamma;
-    std_string folder_path;
 
     // Models
     std_string struct_model;
-    unique_ptr<RegimeModel> regime_model;
     unique_ptr<MicroSignalModel> micro_signal_model;
-    unique_ptr<ResidualModel> residual_model;
-    unique_ptr<ToxicityModel> toxicity_model;
+    unique_ptr<MLModel> edge_model;
+    unique_ptr<RegimeModel> regime_model;
+    unique_ptr<MLModel> toxicity_model;
 
     MarketMakingStrategy(MarketConfig& config, const json& params)
         : config(config), params(params){
-        gamma = params["gamma"].get<double>();
-        folder_path = params["folder_path"].get<std_string>();
+        gamma = params["gamma"];
 
-        struct_model = params["models"]["struct_model"].get<std_string>();
-        regime_model       = load_model<RegimeModel>("regime_model");
+        struct_model = params["models"]["struct_model"];
         micro_signal_model = load_model<MicroSignalModel>("micro_signal_model");
-        residual_model     = load_model<ResidualModel>("residual_model");
-        toxicity_model     = load_model<ToxicityModel>("toxicity_model");
+        edge_model         = load_model<MLModel>("edge_model");
+        regime_model       = load_model<RegimeModel>("regime_model");
+        toxicity_model     = load_model<MLModel>("toxicity_model");
     }
 
-    template<typename T> unique_ptr<T> load_model(const std_string& model){
-        if(params["models"][model].get<std_string>().empty()) return nullptr;
+    template<typename T> unique_ptr<T> load_model(const std_string& model_name){
+        if(!params["models"].contains(model_name)) return nullptr;
 
-        std_string file = folder_path + "/" + params["models"][model].get<std_string>() + ".json";
+        if(params["models"][model_name].get<std_string>().empty()) return nullptr;
+
+        std_string file =
+            params["folder_path"].get<std_string>() + "/" +
+            params["models"][model_name].get<std_string>() + ".json";
+
         ifstream f(file);
         json artifact;
         f >> artifact;
 
+        cout << "INITIALIZED " << model_name << "\n";
+
         return make_unique<T>(artifact);
     }
 
-    Policy detect_regime(const Regime& regime){
-        
-        Policy policy;
-        
-        if(regime_model == nullptr) return policy;
+    """
+    Strategy-level last_bid/last_ask
 
-        auto [pred_regime, regime_id, prob] = regime_model->predict(regime);
+    Used for:
 
-        policy.regime = pred_regime;
-        policy.regime_id = regime_id;
-        policy.regime_prob = prob;
+    quote stability logic (avoid churn)
+    signal smoothing decisions
+    “did my model change meaningfully?”
 
-        if(pred_regime == "trending"){
-            policy.alpha_order_imb = 0.6;
-            policy.alpha_trade_imb = 0.2;
-            policy.alpha_struct = 0.8;
-            policy.spread_multiplier = 2.0;
-            policy.k0 = 1.2;
-            policy.inventory_target = (regime.trade_imbalance > 0) ? 1.0 : -1.0;
-        }
-        else if(pred_regime == "toxic"){
-            policy.alpha_order_imb = 0.05;
-            policy.alpha_trade_imb = 0.01;
-            policy.alpha_struct = 0.4;
-            policy.spread_multiplier = 1.5;
-            policy.k0 = 0.5;
-            policy.inventory_target = 0.0;
-        }
-        else{ // low_vol / normal / competitive
-            policy.alpha_order_imb = 0.15;
-            policy.alpha_trade_imb = 0.05;
-            policy.alpha_struct = 0.2;
-            policy.spread_multiplier = 0.7;
-            policy.k0 = 1.0;
-            policy.inventory_target = 0.0;
-        }
-
-        return policy;
-    }
-
+    This is decision memory
+    """
     // -------------------------
     // CORE ALPHA SIGNALS
     // -------------------------
-    pair<double, double> compute_fair_and_micro(State& state, const Policy& policy){
+
+    pair<double, double> compute_fair_and_micro(State& state, const unordered_map<std_string, double>& policy){
         
         auto& book = state.market_book;
 
@@ -1221,121 +650,111 @@ public:
         return -effective_inventory * gamma * sigma * mid;
     }
 
-    double compute_signal_quality(const auto& log){
+    double compute_signal_quality(State& state){
+        auto& log = state.market_feature_state.ml_signal_log;
 
-        const size_t n = log.size();
+        if(log.size() < 20)
+            return 1.0;
 
-        if(n < 20) return 1.0;
-        // if(n < 10) return 0.0; trust or no trust?
+        vector<double> p, r;
+        p.reserve(log.size());
+        r.reserve(log.size());
 
-        vector<double> pred_arr, realized_arr;
-        pred_arr.reserve(n);
-        realized_arr.reserve(n);
-
-        for(const auto& x: log){
-            pred_arr.push_back(x.pred);
-            realized_arr.push_back(x.realized);
+        for(auto& x: log){
+            p.push_back(x.pred);
+            r.push_back(x.realized);
         }
 
         auto mean = [](const vector<double>& v){
-            double sum = 0.0;
-            for(double x: v) sum += x;
-            return sum / v.size();
+            double s = 0.0;
+            for(double x: v) s += x;
+            return s / v.size();
         };
 
-        double mean_pred = mean(pred_arr);
-        double mean_realized = mean(realized_arr);
+        double mp = mean(p);
+        double mr = mean(r);
 
         // -----------------------------
         // Pearson IC
         // -----------------------------
-        double cov = 0.0, var_pred = 0.0, var_realized = 0.0;
+        double cov = 0.0, vp = 0.0, vr = 0.0;
 
-        for(size_t i = 0; i < n; i++){
-            double dev_pred = pred_arr[i] - mean_pred;
-            double dev_realized = realized_arr[i] - mean_realized;
+        for(size_t i = 0; i < p.size(); i++){
+            double dp = p[i] - mp;
+            double dr = r[i] - mr;
 
-            cov += dev_pred * dev_realized;
-            var_pred += dev_pred * dev_pred;
-            var_realized += dev_realized * dev_realized;
+            cov += dp * dr;
+            vp  += dp * dp;
+            vr  += dr * dr;
         }
 
         double ic = 0.0;
-        if(var_pred > 1e-12 && var_realized > 1e-12)
-            ic = cov / sqrt(var_pred * var_realized);
+        if(vp > 1e-12 && vr > 1e-12)
+            ic = cov / sqrt(vp * vr);
 
-        if(isnan(ic)) ic = 0.0;
+        if(isnan(ic))
+            ic = 0.0;
 
         // -----------------------------
         // Rank IC (Spearman)
         // -----------------------------
+        vector<size_t> idx(p.size());
+        iota(idx.begin(), idx.end(), 0);
+
         auto rank = [&](const vector<double>& v){
-            vector<size_t> id_arr(n);
-            vector<double> rank_arr(n);
+            vector<size_t> id(v.size());
+            iota(id.begin(), id.end(), 0);
 
-            iota(id_arr.begin(), id_arr.end(), 0);
-            sort(id_arr.begin(), id_arr.end(), [&](const size_t& a, const size_t& b){
-                if (v[a] < v[b]) return true;
-                if (v[a] > v[b]) return false;
-                return a < b;
-            });
+            sort(id.begin(), id.end(), [&](size_t a, size_t b){ return v[a] < v[b]; });
 
-            size_t i = 0;
-            while(i < n){
-                size_t j = i;
+            vector<double> rnk(v.size());
+            for(size_t i = 0; i < id.size(); i++)
+                rnk[id[i]] = static_cast<double>(i);
 
-                // find tie group
-                while (j + 1 < n && abs(v[id_arr[j + 1]] - v[id_arr[i]]) < 1e-12) j++;
-        
-                // average rank for ties
-                double avg_rank = (i + j) / 2.0;
-
-                for(size_t k = i; k <= j; k++) rank_arr[id_arr[k]] = avg_rank;
-
-                i = j + 1;
-            }
-            return rank_arr;
+            return rnk;
         };
 
-        vector<double> rank_pred = rank(pred_arr);
-        vector<double> rank_realized = rank(realized_arr);
+        vector<double> rp = rank(p);
+        vector<double> rr = rank(r);
 
-        double mean_pred_rank = mean(rank_pred);
-        double mean_realized_rank = mean(rank_realized);
+        double mp_r = mean(rp);
+        double mr_r = mean(rr);
 
-        double cov_rank = 0.0, var_pred_rank = 0.0, var_realized_rank = 0.0;
+        double cov_r = 0.0, vp_r = 0.0, vr_r = 0.0;
 
-        for(size_t i = 0; i < n; i++){
-            double dev_pred_rank = rank_pred[i] - mean_pred_rank;
-            double dev_realized_rank = rank_realized[i] - mean_realized_rank;
+        for(size_t i = 0; i < rp.size(); i++){
+            double dp = rp[i] - mp_r;
+            double dr = rr[i] - mr_r;
 
-            cov_rank += dev_pred_rank * dev_realized_rank;
-            var_pred_rank  += dev_pred_rank * dev_pred_rank;
-            var_realized_rank  += dev_realized_rank * dev_realized_rank;
+            cov_r += dp * dr;
+            vp_r  += dp * dp;
+            vr_r  += dr * dr;
         }
 
         double rank_ic = 0.0;
-        if(var_pred_rank > 1e-12 && var_realized_rank > 1e-12)
-            rank_ic = cov_rank / sqrt(var_pred_rank * var_realized_rank);
+        if(vp_r > 1e-12 && vr_r > 1e-12)
+            rank_ic = cov_r / sqrt(vp_r * vr_r);
 
-        if(isnan(rank_ic)) rank_ic = 0.0;
+        if(isnan(rank_ic))
+            rank_ic = 0.0;
 
         // -----------------------------
         // Directional accuracy
         // -----------------------------
         double hits = 0.0;
-        for(size_t i = 0; i < n; i++){
-            if((pred_arr[i] > 0) == (realized_arr[i] > 0)) hits += 1.0;
+        for(size_t i = 0; i < p.size(); i++){
+            if((p[i] > 0) == (r[i] > 0))
+                hits += 1.0;
         }
 
-        double hit_rate = hits / n;
+        double hit_rate = hits / p.size();
         double directional_score = (hit_rate - 0.5) * 2.0;  // [-1, 1]
 
         // -----------------------------
-        // Final score
+        // 5. final score
         // -----------------------------
-        double vol_pred = sqrt(var_pred / n);
-        double stability_penalty = exp(-vol_pred * 50.0);
+        double pred_vol = sqrt(vp / p.size());
+        double stability_penalty = exp(-pred_vol * 50.0);
 
         double raw = 0.5 * ic + 0.3 * rank_ic + 0.2 * directional_score;
         double signal_quality = stability_penalty * tanh(3.0 * raw);
@@ -1343,44 +762,85 @@ public:
         return 0.3 + 1.4 * ((signal_quality + 1.0) / 2.0);
     }
 
+    Policy detect_regime(const Features& features){
+        
+        Policy policy;
+        
+        if(regime_model == nullptr) return policy;
+
+        auto [regime, regime_id, prob] = regime_model->predict(features);
+
+        policy.regime = regime;
+        policy.regime_id = regime_id;
+        policy.regime_prob = prob;
+
+        if(regime == "trending"){
+            policy.alpha_order_imb = 0.6;
+            policy.alpha_trade_imb = 0.2;
+            policy.alpha_struct = 0.8;
+            policy.spread_multiplier = 2.0;
+            policy.k0 = 1.2;
+            policy.inventory_target = (features.at("trade_imbalance") > 0 ? 1.0 : -1.0);
+        }
+        else if(regime == "toxic"){
+            policy.alpha_order_imb = 0.05;
+            policy.alpha_trade_imb = 0.01;
+            policy.alpha_struct = 0.4;
+            policy.spread_multiplier = 1.5;
+            policy.k0 = 0.5;
+            policy.inventory_target = 0.7;
+        }
+        else{ // low_vol / normal / competitive
+            policy.alpha_order_imb = 0.15;
+            policy.alpha_trade_imb = 0.05;
+            policy.alpha_struct = 0.2;
+            policy.spread_multiplier = 0.7;
+            policy.k0 = 1.0;
+            policy.inventory_target = 0.0;
+        }
+
+        return policy;
+    }
+
     double compute_struct_delta(const Features& features, const Policy& policy){
         
         if(struct_model != "blended_AS") return 0.0;
 
-        // Move my current mid price toward the structural fair so value by some fraction.
         double reservation = features.fair + features.skew;
-        double struct_delta = policy.alpha_struct * (reservation - features.mid);
+        double struct_center = features.mid + policy.alpha_struct * (reservation - features.mid);
+        double struct_delta = struct_center - features.mid;
 
         return struct_delta;
     }
 
-    double compute_micro_signal_delta(const Features& features){
+    double compute_micro_signal_delta(const Features& features) {
+        
+        if(micro_signal_model == nullptr) 0.0;
 
-        if(micro_signal_model == nullptr) return 0.0;
+        double fair_bias = micro_signal_model->predict(features);
+        double micro_signal_delta = features.mid * fair_bias;
 
-        return micro_signal_model->predict(features);
+        return micro_signal_delta;
     }
 
-    pair<double, double> compute_residual_delta(State& state, double struct_delta, double micro_signal_delta, 
-                                                const Features& features, const Policy& policy){
+    pair<double, double> compute_ml_delta(State& state, double struct_delta, double micro_signal_delta, const Features& features, const Policy& policy){
         
-        if(residual_model == nullptr) return {0.0, 0.0};
+        if(edge_model == nullptr) return {0.0, 0.0};
 
         double reservation = features.mid + struct_delta + micro_signal_delta;
-        double expected_log_return = residual_model->predict(features); // y^ in this case
+        double expected_return = edge_model->predict(features);
+        double signal_quality = compute_signal_quality(state);
 
-        ResidualPred residual_pred; //store residual prediction
-        residual_pred.ts = state.last_depth_ts;
-        residual_pred.horizon_ms = residual_model->horizon_ms;
-        residual_pred.pred = expected_log_return;
-        residual_pred.reservation = reservation;
-        state.mfs.residual_predictions.push_back(residual_pred);
+        MLPred = ml_pred;
+        ml_pred.ts = state.last_depth_ts;
+        ml_pred.pred = expected_return;
+        ml_pred.reservation = reservation;
+        state.market_feature_state.ml_predictions.push_back(ml_pred);
 
-        double residual_signal_quality = compute_signal_quality(state.mfs.residual_signal_log);
-        double effective_k = policy.k0 * residual_signal_quality;
+        double effective_k = p.k0 * signal_quality;
+        double ml_center = reservation * exp(expected_return * effective_k);
 
-        double residual_center = reservation * exp(expected_log_return * effective_k); //scale log return by effective_k
-        return {residual_center - reservation, residual_signal_quality};
+        return {ml_center - reservation, signal_quality};
     }
 
     Toxicity compute_toxicity(const Features& features){
@@ -1390,21 +850,16 @@ public:
         if(toxicity_model == nullptr) return toxicity;
 
         double prediction = toxicity_model->predict(features);
-        // double toxicity_signal_quality = compute_toxicity_signal_quality(state.mfs.toxicity_signal_log);
+        t.tox = -prediction;
 
-        toxicity.tox = -prediction; //trained on future markout, negative markout = toxic
-        // toxicity.k1 *= toxicity_signal_quality;
-        // toxicity.k2 *= toxicity_signal_quality;
-        // toxicity.pred = prediction;
-
-        return toxicity;
+        return t;
     }
 
     // -------------------------
     // FINAL QUOTE GENERATION
     // -------------------------
     Signal generate_quotes(State& state){
-
+        
         auto& book = state.market_book;
 
         auto [bid_tick, bid_size] = book.best_bid();
@@ -1439,12 +894,10 @@ public:
         // ALPHA STACK
         // -------------------------
         double struct_delta = compute_struct_delta(features, policy);
-
         double micro_signal_delta = compute_micro_signal_delta(features);
-
-        auto [residual_delta, residual_signal_quality] = compute_residual_delta(state, struct_delta, micro_signal_delta, features, policy);
-
-        double center = mid + struct_delta + micro_signal_delta + residual_delta;
+        auto [ml_delta, signal_quality] = compute_ml_delta(state, struct_delta, micro_signal_delta, features, policy);
+        
+        double center = mid + struct_delta + micro_signal_delta + ml_delta;
         Toxicity toxicity = compute_toxicity(features);
 
         double spread = compute_spread(features, policy, toxicity);
@@ -1465,10 +918,11 @@ public:
         bid = config.round_price(bid);
         ask = config.round_price(ask);
 
-        double bid_delta = abs(best_bid - state.mfs.prev_best_bid);
-        double ask_delta = abs(best_ask - state.mfs.prev_best_ask);
+        double bid_delta = abs(best_bid - state.market_feature_state.prev_best_bid);
+        double ask_delta = abs(best_ask - state.market_feature_state.prev_best_ask);
 
         Signal signal;
+
         signal.ts = state.last_depth_ts;
         signal.mid = features.mid;
         signal.microprice = features.microprice;
@@ -1487,14 +941,14 @@ public:
         signal.inventory = features.inventory;
         signal.realized_pnl = state.realized_pnl;
         signal.unrealized_pnl = state.get_unrealized_pnl(mid);
-        signal.total_pnl = state.get_pnl(mid);
+        signal.total_pnl = state.get_pnl();
         signal.equity = state.cash + state.inventory * mid;
 
         signal.fair = features.fair;
         signal.skew = features.skew;
         signal.struct_delta = struct_delta;
         signal.micro_signal_delta = micro_signal_delta;
-        signal.residual_delta = residual_delta;
+        signal.ml_delta = ml_delta;
         signal.reservation = center;
 
         signal.regime = policy.regime;
@@ -1506,18 +960,46 @@ public:
         signal.k0 = policy.k0;
         signal.spread_multiplier = policy.spread_multiplier;
         signal.inventory_target = policy.inventory_target;
-        signal.residual_signal_quality = residual_signal_quality;
+        signal.signal_quality = signal_quality;
         signal.toxicity = toxicity;
 
         signal.bid_delta = bid_delta;
         signal.ask_delta = ask_delta;
-        signal.quote_churn = bid_delta + ask_delta;
+        signal.quote_churnn = bid_delta + ask_delta;
 
         signal.my_bid = bid;
         signal.my_ask = ask;
-
+        
         return signal;
     }
+
+    Signal on_market_update(State& state){
+        return generate_quotes(state);
+    }
+};
+
+struct MarketFeatureState {
+    deque<double> mid_returns;
+    deque<double> spread;
+    deque<double> order_imbalance;
+    deque<double> trade_imbalance;
+    deque<double> quote_churn;
+    deque<double> inventory;
+    deque<double> microprice_error;
+
+    deque<MLPred> ml_predictions;
+    deque<MLPred> ml_signal_log;
+    double ml_horizon_ms = 0.0;
+
+    double prev_best_bid = 0.0;
+    double prev_best_ask = 0.0;
+};
+
+struct MLPred {
+    double ts;
+    double pred;
+    double reservation;
+    double realized;
 };
 
 class State {
@@ -1525,17 +1007,18 @@ public:
     MarketConfig& config;
     const json& params;
     OrderBook market_book;
-    MarketFeatureState mfs;
+    double last_mid = 0.0;
+    MarketFeatureState market_feature_state;
+
     optional<Signal> last_signal;
 
-    double last_mid = 0.0;
     double order_imbalance = 0.0;
     double trade_imbalance = 0.0;
     double ewma_var = 0.0;
 
     double inventory = 0.0;
-    double cash;
-    double initial_cash;
+    double cash = 100000.0;
+    double initial_cash = 100000.0;
     double realized_pnl = 0.0;
     double avg_entry_price = 0.0;
 
@@ -1547,29 +1030,23 @@ public:
     double taker_fee_rate;
     double fees_paid = 0.0;
 
-    unordered_map<std_string, unordered_map<int64_t, double>> queue_flow;
-    unordered_map<std_string, unordered_map<int64_t, double>> my_queue_position;
-    unordered_map<std_string, unordered_map<int64_t, deque<Trade>>> trade_buckets;
-    uint64_t trade_flow_window_ms = 1000; // for trade flow buckets
+    unordered_map<std::string, unordered_map<int64_t, double>> queue_flow;
+    unordered_map<std::string, unordered_map<int64_t, double>> my_queue_position;
+    unordered_map<double, deque<Trade>> trade_buckets;
+    double window_ms = 1000;
 
-    double dt = 0.0;
-    uint64_t last_fill_match_ts = 0;
-
+    double last_trade_ts = 0;
     optional<Trade> last_trade;
-    uint64_t last_trade_ts = 0;
-    uint64_t last_depth_ts = 0;
-    optional<Order> last_fill_candidate;
-    optional<Order> last_order_update;
+    double last_depth_ts = 0;
+    Order* last_fill_candidate = nullptr;
+    Order* last_order_update = nullptr;
 
     bool initialized = false;
 
     State(MarketConfig& config, const json& params)
-        : config(config), params(params), market_book(config, params){
-            cash = params["cash"].get<double>();
-            initial_cash = params["initial_cash"].get<double>();
-            maker_fee_rate = params["fees"]["maker_fee_rate"].get<double>();
-            taker_fee_rate = params["fees"]["taker_fee_rate"].get<double>();
-        }
+        : config(config), params(params), market_book(config, params),
+        maker_fee_rate(params["fees"]["maker_fee_rate"].get<double>()),
+        taker_fee_rate(params["fees"]["taker_fee_rate"].get<double>()) {}
 
     double get_vol(){
         return sqrt(ewma_var);
@@ -1593,7 +1070,7 @@ public:
         order_imbalance = (bid_size - ask_size) / (bid_size + ask_size + 1e-9);
     }
 
-    void on_fill(const double& price, double fill_qty, const std_string& side, const std_string& liquidity){
+    void on_fill(const double& price, double qty, const std_string& side, const std_string& liquidity){
 
         // if (toxicity_model) {
             //     ToxicityPrediction p;
@@ -1612,27 +1089,27 @@ public:
         double old_inv = inventory;
         double old_avg = avg_entry_price;
 
-        double fill_value = price * fill_qty;
+        double fill_value = price * qty;
         double fee_rate = (liquidity == "maker") ? maker_fee_rate : taker_fee_rate;
         double fee = fill_value * fee_rate;
         fees_paid += fee;
 
         if(side == "BUY"){
             if(old_inv < 0){
-                double close_qty = min(fill_qty, abs(old_inv));
+                double close_qty = min(qty, abs(old_inv));
                 realized_pnl += close_qty * (old_avg - price);
 
                 old_inv += close_qty;
-                fill_qty -= close_qty;
+                qty -= close_qty;
             }
 
             inventory = old_inv;
 
-            if(fill_qty > 0){
-                double new_inv = old_inv + fill_qty;
+            if(qty > 0){
+                double new_inv = old_inv + qty;
 
                 if(old_inv > 0){
-                    avg_entry_price = (old_avg * old_inv + price * fill_qty) / new_inv;
+                    avg_entry_price = (old_avg * old_inv + price * qty) / new_inv;
                 }
                 else avg_entry_price = price;
 
@@ -1643,20 +1120,20 @@ public:
 
         else{ // SELL
             if(old_inv > 0){
-                double close_qty = min(fill_qty, old_inv);
+                double close_qty = min(qty, old_inv);
                 realized_pnl += close_qty * (price - old_avg);
 
                 old_inv -= close_qty;
-                fill_qty -= close_qty;
+                qty -= close_qty;
             }
 
             inventory = old_inv;
 
-            if(fill_qty > 0){
-                double new_inv = old_inv - fill_qty;
+            if(qty > 0){
+                double new_inv = old_inv - qty;
 
                 if(old_inv < 0){
-                    avg_entry_price = (old_avg * abs(old_inv) + price * fill_qty) / abs(new_inv);
+                    avg_entry_price = (old_avg * abs(old_inv) + price * qty) / abs(new_inv);
                 }
                 else avg_entry_price = price;
 
@@ -1673,24 +1150,24 @@ public:
     }
 
     double get_pnl(double mid){
-        return realized_pnl + get_unrealized_pnl(mid) - fees_paid;
+        return realized_pnl + inventory * (mid - avg_entry_price) - fees_paid;
     }
 
-    double get_value(auto& m, const std_string& side, const int64_t& price_tick){
+    double get_value(auto& m, const std_string& side, const int64_t& price){
         auto it1 = m.find(side);
         if(it1 == m.end()) return 0.0;
 
-        auto it2 = it1->second.find(price_tick);
+        auto it2 = it1->second.find(price);
         if(it2 == it1->second.end()) return 0.0;
 
         return it2->second;
     }
 
     double compute_queue_ahead(const std_string& side, const int64_t& price_tick){
-        double my_queue_pos = get_value(my_queue_position, side, price_tick);
+        double my_pos = get_value(my_queue_position, side, price_tick);
         double flow   = get_value(queue_flow, side, price_tick);
 
-        double ahead = my_queue_pos - flow;
+        double ahead = my_pos - flow;
         return max(0.0, ahead);
     }
 
@@ -1699,29 +1176,32 @@ public:
         queue_flow[side].erase(price_tick);
     }
 
-    void update_queue_from_depth(const Depth& entry){
+    void update_queue_from_depth(const vector<pair<double, double>>& bid_delta, 
+                                    const vector<pair<double, double>>& ask_delta){
 
-        for(auto& [price_tick, q]: entry.bid_delta){
+        for(const auto& [p, q]: bid_delta){
+            int64_t tick = config.to_tick(p);
             
-            auto it = market_book.bids.find(price_tick);
-            double old_qty = (it != market_book.bids.end()) ? it->second : 0.0;
-            double new_qty = q;
+            auto it = market_book.bids.find(tick);
+            double old = (it != market_book.bids.end()) ? it->second : 0.0;
+            double new = q;
 
-            if(old_qty > 0.0){
-                double depletion = max(0.0, old_qty - new_qty);
-                queue_flow["bids"][price_tick] += depletion;
+            if(old > 0.0){
+                double depletion = max(0.0, old - new);
+                queue_flow["bids"][tick] += depletion;
             }
         }
 
-        for(auto& [price_tick, q]: entry.ask_delta){
+        for(const auto& [p, q]: ask_delta){
+            int64_t tick = config.to_tick(p);
             
-            auto it = market_book.asks.find(price_tick);
-            double old_qty = (it != market_book.asks.end()) ? it->second : 0.0;
-            double new_qty = static_cast<double>(q);
+            auto it = market_book.asks.find(tick);
+            double old = (it != market_book.asks.end()) ? it->second : 0.0;
+            double new = static_cast<double>(q);
 
-            if(old_qty > 0.0){
-                double depletion = max(0.0, old_qty - new_qty);
-                queue_flow["asks"][price_tick] += depletion;
+            if(old > 0.0){
+                double depletion = max(0.0, old - new);
+                queue_flow["asks"][tick] += depletion;
             }
         }
     }
@@ -1732,6 +1212,7 @@ public:
     }
 
     void update_market_feature_state(){
+        auto& mfs = market_feature_state;
         auto& book = market_book;
 
         auto [bid_tick, bid_size] = book.best_bid();
@@ -1744,29 +1225,32 @@ public:
         double spread = best_ask - best_bid;
         double microprice = (best_ask * bid_size + best_bid * ask_size) /(bid_size + ask_size + 1e-9);
 
-        double mid_return = (last_mid != 0.0) ? (mid - last_mid) / last_mid : 0.0;
         last_mid = mid;
+        double mid_return = (mid - last_mid) / last_mid;
 
-        double quote_churn = 0.0;
-        if(mfs.prev_best_bid != 0.0 && mfs.prev_best_ask != 0.0){
+        if(mfs.prev_best_bid == 0.0 && mfs.prev_best_ask == 0.0){
+            double quote_churn = 0.0;
+        }
+        else{
             double bid_delta = abs(best_bid - mfs.prev_best_bid);
             double ask_delta = abs(best_ask - mfs.prev_best_ask);
-            quote_churn = bid_delta + ask_delta;
+            double quote_churn = bid_delta + ask_delta;
         }
 
         mfs.prev_best_bid = best_bid;
         mfs.prev_best_ask = best_ask;
 
-        push_limited(mfs.mid_returns, mid_return);
-        push_limited(mfs.spread, spread);
-        push_limited(mfs.order_imbalance, order_imbalance);
-        push_limited(mfs.trade_imbalance, trade_imbalance);
-        push_limited(mfs.quote_churn, quote_churn);
-        push_limited(mfs.inventory, inventory);
-        push_limited(mfs.microprice_error, mid - microprice);
+        mfs.mid_returns.push_limited(mid_return);
+        mfs.spread.push_limited(spread);
+        mfs.order_imbalance.push_limited(order_imbalance);
+        mfs.trade_imbalance.push_limited(trade_imbalance);
+        mfs.quote_churn.push_limited(quote_churn);
+        mfs.inventory.push_limited(inventory);
+        mfs.microprice_error.push_limited(mid - microprice);
     }
 
     Regime get_regime(){
+        auto& mfs = market_feature_state;
 
         auto mean = [](const deque<double>& q){
             if(q.empty()) return 0.0;
@@ -1799,35 +1283,43 @@ public:
         return regime;
     }
 
-    void update_residual_realization(){
+    void update_ml_realization(){
+        auto& mfs = market_feature_state;
+        double now = config.now_ms();
 
-        while(!mfs.residual_predictions.empty() && 
-        last_depth_ts - mfs.residual_predictions.front().ts >= mfs.residual_predictions.front().horizon_ms){
-            
-            auto& entry = mfs.residual_predictions.front();
-            mfs.residual_predictions.pop_front();
+        while(!mfs.ml_predictions.empty() && now - mfs.ml_predictions.front().ts >= mfs.ml_horizon_ms){
+            auto& entry = mfs.ml_predictions.front();
+            mfs.ml_predictions.pop_front();
             
             entry.realized = log(last_mid / entry.reservation);
-            push_limited(mfs.residual_signal_log, entry, 2000); //2000 in queue, 200s window
+            mfs.ml_signal_log.push_back(entry);
         }
     }
 
-    // void update_toxicity_realization(){
-    //        uint64_t now = std::max(last_depth_ts, last_trade_ts);
-    //     while(!mfs.toxicity_predictions.empty() && 
-    //     now - mfs.toxicity_predictions.front().ts >= mfs.toxicity_predictions.front().horizon_ms){
-    //         auto& entry = mfs.toxicity_predictions.front();
-    //         mfs.toxicity_predictions.pop_front();
+    void update_performance(){
+        auto [bid_tick, bid_size] = market_book.best_bid();
+        auto [ask_tick, ask_size] = market_book.best_ask();
 
-            
-            
-    //         entry.realized = p.fill_sign * (last_mid - entry.fill_price);
-    //         push_limited(mfs.toxicity_signal_log, entry, 2000);
-    //     }
-    // }
+        if(bid_size <= 0 || ask_size <= 0) return;
 
-    PerformanceMetrics compute_performance(){
-        PerformanceMetrics performance;
+        double bid = config.from_tick(bid_tick);
+        double ask = config.from_tick(ask_tick);
+
+        double mid = (bid + ask) / 2.0;
+        double equity = cash + inventory * mid;
+
+        if(last_equity > 0.0 && equity > 0.0){
+            double r = log(equity / last_equity);
+
+            if(isfinite(r)) return_history.push_back(r);
+        }
+
+        last_equity = equity;
+        equity_history.push_back(equity);
+    }
+
+    double compute_sharpe(){
+        if(return_history.size() < 30) return 0.0;
 
         vector<double> returns;
         returns.reserve(return_history.size());
@@ -1837,66 +1329,261 @@ public:
         }
 
         if(returns.size() < 30){
-            cout << "PERFORMANCE - insufficient returns: " << returns.size() << "\n";
-            return performance;
+            cout << "SHARPE - len(returns) < 30:", NAN << "\n";
+            return NAN;
         }
 
-        // -------------------------
-        // Mean return
-        // -------------------------
         double mean = 0.0;
-
         for(double r: returns) mean += r;
-
         mean /= returns.size();
 
-        // -------------------------
-        // Variance + downside variance
-        // -------------------------
         double var = 0.0;
-        double downside_var = 0.0;
-
-        for(double r: returns){
-            double diff = r - mean;
-            var += diff * diff;
-
-            double downside = min(r, 0.0); // MAR = 0
-            downside_var += downside * downside;
-        }
-
+        for(double r: returns) var += (r - mean) * (r - mean);
         var /= returns.size();
-        downside_var /= returns.size();
 
         double std = sqrt(var);
-        double downside_std = sqrt(downside_var);
-
-        // -------------------------
-        // Sharpe
-        // -------------------------
-        double annualization_factor = sqrt(10 * 60 * 60 * 24 * 365);
-
-        if(std > 0.0 && isfinite(std)){
-            double sharpe = mean / (std + 1e-9);
-            performance.sharpe = sharpe;
-            performance.annualized_sharpe = sharpe * annualization_factor;
+        if(std == 0.0 || isnan(std)){
+            cout << "SHARPE - std == 0 / isnan(std):", NAN << "\n";
+            return NAN;
         }
 
-        // -------------------------
-        // Sortino
-        // -------------------------
-        if(downside_std > 0.0 && isfinite(downside_std)){
-            double sortino = mean / (downside_std + 1e-9);
-            performance.sortino = sortino;
-            performance.annualized_sortino = sortino * annualization_factor;
-        }
+        double sharpe_ratio = mean / (std + 1e-9);
+        cout << "SHARPE: " << sharpe_ratio << "\n";
 
-        cout << "SHARPE: " << performance.sharpe
-            << " Annualized SHARPE: " << performance.annualized_sharpe
-            << " SORTINO: " << performance.sortino
-            << " Annualized SORTINO: " << performance.annualized_sortino << "\n";
-
-        return performance;
+        return sharpe_ratio;
     }
+};
+
+struct SnapshotRow {
+    uint64_t ts;
+    std_string symbol;
+
+    double mid;
+    int64_t mid_tick;
+    double spread;
+    double microprice;
+    double microprice_dev;
+    double microprice_error;
+
+    double best_bid;
+    double best_ask;
+    int64_t best_bid_tick;
+    int64_t best_ask_tick;
+
+    double order_imbalance;
+    double trade_imbalance;
+    double volatility;
+    double queue_ahead_bid;
+    double queue_ahead_ask;
+
+    double inventory;
+    double realized_pnl;
+    double unrealized_pnl;
+    double total_pnl;
+    double equity;
+
+    double fair;
+    double skew;
+    double struct_delta;
+    double micro_signal_delta;
+    double ml_delta;
+    double reservation;
+
+    std_string regime;
+    int regime_id;
+    double regime_prob;
+    double alpha_order_imb;
+    double alpha_trade_imb;
+    double alpha_struct;
+    double k0;
+    double spread_multiplier;
+    double inventory_target;
+    double signal_quality;
+    double tox;
+    double k1;
+    double k2;
+
+    double my_bid;
+    double my_ask;
+    int64_t my_bid_tick;
+    int64_t my_ask_tick;
+
+    double bid_distance_touch;
+    double ask_distance_touch;
+    double bid_distance_spread;
+    double ask_distance_spread;
+
+    double bid_delta;
+    double ask_delta;
+    double quote_churn;
+};
+
+struct TradeRow {
+    int64_t ts;
+    std_string symbol;
+
+    double price;
+    int64_t price_tick;
+    double qty;
+    std_string side;
+    bool is_buyer_maker;
+
+    double mid;
+    double microprice;
+    double microprice_dev;
+    double microprice_error;
+    double spread;
+    double best_bid;
+    double best_ask;
+    int64_t best_bid_tick;
+    int64_t best_ask_tick;
+
+    double bid_size;
+    double ask_size;
+
+    double trade_to_mid;
+    double trade_to_microprice;
+    double price_to_best_bid;
+    double price_to_best_ask;
+
+    std_string trade_side;
+    int trade_sign;
+
+    double notional;
+    double log_notional;
+    double intensity;
+};
+
+struct QuoteRow {
+    int64_t ts;
+    std_string symbol;
+    std_string client_oid;
+    std_string side;
+    std_string event_type;
+
+    double price;
+    int64_t price_tick;
+    double qty;
+
+    double mid;
+    double microprice;
+    double microprice_dev;
+    double microprice_error;
+    double spread;
+    double best_bid;
+    double best_ask;
+    int64_t best_bid_tick;
+    int64_t best_ask_tick;
+    
+    double order_imbalance;
+    double trade_imbalance;
+    double volatility;
+    double queue_ahead_bid;
+    double queue_ahead_ask;
+
+    double distance_to_mid;
+    double distance_to_touch;
+    double inventory;
+
+    double fair;
+    double skew;
+    double struct_delta;
+    double micro_signal_delta;
+    double ml_delta;
+    double reservation;
+
+    std_string regime;
+    int regime_id;
+    double regime_prob;
+    double alpha_order_imb;
+    double alpha_trade_imb;
+    double alpha_struct;
+    double k0;
+    double spread_multiplier;
+    double inventory_target;
+    double signal_quality;
+    double tox;
+    double k1;
+    double k2;
+};
+
+struct FillRow {
+    int64_t ts;
+    std_string symbol;
+    std_string side;
+    double price;
+    int64_t price_tick;
+    double qty;
+
+    bool is_maker;
+    std_string fill_type;
+    std_string fill_status;
+    double queue_ahead_at_join;
+
+    double mid_at_fill;
+    double microprice_at_fill;
+    double microprice_dev_at_fill;
+    double microprice_error_at_fill;
+    double spread_at_fill;
+    double best_bid_at_fill;
+    double best_ask_at_fill;
+    double volatility_at_fill;
+    double volatility_at_fill_bps;
+
+    double mid;
+    double microprice;
+    double microprice_dev;
+    double microprice_error;
+    double spread;
+    double best_bid;
+    double best_ask;
+    int64_t best_bid_tick;
+    int64_t best_ask_tick;
+
+    double order_imbalance;
+    double trade_imbalance;
+    double volatility;
+    double volatility_bps;
+    double queue_ahead_bid;
+    double queue_ahead_ask;
+    double inventory;
+
+    double fair;
+    double skew;
+    double struct_delta;
+    double micro_signal_delta;
+    double ml_delta;
+    double reservation;
+
+    std_string regime;
+    int regime_id;
+    double regime_prob;
+    double alpha_order_imb;
+    double alpha_trade_imb;
+    double alpha_struct;
+    double k0;
+    double spread_multiplier;
+    double inventory_target;
+    double signal_quality;
+    double tox;
+    double k1;
+    double k2;
+
+    double my_bid;
+    double my_ask;
+    int64_t my_bid_tick;
+    int64_t my_ask_tick;
+
+    double bid_distance_touch;
+    double ask_distance_touch;
+    double bid_distance_spread;
+    double ask_distance_spread;
+};
+
+struct EventsRow {
+    std_string type;
+    uint64_t ts;
+    std_string msg;   // raw JSON string (same as Python)
 };
 
 class DatasetRecorder {
@@ -1941,7 +1628,7 @@ public:
         ostringstream ss;
         ss << folder_path << '/' << file << '_' << setw(6) << setfill('0') << file_id << ".parquet";
         
-        cout << file << "_file_path: " << ss.str() << "\n";
+        cout << file_id << "_file_path: " << ss.str() << "\n";
         return ss.str();
     }
 
@@ -2071,16 +1758,12 @@ public:
         // manifest
         json manifest = params;
         std_string manifest_path = folder_path + "/manifest.json";
-        PerformanceMetrics performance = state.compute_performance();
 
         manifest["run_id"] = run_id;
         manifest["folder_path"] = folder_path;
         manifest["performance"] = {
             {"pnl", round(state.get_pnl(state.market_book.mid()) * 10000.0) / 10000.0},
-            {"sharpe", round(performance.sharpe * 10000.0) / 10000.0},
-            {"annualized_sharpe", round(performance.annualized_sharpe * 10000.0) / 10000.0},
-            {"sortino", round(performance.sortino * 10000.0) / 10000.0},
-            {"sortino", round(performance.annualized_sortino * 10000.0) / 10000.0},
+            {"sharpe", round(state.compute_sharpe() * 10000.0) / 10000.0},
             {"fees_paid", round(state.fees_paid * 10000.0) / 10000.0},
             {"fees_per_fill", state.fees_paid / (fills.size() + 1e-9)},
             {"pnl_per_fill", state.get_pnl(state.market_book.mid()) / (fills.size() + 1e-9)}
@@ -2125,7 +1808,7 @@ public:
         row.skew = signal.skew;
         row.struct_delta = signal.struct_delta;
         row.micro_signal_delta = signal.micro_signal_delta;
-        row.residual_delta = signal.residual_delta;
+        row.ml_delta = signal.ml_delta;
         row.reservation = signal.reservation;
 
         row.regime = signal.regime;
@@ -2137,7 +1820,7 @@ public:
         row.k0 = signal.k0;
         row.spread_multiplier = signal.spread_multiplier;
         row.inventory_target = signal.inventory_target;
-        row.residual_signal_quality = signal.residual_signal_quality;
+        row.signal_quality = signal.signal_quality;
         row.tox = signal.toxicity.tox;
         row.k1 = signal.toxicity.k1;
         row.k2 = signal.toxicity.k2;
@@ -2202,7 +1885,7 @@ public:
         DoubleBuilder skew_b(pool);
         DoubleBuilder struct_delta_b(pool);
         DoubleBuilder micro_signal_delta_b(pool);
-        DoubleBuilder residual_delta_b(pool);
+        DoubleBuilder ml_delta_b(pool);
         DoubleBuilder reservation_b(pool);
         
         StringBuilder regime_b(pool);
@@ -2214,7 +1897,7 @@ public:
         DoubleBuilder k0_b(pool);
         DoubleBuilder spread_multiplier_b(pool);
         DoubleBuilder inventory_target_b(pool);
-        DoubleBuilder residual_signal_quality_b(pool);
+        DoubleBuilder signal_quality_b(pool);
         DoubleBuilder tox_b(pool);
         DoubleBuilder k1_b(pool);
         DoubleBuilder k2_b(pool);
@@ -2268,7 +1951,7 @@ public:
             skew_b.Append(r.skew);
             struct_delta_b.Append(r.struct_delta);
             micro_signal_delta_b.Append(r.micro_signal_delta);
-            residual_delta_b.Append(r.residual_delta);
+            ml_delta_b.Append(r.ml_delta);
             reservation_b.Append(r.reservation);
 
             regime_b.Append(r.regime);
@@ -2280,7 +1963,7 @@ public:
             k0_b.Append(r.k0);
             spread_multiplier_b.Append(r.spread_multiplier);
             inventory_target_b.Append(r.inventory_target);
-            residual_signal_quality_b.Append(r.residual_signal_quality);
+            signal_quality_b.Append(r.signal_quality);
             tox_b.Append(r.tox);
             k1_b.Append(r.k1);
             k2_b.Append(r.k2);
@@ -2309,11 +1992,11 @@ public:
         shared_ptr<Array> order_imbalance_arr, trade_imbalance_arr, volatility_arr;
         shared_ptr<Array> queue_ahead_bid_arr, queue_ahead_ask_arr;
         shared_ptr<Array> inventory_arr, realized_pnl_arr, unrealized_pnl_arr, total_pnl_arr, equity_arr;
-        shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr;
+        shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, ml_delta_arr, reservation_arr;
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
         shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
         shared_ptr<Array> k0_arr, spread_multiplier_arr, inventory_target_arr;
-        shared_ptr<Array> residual_signal_quality_arr, tox_arr, k1_arr, k2_arr;
+        shared_ptr<Array> signal_quality_arr, tox_arr, k1_arr, k2_arr;
         shared_ptr<Array> my_bid_arr, my_ask_arr, my_bid_tick_arr, my_ask_tick_arr;
         shared_ptr<Array> bid_distance_touch_arr, ask_distance_touch_arr;
         shared_ptr<Array> bid_distance_spread_arr, ask_distance_spread_arr;
@@ -2350,7 +2033,7 @@ public:
         skew_b.Finish(&skew_arr);
         struct_delta_b.Finish(&struct_delta_arr);
         micro_signal_delta_b.Finish(&micro_signal_delta_arr);
-        residual_delta_b.Finish(&residual_delta_arr);
+        ml_delta_b.Finish(&ml_delta_arr);
         reservation_b.Finish(&reservation_arr);
         
         regime_b.Finish(&regime_arr);
@@ -2362,7 +2045,7 @@ public:
         k0_b.Finish(&k0_arr);
         spread_multiplier_b.Finish(&spread_multiplier_arr);
         inventory_target_b.Finish(&inventory_target_arr);
-        residual_signal_quality_b.Finish(&residual_signal_quality_arr);
+        signal_quality_b.Finish(&signal_quality_arr);
         tox_b.Finish(&tox_arr);
         k1_b.Finish(&k1_arr);
         k2_b.Finish(&k2_arr);
@@ -2416,7 +2099,7 @@ public:
             field("skew", float64()),
             field("struct_delta", float64()),
             field("micro_signal_delta", float64()),
-            field("residual_delta", float64()),
+            field("ml_delta", float64()),
             field("reservation", float64()),
             
             field("regime", utf8()),
@@ -2428,7 +2111,7 @@ public:
             field("k0", float64()),
             field("spread_multiplier", float64()),
             field("inventory_target", float64()),
-            field("residual_signal_quality", float64()),
+            field("signal_quality", float64()),
             field("tox", float64()),
             field("k1", float64()),
             field("k2", float64()),
@@ -2458,11 +2141,11 @@ public:
             order_imbalance_arr, trade_imbalance_arr, volatility_arr,
             queue_ahead_bid_arr, queue_ahead_ask_arr,
             inventory_arr, realized_pnl_arr, unrealized_pnl_arr, total_pnl_arr, equity_arr,
-            fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr,
+            fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, ml_delta_arr, reservation_arr,
             regime_arr, regime_id_arr, regime_prob_arr,
             alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,
             k0_arr, spread_multiplier_arr, inventory_target_arr,
-            residual_signal_quality_arr, tox_arr, k1_arr, k2_arr,
+            signal_quality_arr, tox_arr, k1_arr, k2_arr,
             my_bid_arr, my_ask_arr, my_bid_tick_arr, my_ask_tick_arr,
             bid_distance_touch_arr, ask_distance_touch_arr,
             bid_distance_spread_arr, ask_distance_spread_arr,
@@ -2768,7 +2451,7 @@ public:
         row.skew = order.signal.skew;
         row.struct_delta = order.signal.struct_delta;
         row.micro_signal_delta = order.signal.micro_signal_delta;
-        row.residual_delta = order.signal.residual_delta;
+        row.ml_delta = order.signal.ml_delta;
         row.reservation = order.signal.reservation;
         
         row.regime = order.signal.regime;
@@ -2780,7 +2463,7 @@ public:
         row.k0 = order.signal.k0;
         row.spread_multiplier = order.signal.spread_multiplier;
         row.inventory_target = order.signal.inventory_target;
-        row.residual_signal_quality = order.signal.residual_signal_quality;
+        row.signal_quality = order.signal.signal_quality;
         row.tox = order.signal.toxicity.tox;
         row.k1 = order.signal.toxicity.k1;
         row.k2 = order.signal.toxicity.k2;
@@ -2835,7 +2518,7 @@ public:
         DoubleBuilder skew_b(pool);
         DoubleBuilder struct_delta_b(pool);
         DoubleBuilder micro_signal_delta_b(pool);
-        DoubleBuilder residual_delta_b(pool);
+        DoubleBuilder ml_delta_b(pool);
         DoubleBuilder reservation_b(pool);
 
         StringBuilder regime_b(pool);
@@ -2847,7 +2530,7 @@ public:
         DoubleBuilder k0_b(pool);
         DoubleBuilder spread_multiplier_b(pool);
         DoubleBuilder inventory_target_b(pool);
-        DoubleBuilder residual_signal_quality_b(pool);
+        DoubleBuilder signal_quality_b(pool);
         DoubleBuilder tox_b(pool);
         DoubleBuilder k1_b(pool);
         DoubleBuilder k2_b(pool);
@@ -2890,7 +2573,7 @@ public:
             skew_b.Append(r.skew);
             struct_delta_b.Append(r.struct_delta);
             micro_signal_delta_b.Append(r.micro_signal_delta);
-            residual_delta_b.Append(r.residual_delta);
+            ml_delta_b.Append(r.ml_delta);
             reservation_b.Append(r.reservation);
 
             regime_b.Append(r.regime);
@@ -2902,7 +2585,7 @@ public:
             k0_b.Append(r.k0);
             spread_multiplier_b.Append(r.spread_multiplier);
             inventory_target_b.Append(r.inventory_target);
-            residual_signal_quality_b.Append(r.residual_signal_quality);
+            signal_quality_b.Append(r.signal_quality);
             tox_b.Append(r.tox);
             k1_b.Append(r.k1);
             k2_b.Append(r.k2);
@@ -2925,12 +2608,12 @@ public:
         shared_ptr<Array> distance_to_mid_arr, distance_to_touch_arr, inventory_arr;
 
         shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr;
-        shared_ptr<Array> micro_signal_delta_arr, residual_delta_arr, reservation_arr;
+        shared_ptr<Array> micro_signal_delta_arr, ml_delta_arr, reservation_arr;
         
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
         shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
         shared_ptr<Array> k0_arr, spread_multiplier_arr, inventory_target_arr;
-        shared_ptr<Array> residual_signal_quality_arr, tox_arr, k1_arr, k2_arr;
+        shared_ptr<Array> signal_quality_arr, tox_arr, k1_arr, k2_arr;
 
         ts_b.Finish(&ts_arr);
         symbol_b.Finish(&symbol_arr);
@@ -2966,7 +2649,7 @@ public:
         skew_b.Finish(&skew_arr);
         struct_delta_b.Finish(&struct_delta_arr);
         micro_signal_delta_b.Finish(&micro_signal_delta_arr);
-        residual_delta_b.Finish(&residual_delta_arr);
+        ml_delta_b.Finish(&ml_delta_arr);
         reservation_b.Finish(&reservation_arr);
 
         regime_b.Finish(&regime_arr);
@@ -2978,7 +2661,7 @@ public:
         k0_b.Finish(&k0_arr);
         spread_multiplier_b.Finish(&spread_multiplier_arr);
         inventory_target_b.Finish(&inventory_target_arr);
-        residual_signal_quality_b.Finish(&residual_signal_quality_arr);
+        signal_quality_b.Finish(&signal_quality_arr);
         tox_b.Finish(&tox_arr);
         k1_b.Finish(&k1_arr);
         k2_b.Finish(&k2_arr);
@@ -3021,7 +2704,7 @@ public:
             field("skew", float64()),
             field("struct_delta", float64()),
             field("micro_signal_delta", float64()),
-            field("residual_delta", float64()),
+            field("ml_delta", float64()),
             field("reservation", float64()),
 
             field("regime", utf8()),
@@ -3033,7 +2716,7 @@ public:
             field("k0", float64()),
             field("spread_multiplier", float64()),
             field("inventory_target", float64()),
-            field("residual_signal_quality", float64()),
+            field("signal_quality", float64()),
             field("tox", float64()),
             field("k1", float64()),
             field("k2", float64())
@@ -3052,11 +2735,11 @@ public:
             queue_ahead_bid_arr, queue_ahead_ask_arr,
             distance_to_mid_arr, distance_to_touch_arr, inventory_arr,
             fair_arr, skew_arr, struct_delta_arr,
-            micro_signal_delta_arr, residual_delta_arr, reservation_arr,
+            micro_signal_delta_arr, ml_delta_arr, reservation_arr,
             regime_arr, regime_id_arr, regime_prob_arr,
             alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,
             k0_arr, spread_multiplier_arr, inventory_target_arr,
-            residual_signal_quality_arr, tox_arr, k1_arr, k2_arr
+            signal_quality_arr, tox_arr, k1_arr, k2_arr
         });
 
         // -------------------------
@@ -3086,12 +2769,12 @@ public:
         row.ts = state.last_trade_ts;
         row.symbol = instrument_upper;
         row.side = order.side;
+        row.side_sign = (order.side == "BUY") ? 1 : -1;
         row.price = config.from_tick(order.price_tick);
         row.price_tick = order.price_tick;
         row.qty = qty;
 
         row.is_maker = is_maker;
-        row.fill_sign = (order.side == "BUY") ? 1 : -1;
         row.fill_type = (order.side == "BUY") ? "BID_HIT" : "ASK_LIFT";
         row.fill_status = (order.remaining > 0.0) ? "PARTIAL" : "FULL";
         row.queue_ahead_at_join = order.queue_ahead_at_join;
@@ -3128,7 +2811,7 @@ public:
         row.skew = order.signal.skew;
         row.struct_delta = order.signal.struct_delta;
         row.micro_signal_delta = order.signal.micro_signal_delta;
-        row.residual_delta = order.signal.residual_delta;
+        row.ml_delta = order.signal.ml_delta;
         row.reservation = order.signal.reservation;
 
         row.regime = order.signal.regime;
@@ -3140,7 +2823,7 @@ public:
         row.k0 = order.signal.k0;
         row.spread_multiplier = order.signal.spread_multiplier;
         row.inventory_target = order.signal.inventory_target;
-        row.residual_signal_quality = order.signal.residual_signal_quality;
+        row.signal_quality = order.signal.signal_quality;
         row.tox = order.signal.toxicity.tox;
         row.k1 = order.signal.toxicity.k1;
         row.k2 = order.signal.toxicity.k2;
@@ -3178,7 +2861,6 @@ public:
         DoubleBuilder qty_b(pool);
 
         BooleanBuilder is_maker_b(pool);
-        Int32Builder fill_sign_b(pool);
         StringBuilder fill_type_b(pool);
         StringBuilder fill_status_b(pool);
         DoubleBuilder queue_ahead_at_join_b(pool);
@@ -3215,7 +2897,7 @@ public:
         DoubleBuilder skew_b(pool);
         DoubleBuilder struct_delta_b(pool);
         DoubleBuilder micro_signal_delta_b(pool);
-        DoubleBuilder residual_delta_b(pool);
+        DoubleBuilder ml_delta_b(pool);
         DoubleBuilder reservation_b(pool);
 
         StringBuilder regime_b(pool);
@@ -3227,7 +2909,7 @@ public:
         DoubleBuilder k0_b(pool);
         DoubleBuilder spread_multiplier_b(pool);
         DoubleBuilder inventory_target_b(pool);
-        DoubleBuilder residual_signal_quality_b(pool);
+        DoubleBuilder signal_quality_b(pool);
         DoubleBuilder tox_b(pool);
         DoubleBuilder k1_b(pool);
         DoubleBuilder k2_b(pool);
@@ -3254,7 +2936,6 @@ public:
             qty_b.Append(r.qty);
 
             is_maker_b.Append(r.is_maker);
-            fill_sign_b.Append(r.fill_sign);
             fill_type_b.Append(r.fill_type);
             fill_status_b.Append(r.fill_status);
             queue_ahead_at_join_b.Append(r.queue_ahead_at_join);
@@ -3291,7 +2972,7 @@ public:
             skew_b.Append(r.skew);
             struct_delta_b.Append(r.struct_delta);
             micro_signal_delta_b.Append(r.micro_signal_delta);
-            residual_delta_b.Append(r.residual_delta);
+            ml_delta_b.Append(r.ml_delta);
             reservation_b.Append(r.reservation);
 
             regime_b.Append(r.regime);
@@ -3303,7 +2984,7 @@ public:
             k0_b.Append(r.k0);
             spread_multiplier_b.Append(r.spread_multiplier);
             inventory_target_b.Append(r.inventory_target);
-            residual_signal_quality_b.Append(r.residual_signal_quality);
+            signal_quality_b.Append(r.signal_quality);
             tox_b.Append(r.tox);
             k1_b.Append(r.k1);
             k2_b.Append(r.k2);
@@ -3324,7 +3005,7 @@ public:
         // -------------------------
         shared_ptr<Array> ts_arr, symbol_arr, side_arr;
         shared_ptr<Array> price_arr, price_tick_arr, qty_arr;
-        shared_ptr<Array> is_maker_arr, fill_sign_arr, fill_type_arr, fill_status_arr, queue_ahead_at_join_arr;
+        shared_ptr<Array> is_maker_arr, fill_type_arr, fill_status_arr, queue_ahead_at_join_arr;
         
         shared_ptr<Array> mid_at_fill_arr, microprice_at_fill_arr, microprice_dev_at_fill_arr, microprice_error_at_fill_arr;
         shared_ptr<Array> spread_at_fill_arr, best_bid_at_fill_arr, best_ask_at_fill_arr;
@@ -3337,11 +3018,11 @@ public:
         shared_ptr<Array> order_imbalance_arr, trade_imbalance_arr, volatility_arr, volatility_bps_arr;
         shared_ptr<Array> queue_ahead_bid_arr, queue_ahead_ask_arr, inventory_arr;
         
-        shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr;
+        shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, ml_delta_arr, reservation_arr;
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
         shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
         shared_ptr<Array> k0_arr, spread_multiplier_arr, inventory_target_arr;
-        shared_ptr<Array> residual_signal_quality_arr, tox_arr, k1_arr, k2_arr;
+        shared_ptr<Array> signal_quality_arr, tox_arr, k1_arr, k2_arr;
 
         shared_ptr<Array> my_bid_arr, my_ask_arr, my_bid_tick_arr, my_ask_tick_arr;
         shared_ptr<Array> bid_dist_touch_arr, ask_dist_touch_arr;
@@ -3355,7 +3036,6 @@ public:
         qty_b.Finish(&qty_arr);
 
         is_maker_b.Finish(&is_maker_arr);
-        fill_sign_b.Finish(&fill_sign_arr);
         fill_type_b.Finish(&fill_type_arr);
         fill_status_b.Finish(&fill_status_arr);
         queue_ahead_at_join_b.Finish(&queue_ahead_at_join_arr);
@@ -3392,7 +3072,7 @@ public:
         skew_b.Finish(&skew_arr);
         struct_delta_b.Finish(&struct_delta_arr);
         micro_signal_delta_b.Finish(&micro_signal_delta_arr);
-        residual_delta_b.Finish(&residual_delta_arr);
+        ml_delta_b.Finish(&ml_delta_arr);
         reservation_b.Finish(&reservation_arr);
         
         regime_b.Finish(&regime_arr);
@@ -3404,7 +3084,7 @@ public:
         k0_b.Finish(&k0_arr);
         spread_multiplier_b.Finish(&spread_multiplier_arr);
         inventory_target_b.Finish(&inventory_target_arr);
-        residual_signal_quality_b.Finish(&residual_signal_quality_arr);
+        signal_quality_b.Finish(&signal_quality_arr);
         tox_b.Finish(&tox_arr);
         k1_b.Finish(&k1_arr);
         k2_b.Finish(&k2_arr);
@@ -3430,7 +3110,6 @@ public:
             field("price_tick", int64()),
             field("qty", float64()),
             field("is_maker", boolean()),
-            field("fill_sign", int32()),
             field("fill_type", utf8()),
             field("fill_status", utf8()),
             field("queue_ahead_at_join", float64()),
@@ -3467,7 +3146,7 @@ public:
             field("skew", float64()),
             field("struct_delta", float64()),
             field("micro_signal_delta", float64()),
-            field("residual_delta", float64()),
+            field("ml_delta", float64()),
             field("reservation", float64()),
             
             field("regime", utf8()),
@@ -3479,7 +3158,7 @@ public:
             field("k0", float64()),
             field("spread_multiplier", float64()),
             field("inventory_target", float64()),
-            field("residual_signal_quality", float64()),
+            field("signal_quality", float64()),
             field("tox", float64()),
             field("k1", float64()),
             field("k2", float64()),
@@ -3501,7 +3180,7 @@ public:
         auto table = arrow::Table::Make(schema, {
             ts_arr, symbol_arr, side_arr,
             price_arr, price_tick_arr, qty_arr,
-            is_maker_arr, fill_sign_arr, fill_type_arr, fill_status_arr, queue_ahead_at_join_arr,
+            is_maker_arr, fill_type_arr, fill_status_arr, queue_ahead_at_join_arr,
             mid_at_fill_arr, microprice_at_fill_arr, microprice_dev_at_fill_arr, microprice_error_at_fill_arr,
             spread_at_fill_arr, best_bid_at_fill_arr, best_ask_at_fill_arr,
             volatility_at_fill_arr, volatility_at_fill_bps_arr,
@@ -3509,11 +3188,11 @@ public:
             spread_arr, best_bid_arr, best_ask_arr, best_bid_tick_arr, best_ask_tick_arr,
             order_imbalance_arr, trade_imbalance_arr, volatility_arr, volatility_bps_arr,
             queue_ahead_bid_arr, queue_ahead_ask_arr, inventory_arr,
-            fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr,
+            fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, ml_delta_arr, reservation_arr,
             regime_arr, regime_id_arr, regime_prob_arr,
             alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,
             k0_arr, spread_multiplier_arr, inventory_target_arr,
-            residual_signal_quality_arr, tox_arr, k1_arr, k2_arr,
+            signal_quality_arr, tox_arr, k1_arr, k2_arr,
             my_bid_arr, my_ask_arr, my_bid_tick_arr, my_ask_tick_arr,
             bid_dist_touch_arr, ask_dist_touch_arr,
             bid_dist_spread_arr, ask_dist_spread_arr
@@ -3526,6 +3205,22 @@ public:
         arrow::io::FileOutputStream::Open(fills_path).Value(&out);
         parquet::arrow::WriteTable(*table, pool, out, 1024);
     }
+};
+
+struct Trade {
+    std_string side;
+    double price;
+    double qty;
+    uint64_t ts;
+};
+
+struct Depth {
+    uint64_t ts;
+    uint64_t U;
+    uint64_t u;
+    uint64_t pu;
+    vector<pair<int64_t, double>> bid_delta;
+    vector<pair<int64_t, double>> ask_delta;
 };
 
 class Feed {
@@ -3848,9 +3543,8 @@ public:
         state.update_vol();
         state.compute_order_imbalance();
         state.update_market_feature_state();
-        state.update_residual_realization();
+        state.update_ml_realization();
         state.update_performance();
-        // state.update_toxicity_realization();
 
         // -----------------------------
         // STRATEGY ONLY AFTER INIT
@@ -4171,9 +3865,8 @@ public:
         state.update_vol();
         state.compute_order_imbalance();
         state.update_market_feature_state();
-        state.update_residual_realization();
+        state.update_ml_realization();
         state.update_performance();
-        // state.update_toxicity_realization();
 
         // -----------------------------
         // STRATEGY ONLY AFTER INIT
@@ -4439,9 +4132,8 @@ public:
         state.update_vol();
         state.compute_order_imbalance();
         state.update_market_feature_state();
-        state.update_residual_realization();
+        state.update_ml_realization();
         state.update_performance();
-        // state.update_toxicity_realization();
 
         // -----------------------------
         // STRATEGY ONLY AFTER INIT
@@ -4707,9 +4399,8 @@ public:
         state.update_vol();
         state.compute_order_imbalance();
         state.update_market_feature_state();
-        state.update_residual_realization();
+        state.update_ml_realization();
         state.update_performance();
-        // state.update_toxicity_realization();
 
         // -----------------------------
         // STRATEGY ONLY AFTER INIT
@@ -4718,44 +4409,43 @@ public:
     }
 };
 
-// class Execution {
-// public:
-//     virtual Order* get_open_order(const std_string&) = 0;
-//     virtual Order* get_order(const std_string&) = 0;
-//     virtual pair<double, double> compute_order_size(const Signal&) = 0;
-//     virtual bool can_quote(const std_string&) = 0;
-//     virtual void place_quotes(const Signal&) = 0;
-//     virtual void cancel_all_orders() = 0;
-//     virtual void process_trade(const Trade&) = 0;
-//     virtual void update_trade_flow(const Trade&) = 0;
-//     virtual void update_trade_flow_buckets(const Trade&) = 0;
-
-//     virtual std_string new_order_id() = 0;
-//     virtual void process_place_quotes(const Signal&) = 0;
-//     virtual void process_latency_queue() = 0;
-//     virtual Order* place_limit(const std_string&, const double&, const double&, const uint64_t&, const Signal&) = 0;
-//     virtual void cancel_side(const std_string&) = 0;
-//     virtual void place_market() = 0;
-//     virtual double get_trade_rate(const Trade&) = 0;
-//     virtual void match_side(const Trade&) = 0;
-//     virtual void execute_market(Order&) = 0;
-
-//     virtual ~Execution() = default;
-// };
+// Execution Layer
+struct Order {
+    std_string client_oid; // changed to client_oid from order_id
+    std_string side;
+    int64_t price_tick;
+    double qty;
+    double remaining;
+    std_string status;
+    uint64_t ts;
+    std_string owner;
+    json resp;
+    Signal signal;
+    double queue_ahead_at_join;
+};
 
 class Execution {
 public:
-    virtual double get_last_bid() = 0;
-    virtual double get_last_ask() = 0;
-    virtual double get_current_bid_size() = 0;
-    virtual double get_current_ask_size() = 0;
-    virtual void place_quotes_latency(const Signal&) = 0;
-    virtual void process_latency_queue() = 0;
-    virtual void process_trade(const Trade&) = 0;
     virtual Order* get_open_order(const std_string&) = 0;
-    virtual void cancel_all_orders() = 0;
+    virtual Order* get_order(const std_string&) = 0;
+    virtual pair<double, double> compute_order_size(const Signal&) = 0;
+    virtual bool can_quote(const std_string&) = 0;
     virtual void place_quotes(const Signal&) = 0;
+    virtual void cancel_all_orders() = 0;
+    virtual void process_trade(const Trade&) = 0;
+    virtual void update_trade_flow(const Trade&) = 0;
+    virtual void update_trade_flow_buckets(const Trade&) = 0;
+
+    virtual std_string new_order_id() = 0;
+    virtual void process_place_quotes(const Signal&) = 0;
+    virtual void process_latency_queue() = 0;
+    virtual Order* place_limit(const std_string&, const double&, const double&, const uint64_t&, const Signal&) = 0;
+    virtual void cancel_side(const std_string&) = 0;
     virtual void place_market() = 0;
+    virtual double get_trade_rate(const Trade&) = 0;
+    virtual void match_side(const Trade&) = 0;
+    virtual void execute_market(Order&) = 0;
+
     virtual ~Execution() = default;
 };
 
@@ -5327,10 +5017,6 @@ public:
         connected = true;
     }
 
-    void UserStream::on_order_update(const OrderUpdate& update) {
-        engine->handle_order_update(update);
-    }
-
     void on_message(const std_string& msg){
         auto data = json::parse(msg);
 
@@ -5344,14 +5030,6 @@ public:
         std_string exec_type = o["x"];
         std_string status = o["X"];
         uint64_t ts = o["T"];
-
-        if(order->broker_sent_ts > 0)
-        {
-            order->exchange_new_ts = ts;
-            order->ack_latency_ms = ts - order->broker_sent_ts;
-
-            execution.record_latency(order->ack_latency_ms);
-        }
 
         Order* order = execution.get_order(client_oid);
 
@@ -5452,9 +5130,9 @@ public:
     MarketConfig& config;
     const json& params;
     State& state;
-    DatasetRecorder& recorder;
 
-    unordered_map<std_string, Order> open_orders;
+    unordered_map<uint64_t, Order> open_orders;
+    uint64_t order_id_counter = 0;
 
     double current_bid_size = 0.0;
     double current_ask_size = 0.0;
@@ -5465,47 +5143,53 @@ public:
     double base_size;
     double max_inv;
 
+    mutex orders_mtx;
+    DatasetRecorder& recorder;
+
     mt19937 rng;
     uniform_real_distribution<double> dist;
-    mutex orders_mtx;
 
-    uint64_t latency_ms;
+    // -------------------------
+    // latency simulation
+    // -------------------------
+    struct LatencyEvent {
+        double execute_ts;
+        std_string type;
+        Signal signal;
+    };
+
+    struct Compare {
+        bool operator()(const LatencyEvent& a, const LatencyEvent& b) {
+            return a.execute_ts > b.execute_ts;
+        }
+    };
+
     priority_queue<LatencyEvent, vector<LatencyEvent>, Compare> latency_queue;
-    mutex latency_mtx;
+    double latency_ms = 50;
 
     PaperExecution(MarketConfig& config, State& state, DatasetRecorder& recorder, const json& params)
         : config(config), state(state), recorder(recorder), params(params)
     {
-        base_size = params["base_size"].get<double>();
-        max_inv = params["max_inv"].get<double>();
-        latency_ms = params["latency_ms"].get<uint64_t>();
+        base_size = params["base_size"];
+        max_inv = params["max_inv"];
         
         rng.seed(random_device{}());
         dist = uniform_real_distribution<double>(0.0, 1.0);
     }
 
-    double get_last_bid() override {
-        return last_bid;
+    std_string new_order_id() override {
+        return to_string(order_id_counter++);
     }
 
-    double get_last_ask() override {
-        return last_ask;
+    Order* get_open_order(const std_string& side) override {
+        for(auto& [id, o]: open_orders) if(o.side == side) return &o;
+        return nullptr;
     }
 
-    double get_current_bid_size() override {
-        return current_bid_size;
-    }
-
-    double get_current_ask_size() override {
-        return current_ask_size;
-    }
-
-    // -------------------------
-    // latency simulation
-    // -------------------------
-    void place_quotes_latency(const Signal& signal) override {
-        lock_guard<mutex> lock(latency_mtx);
-
+    // =========================================================
+    // PUBLIC ENTRY (engine calls this)
+    // =========================================================
+    void process_place_quotes(const Signal& signal) override {
         LatencyEvent event;
         event.execute_ts = config.now_ms() + latency_ms;
         event.type = "PLACE_QUOTES";
@@ -5514,58 +5198,26 @@ public:
         latency_queue.push(event);
     }
 
+    // =========================================================
+    // MAIN TICK: must be called in engine loop
+    // =========================================================
     void process_latency_queue() override {
-        lock_guard<mutex> lock(latency_mtx);
+        double now = config.now_ms();
 
         while(!latency_queue.empty()){
             auto event = latency_queue.top();
-            if(config.now_ms() < event.execute_ts) break;
+
+            if(event.execute_ts > now) break;
 
             latency_queue.pop();
-            place_quotes(event.signal);
+
+            if(event.type == "PLACE_QUOTES"){
+                place_quotes(event.signal);
+            }
         }
     }
 
-    void process_trade(const Trade& trade) override {
-
-        update_trade_flow_buckets(trade);
-        update_trade_flow(trade);
-        match_side(trade);
-    }
-
-    void update_trade_flow_buckets(const Trade& trade){
-
-        int64_t price_tick = config.to_tick(trade.price);
-
-        auto& bucket = state.trade_buckets[trade.side][price_tick];
-        bucket.push_back(trade);
-
-        while(!bucket.empty() && trade.ts - bucket.front().ts > state.trade_flow_window_ms){
-            bucket.pop_front();
-        }
-    }
-
-    void update_trade_flow(const Trade& trade){
-        
-        double flow = (trade.side == "BUY") ? 1.0 : -1.0;
-        double alpha = 0.2;
-
-        state.trade_imbalance = alpha * flow + (1 - alpha) * state.trade_imbalance;
-    }
-
-    double get_trade_rate(const Trade& trade){
-
-        int64_t price_tick = config.to_tick(trade.price);
-
-        auto& bucket = state.trade_buckets[trade.side][price_tick]; //guaranteed to be pruned at update_trade_flow_buckets
-        double volume = 0.0;
-
-        for(auto& t: bucket) volume += t.qty;
-
-        return volume / (state.trade_flow_window_ms / 1000.0); // per second (1000ms)
-    }
-
-    pair<double, double> compute_order_size(const Signal& signal){
+    pair<double, double> compute_order_size(const Signal& signal) override {
         double inv = state.inventory;
         double vol = state.get_vol();
 
@@ -5579,7 +5231,7 @@ public:
 
         double risk_penalty = exp(-0.2 * inv * inv);
 
-        double toxicity_penalty = exp(-signal.toxicity.k2 * signal.toxicity.tox); //negative markout translates into positive exp
+        double toxicity_penalty = exp(-signal.toxicity.k2 * signal.toxicity.tox);
 
         double base = base_size * vol_penalty * risk_penalty;
         double size = base * toxicity_penalty;
@@ -5592,12 +5244,106 @@ public:
         };
     }
 
-    Order* get_open_order(const std_string& side) override {
-        for(auto& [client_oid, order]: open_orders) if(order.side == side) return &order;
-        return nullptr;
+    bool can_quote(const std_string& side) override {
+        double inv = state.inventory;
+
+        if(abs(inv) >= max_inv){
+            if(side == "BUY" && inv < 0) return true;
+            if(side == "SELL" && inv > 0) return true;
+            return false;
+        }
+        return true;
     }
 
-    void cancel_side(const std_string& side){
+    // =========================================================
+    // CORE QUOTE ENGINE
+    // =========================================================
+    void place_quotes(const Signal& signal) override {
+
+        double desired_bid = signal.my_bid;
+        double desired_ask = signal.my_ask;
+
+        auto [bid_size, ask_size] = compute_order_size(signal);
+        uint64_t ts = config.now_ms();
+
+        Order* bid_order = get_open_order("BUY");
+        Order* ask_order = get_open_order("SELL");
+
+        current_bid_size = bid_size;
+        current_ask_size = ask_size;
+
+        if(!bid_order || !ask_order){
+            Order* new_bid_order = place_limit("BUY", desired_bid, bid_size, ts, signal);
+            Order* new_ask_order = place_limit("SELL", desired_ask, ask_size, ts, signal);
+
+            last_bid = desired_bid;
+            last_ask = desired_ask;
+
+            recorder.log_quote(ts, *new_bid_order, "BID", "NEW", desired_bid);
+            recorder.log_quote(ts, *new_ask_order, "ASK", "NEW", desired_ask);
+
+            return;
+        }
+
+        double tick = config.tick_size;
+        bool bid_change = abs(desired_bid - config.from_tick(bid_order->price_tick)) >= tick;
+        bool ask_change = abs(desired_ask - config.from_tick(ask_order->price_tick)) >= tick;
+
+        if(bid_change){
+            state.reset_queue_ahead("bids", bid_order->price_tick);
+            cancel_side("BUY");
+
+            if(can_quote("BUY")) {
+                Order* new_bid_order = place_limit("BUY", desired_bid, bid_size, ts, signal);
+                last_bid = desired_bid;
+
+                recorder.log_quote(ts, *new_bid_order, "BID", "REPLACE", desired_bid);
+            }
+        }
+
+        if(ask_change){
+            state.reset_queue_ahead("asks", ask_order->price_tick);
+            cancel_side("SELL");
+
+            if(can_quote("SELL")){
+                Order* new_ask_order = place_limit("SELL", desired_ask, ask_size, ts, signal);
+                last_ask = desired_ask;
+
+                recorder.log_quote(ts, *new_ask_order, "ASK", "REPLACE", desired_ask);
+            }
+        }
+    }
+
+    Order* place_limit(const std_string& side, const double& price, const double& size,
+                      const uint64_t& ts, const Signal& signal) override {
+
+        std_string oid = new_order_id();
+        int64_t tick_price = config.to_tick(price);
+
+        auto& book_side = (side == "BUY") ? state.market_book.bids : state.market_book.asks;
+        auto it = book_side.find(tick_price);
+        double book_size = (it != book_side.end()) ? it->second : 0.0;
+
+        state.my_queue_position[(side == "BUY") ? "bids" : "asks"][tick_price] = book_size;
+
+        lock_guard<mutex> lock(orders_mtx);
+        Order& order = open_orders[oid];
+
+        order.order_id = oid;
+        order.side = side;
+        order.price_tick = tick_price;
+        order.qty = size;
+        order.remaining = size;
+        order.status = "LIVE";
+        order.ts = ts;
+        order.owner = "self";
+        order.signal = signal;
+        order.queue_ahead_at_join = book_size;
+
+        return &order;
+    }
+
+    void cancel_side(const std_string& side) override {
         lock_guard<mutex> lock(orders_mtx);
 
         for(auto it = open_orders.begin(); it != open_orders.end();){
@@ -5616,160 +5362,111 @@ public:
         cancel_side("SELL");
     }
 
-    bool can_quote(const std_string& side){
-        double inv = state.inventory;
+    // =========================================================
+    // MARKET ORDER
+    // =========================================================
+    void place_market() override {
 
-        if(abs(inv) >= max_inv){
-            if(side == "BUY" && inv < 0) return true;
-            if(side == "SELL" && inv > 0) return true;
-            return false;
-        }
-        return true;
-    }
+        uint64_t ts = config.now_ms();
+        std_string side = (state.inventory > 0) ? "SELL" : "BUY";
+        double qty = abs(state.inventory);
 
-    std_string uuid16(){
-        auto u = boost::uuids::random_generator()();
-        std_string s = boost::uuids::to_string(u);
-
-        s.erase(remove(s.begin(), s.end(), '-'), s.end());
-        return s.substr(0, 16);
-    }
-
-    Order* place_limit(const std_string& side, const double& price, const double& size, const Signal& signal){
+        std_string oid = new_order_id();
 
         lock_guard<mutex> lock(orders_mtx);
-        std_string client_oid = "MM-" + uuid16();
-        int64_t price_tick = config.to_tick(price);
+        Order& order = open_orders[oid];
 
-        double book_size = 0.0;
-        if(side == "BUY"){
-            auto it = state.market_book.bids.find(price_tick);
-            if(it != state.market_book.bids.end()) book_size = it->second;
-        }
-        else{
-            auto it = state.market_book.asks.find(price_tick);
-            if(it != state.market_book.asks.end()) book_size = it->second;
-        }
-        state.my_queue_position[(side == "BUY") ? "bids" : "asks"][price_tick] = book_size;
-
-        Order& order = open_orders[client_oid];
-        order.client_oid = client_oid;
+        order.order_id = oid;
         order.side = side;
-        order.price_tick = price_tick;
-        order.qty = size;
-        order.remaining = size;
+        order.price_tick = -1;
+        order.qty = qty;
+        order.remaining = qty;
         order.status = "LIVE";
-        order.ts = config.now_ms();
+        order.ts = ts;
         order.owner = "self";
-        order.signal = signal;
-        order.queue_ahead_at_join = book_size;
 
-        return &order; //return pointer, in case order creation fails and returns nullptr
+        execute_market(order);
     }
 
-    void place_quotes(const Signal& signal) override {
+    void process_trade(const Trade& trade) override {
 
-        double desired_bid = signal.my_bid;
-        double desired_ask = signal.my_ask;
+        update_trade_flow_buckets(trade);
+        update_trade_flow(trade);
+        match_side(trade);
+    }
 
-        auto [bid_size, ask_size] = compute_order_size(signal);
-        double tick = config.tick_size;
+    void update_trade_flow(const Trade& trade) override {
+        
+        double flow = (trade.side == "BUY") ? 1.0 : -1.0;
+        double alpha = 0.2;
 
-        Order* bid_order = get_open_order("BUY");
-        Order* ask_order = get_open_order("SELL");
+        state.trade_imbalance = alpha * flow + (1 - alpha) * state.trade_imbalance;
+    }
 
-        current_bid_size = bid_size;
-        current_ask_size = ask_size;
+    void update_trade_flow_buckets(const Trade& trade) override {
 
-        if(!bid_order && can_quote("BUY")){ // if no bid order
-            Order* new_bid_order = place_limit("BUY", desired_bid, bid_size, signal);
-            last_bid = desired_bid;
-            recorder.log_quote(*new_bid_order, "BID", "NEW");
-        }
+        int64_t price = config.to_tick(trade.price);
 
-        else if(abs(desired_bid - config.from_tick(bid_order->price_tick)) >= tick){ // if bid change
-            state.reset_queue_ahead("bids", bid_order->price_tick);
-            cancel_side("BUY");
+        Trade trade_event;
+        trade_event.side = trade.side;
+        trade_event.price = price;
+        trade_event.qty = trade.qty;
+        trade_event.timestamp = trade.timestamp;
+        
+        auto& bucket = state.trade_buckets[trade.side][price];
+        bucket.push_back(trade_event);
 
-            if(can_quote("BUY")){
-                Order* new_bid_order = place_limit("BUY", desired_bid, bid_size, signal);
-                last_bid = desired_bid;
-                recorder.log_quote(*new_bid_order, "BID", "REPLACE");
-            }
-        }
-
-        if(!ask_order && can_quote("SELL")){ // if no ask order
-            Order* new_ask_order = place_limit("SELL", desired_ask, ask_size, signal);
-            last_ask = desired_ask;
-            recorder.log_quote(*new_ask_order, "ASK", "NEW");
-        }
-
-        else if(abs(desired_ask - config.from_tick(ask_order->price_tick)) >= tick){ // else if ask change
-            state.reset_queue_ahead("asks", ask_order->price_tick);
-            cancel_side("SELL");
-
-            if(can_quote("SELL")){
-                Order* new_ask_order = place_limit("SELL", desired_ask, ask_size, signal);
-                last_ask = desired_ask;
-                recorder.log_quote(*new_ask_order, "ASK", "REPLACE");
-            }
+        while(!bucket.empty() && trade_event.timestamp - bucket.front().timestamp > state.window_ms){
+            bucket.pop_front();
         }
     }
 
-    Order* get_fill_candidate_order(const std_string& side, const int64_t& price_tick){
-        for(auto& [client_oid, order]: open_orders){
-            if(order.side == side && order.price_tick == price_tick && order.status == "LIVE") return &order;
+    double get_trade_rate(const Trade& trade) override {
+
+        uint64_t ts = trade.timestamp;
+        int64_t price = config.to_tick(trade.price);
+
+        auto& bucket = state.trade_buckets[trade.side][price];
+        double volume = 0.0;
+
+        for(auto it = bucket.rbegin(); it != bucket.rend(); ++it){
+            if(ts - it->timestamp > state.window_ms) break;
+
+            volume += it->size;
         }
-        return nullptr;
+
+        return volume / (state.window_ms / 1000.0);
     }
 
-    void match_side(const Trade& trade){
+    void match_side(const Trade& trade) override {
 
         lock_guard<mutex> lock(orders_mtx);
 
         std_string side = (trade.side == "BUY") ? "SELL" : "BUY";
-        int64_t price_tick = config.to_tick(trade.price);
+        int64_t price = config.to_tick(trade.price);
         double qty = trade.qty;
 
-        // -------------------------
-        // GET dt (time interval between trades) -> amount of time you allow those events to happen
-        // -------------------------
-        if(state.last_fill_match_ts != 0){
-            state.dt = (trade.ts - state.last_fill_match_ts) / 1000.0; // dt (s) represents interval between last_fill_model_ts and trade ts
-        }
-        state.last_fill_match_ts = trade.ts;
+        Order* order = nullptr;
 
-        // -------------------------
-        // FILL CANDIDATE
-        // -------------------------
-        Order* order = get_fill_candidate_order(side, price_tick);
+        for(auto& [id, o]: open_orders){
+            if(o.side == side && o.price_tick == price && o.status == "LIVE"){
+                order = &o;
+                break;
+            }
+        }
 
         if(!order) return;
 
         state.last_fill_candidate = *order;
 
         // -------------------------
-        // QUEUE + FLOW MODEL
+        // queue + flow model
         // -------------------------
-        double queue_ahead = state.compute_queue_ahead((side == "BUY") ? "bids" : "asks", price_tick);
+        double queue_ahead = state.compute_queue_ahead((side == "BUY") ? "bids" : "asks", price);
         double trade_rate = get_trade_rate(trade);
 
-        double lambda_fill = trade_rate / (queue_ahead + 1e-9); // expected fill events per second
-        double p_fill = 1.0 - exp(-lambda_fill * state.dt); // probability that at least one fill event happens during that time
-        // double p_fill = 1.0 - exp(-lambda_fill * 0.1); // dt = 100ms
-
-        // increase p_fill
-        // 1. Higher trade_rate
-        // More aggressive market taking liquidity
-        // More volume consumes the queue ahead of you
-        // Increases lambda_fill
-        // 2. Lower queue_ahead
-        // Less volume in front of your order
-        // Easier for trades to reach you
-        // Increases lambda_fill
-        // 3. Longer dt
-        // More time for the process to act
-        // Increases the chance that the queue gets consumed
+        double lambda_fill = trade_rate / (queue_ahead + 1e-9);
+        double p_fill = 1.0 - exp(-lambda_fill * 0.1); // dt = 100ms
 
         // stochastic acceptance
         if(p_fill < dist(rng)) return;
@@ -5777,95 +5474,150 @@ public:
         // -------------------------
         // APPLY FILL
         // -------------------------
-        double fill_qty = min(order->remaining, qty);
-        order->remaining -= fill_qty;
+        double fill = min(order->remaining, qty);
+        order->remaining -= fill;
 
-        state.on_fill(trade.price, fill_qty, order->side, "maker");
+        state.on_fill(trade.price, fill, order->side, "maker");
         state.last_order_update = *order;
-        recorder.log_fill(fill_qty, *order, true);
+        recorder.log_fill(fill, *order, true);
 
         if(order->remaining == 0){
             order->status = "FILLED";
-            open_orders.erase(order->client_oid);
-            state.reset_queue_ahead((side == "BUY") ? "bids" : "asks", order->price_tick);
+
+            open_orders.erase(order->order_id);
+            state.reset_queue_ahead((side == "BUY") ? "bids" : "asks", price);
         }
     }
 
-    void place_market() override {
-
-        lock_guard<mutex> lock(orders_mtx);
-        std_string client_oid = "MM-" + uuid16();
-
-        Order& order = open_orders[client_oid];
-        order.client_oid = client_oid;
-        order.side = (state.inventory > 0) ? "SELL" : "BUY";
-        order.price_tick = -1;
-        order.qty = abs(state.inventory);
-        order.remaining = abs(state.inventory);
-        order.status = "LIVE";
-        order.ts = config.now_ms();
-        order.owner = "self";
-        order.queue_ahead_at_join = -1.0;
-
-        execute_market(order);
-    }
-
-    std_string orderMarketToString(const Order& order, const double& fill_qty){
-        return format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
-            order.side, config.from_tick(order.price_tick), fill_qty, order.status);
-    }
-
-    void execute_market(Order& order){
+    void execute_market(Order& order) override {
 
         auto& book = state.market_book;
 
         if(order.side == "BUY"){
-            for(auto it = book.asks.begin(); it != book.asks.end() && order.remaining > 0;){
+            for(auto it = book.asks.begin(); it != book.asks.end(); ++it){
 
-                double fill_qty = min(order.remaining, it->second);
+                if(order.remaining <= 0) break;
 
-                order.remaining -= fill_qty;
-                it->second -= fill_qty;
+                double fill = min(order.remaining, it->second);
 
-                if(order.remaining == 0) order.status = "FILLED";
-                else order.status = "PARTIALLY_FILLED";
-
-                order.price_tick = it->first;
-                state.last_fill_candidate = order; // for dashboard UI for market orders
-                state.last_order_update = order;
-
-                cout << orderMarketToString(order, fill_qty) << "\n";
-
-                state.on_fill(config.from_tick(it->first), fill_qty, "BUY", "taker");
-
-                if(it->second <= 0) it = book.asks.erase(it);   // erase returns the next iterator
-                else ++it;
-            }
-        }
-        else if(order.side == "SELL") {
-            for(auto it = book.bids.begin(); it != book.bids.end() && order.remaining > 0;){
-
-                double fill_qty = min(order.remaining, it->second);
-
-                order.remaining -= fill_qty;
-                it->second -= fill_qty;
-                
-                if(order.remaining == 0) order.status = "FILLED";
-                else order.status = "PARTIALLY_FILLED";
+                order.remaining -= fill;
+                it->second -= fill;
 
                 order.price_tick = it->first; // for dashboard UI for market orders
                 state.last_fill_candidate = order;
                 state.last_order_update = order;
+
+                cout << format("{:<5} | {:>10.4f} | {:>8.6f} [{}]",  order.side, order.price_tick, fill, order->status) << "\n";
                 
-                cout << orderMarketToString(order, fill_qty) << "\n";
+                if(it->second <= 0) book.asks.erase(it);
 
-                state.on_fill(config.from_tick(it->first), fill_qty, "SELL", "taker");
-
-                if(it->second <= 0) it = book.bids.erase(it);   // erase returns the next iterator
-                else ++it;
+                state.on_fill(config.from_tick(it->first), fill, "BUY", "taker");
             }
         }
+        else if(order.side == "SELL") {
+            for(auto it = book.bids.begin(); it != book.bids.end(); ++it){
+
+                if(order.remaining <= 0) break;
+
+                double fill = min(order.remaining, it->second);
+
+                order.remaining -= fill;
+                it->second -= fill;
+
+                order.price_tick = it->first; // for dashboard UI for market orders
+                state.last_fill_candidate = order;
+                state.last_order_update = order;
+
+                cout << format("{:<5} | {:>10.4f} | {:>8.6f} [{}]",  order.side, order.price_tick, fill, order->status) << "\n";
+
+                if(it->second <= 0) book.bids.erase(it);
+
+                state.on_fill(config.from_tick(it->first), fill, "SELL", "taker");
+            }
+        }
+
+        if(order.remaining == 0){
+            order.status = "FILLED";
+        }
     }
+};
+
+struct Snapshot {
+    struct {
+        std_string struct_model;
+        std_string mode;
+        std_string exchange;
+        std_string instrument;
+        std_string regime;
+        double pnl_pct;
+    } title;
+
+    struct {
+        double mid;
+        double microprice;
+        double spread;
+        double best_bid;
+        double best_ask;
+        double bid_size;
+        double ask_size;
+        double ewma_vol;
+        double order_imbalance;
+        double trade_imbalance;
+        std_string trade;
+    } market;
+
+    struct {
+        std_string regime;
+        double confidence;
+    } regime;
+
+    struct {
+        double fair;
+        double skew;
+        double reservation;
+        double alpha_order_imb;
+        double alpha_trade_imb;
+        double alpha_struct;
+        double k0;
+        double spread_multiplier;
+        double inventory_target;
+        double signal_quality;
+        double tox;
+        double k1;
+        double k2;
+    } signals;
+
+    struct {
+        double my_bid;
+        double my_ask;
+        double current_bid_size;
+        double current_ask_size;
+    } quotes;
+
+    struct {
+        double bid_queue;
+        double ask_queue;
+        double bid_pressure;
+        double ask_pressure;
+        std_string buy_order;
+        std_string sell_order;
+        std_string last_fill_candidate;
+        std_string last_order_update;
+    } execution;
+
+    struct {
+        double inventory;
+        double realized_pnl;
+        double unrealized_pnl;
+        double fees_paid;
+        double total_pnl;
+    } risk;
+
+    struct {
+        std_string time;
+        std_string last_trade_ts;
+        std_string last_depth_ts;
+    } system;
 };
 
 class Engine {
@@ -5877,67 +5629,46 @@ public:
     Execution& execution;
     DatasetRecorder& recorder;
 
-    EventNotifier& execution_event;
-    EventNotifier& dashboard_event;
-    std_string header;
-    std_string latency_ms;
+    queue<Signal>& signal_queue;
 
-    atomic<bool> running{false};
+    std_string struct_model;
+    std_string edge_model;
+    std_string mode;
+    std_string exchange;
+    std_string instrument;
 
     Engine(MarketConfig& config, State& state, MarketMakingStrategy& strategy, Execution& execution,
-            DatasetRecorder& recorder, EventNotifier& execution_event, EventNotifier& dashboard_event, const json& params)
-        : config(config), state(state), strategy(strategy), execution(execution), recorder(recorder),
-        execution_event(execution_event), dashboard_event(dashboard_event), params(params)
-        {
-            ostringstream ss;
-            ss << setw(3) << setfill('0') << to_string(params["latency_ms"].get<uint64_t>());
-            latency_ms = ss.str();
-            build_header();
-        }
+            DatasetRecorder& recorder, const json& params, queue<Signal>& signal_queue)
+        : config(config), params(params), state(state), strategy(strategy), execution(execution),
+        recorder(recorder), signal_queue(signal_queue)
+    {
+        struct_model = params["models"]["struct_model"].get<std_string>();
+        edge_model   = params["models"]["edge_model"].get<std_string>();
+        mode         = params["mode"].get<std_string>();
+        exchange     = params["exchange"].get<std_string>();
+        instrument   = params["instrument"].get<std_string>();
+    }
 
     void on_trade_event(const Trade& trade){
         recorder.log_trade(trade);
         execution.process_trade(trade);
-
-        {
-            lock_guard<mutex> lock(dashboard_event.signal_mtx);
-            dashboard_event.signal_pending = true;
-        }
-        dashboard_event.signal_cv.notify_one();
     }
 
     void on_depth_event(){
         if(!state.initialized) return;
+        Signal signal = strategy.on_market_update(state);
 
-        Signal signal = strategy.generate_quotes(state);
+        if(signal_queue.size() < 1000){
+            signal_queue.push(signal);
+        }
         recorder.log_snapshot(signal);
-
-        {
-            lock_guard<mutex> lock(execution_event.signal_mtx);
-            state.last_signal = signal;
-            execution_event.signal_pending = true;
-        }
-
-        {
-            lock_guard<mutex> lock(dashboard_event.signal_mtx);
-            dashboard_event.signal_pending = true;
-        }
-
-        execution_event.signal_cv.notify_one();
-        dashboard_event.signal_cv.notify_one();
-        // cout << "signal sending, locking..., ts: " << signal.ts << "\n";
     }
 
     std_string tradeToString(const optional<Trade>& trade){
         return trade ? format("{:<5} | {:>10.4f} | {:>8.6f}", trade->side, trade->price, trade->qty) : "—";
     }
 
-    std_string orderPointerToString(const Order* order){
-        return order ? format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
-            order->side, config.from_tick(order->price_tick), order->qty, order->status) : "—";
-    }
-
-    std_string orderOptionalToString(const optional<Order>& order){
+    std_string orderToString(const Order* order){
         return order ? format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
             order->side, config.from_tick(order->price_tick), order->qty, order->status) : "—";
     }
@@ -5946,29 +5677,31 @@ public:
         Snapshot snap;
 
         auto& book = state.market_book;
- 
+
         auto [bid_tick, bid_size] = book.best_bid();
         auto [ask_tick, ask_size] = book.best_ask();
 
-        double best_bid = config.from_tick(bid_tick);
-        double best_ask = config.from_tick(ask_tick);
+        double bid = config.from_tick(bid_tick);
+        double ask = config.from_tick(ask_tick);
 
-        double mid = (best_bid + best_ask) / 2.0;
-        double spread = best_ask - best_bid;
-        double microprice = (best_ask * bid_size + best_bid * ask_size) /(bid_size + ask_size + 1e-9);
+        double mid = (bid + ask) / 2.0;
+        double spread = ask - bid;
 
-        double bid_queue = state.compute_queue_ahead("bids", config.to_tick(best_bid));
-        double ask_queue = state.compute_queue_ahead("asks", config.to_tick(best_ask));
+        double bid_queue = state.compute_queue_ahead("bids", config.to_tick(bid));
+        double ask_queue = state.compute_queue_ahead("asks", config.to_tick(ask));
 
-        snap.title.header = header;
-        snap.title.regime = state.last_signal ? state.last_signal->regime : "";
-        snap.title.pnl_pct = state.get_pnl(mid) / state.initial_cash * 100;
+        snap.title.struct_model = struct_model;
+        snap.title.mode = mode;
+        snap.title.exchange = exchange;
+        snap.title.instrument = instrument;
+        snap.title.regime = state.last_signal.regime;
+        snap.title.pnl_pct = state.get_pnl() / state.initial_cash * 100;
 
         snap.market.mid = mid;
-        snap.market.microprice = microprice;
+        snap.market.microprice = state.last_signal.microprice;
         snap.market.spread = spread;
-        snap.market.best_bid = best_bid;
-        snap.market.best_ask = best_ask;
+        snap.market.bid = bid;
+        snap.market.ask = ask;
         snap.market.bid_size = bid_size;
         snap.market.ask_size = ask_size;
         snap.market.ewma_vol = state.get_vol();
@@ -5976,37 +5709,35 @@ public:
         snap.market.trade_imbalance = state.trade_imbalance;
         snap.market.trade = tradeToString(state.last_trade);
 
-        snap.regime.regime = state.last_signal ? state.last_signal->regime : "";
-        snap.regime.confidence = state.last_signal ? state.last_signal->regime_prob : 0.0;
+        snap.regime.regime = state.last_signal.regime;
+        snap.regime.confidence = state.last_signal.regime_prob;
 
-        snap.signals.fair = state.last_signal ? state.last_signal->fair : 0.0;
-        snap.signals.skew = state.last_signal ? state.last_signal->skew : 0.0;
-        snap.signals.reservation = state.last_signal ? state.last_signal->reservation : 0.0;
-        snap.signals.alpha_order_imb = state.last_signal ? state.last_signal->alpha_order_imb : 0.0;
-        snap.signals.alpha_trade_imb = state.last_signal ? state.last_signal->alpha_trade_imb : 0.0;
-        snap.signals.alpha_struct = state.last_signal ? state.last_signal->alpha_struct : 0.0;
-        snap.signals.k0 = state.last_signal ? state.last_signal->k0 : 0.0;
-        snap.signals.spread_multiplier = state.last_signal ? state.last_signal->spread_multiplier : 0.0;
-        snap.signals.inventory_target = state.last_signal ? state.last_signal->inventory_target : 0.0;
-        snap.signals.residual_signal_quality = state.last_signal ? state.last_signal->residual_signal_quality : 0.0;
-        snap.signals.tox = state.last_signal ? state.last_signal->toxicity.tox : 0.0;
-        snap.signals.k1 = state.last_signal ? state.last_signal->toxicity.k1 : 0.0;
-        snap.signals.k2 = state.last_signal ? state.last_signal->toxicity.k2 : 0.0;
+        snap.signals.fair_value = state.last_signal.fair_value;
+        snap.signals.skew = state.last_signal.skew;
+        snap.signals.reservation = state.last_signal.reservation;
+        snap.signals.alpha_order_imb = state.last_signal.alpha_order_imb;
+        snap.signals.alpha_trade_imb = state.last_signal.alpha_trade_imb;
+        snap.signals.alpha_struct = state.last_signal.alpha_struct;
+        snap.signals.k0 = state.last_signal.k0;
+        snap.signals.spread_multiplier = state.last_signal.spread_multiplier;
+        snap.signals.inventory_target = state.last_signal.inventory_target;
+        snap.signals.tox = state.last_signal.tox;
+        snap.signals.k1 = state.last_signal.k1;
+        snap.signals.k2 = state.last_signal.k2;
 
-        snap.quotes.my_bid = execution.get_last_bid();
-        snap.quotes.my_ask = execution.get_last_ask();
-        snap.quotes.current_bid_size = execution.get_current_bid_size();
-        snap.quotes.current_ask_size = execution.get_current_ask_size();
+        snap.quotes.my_bid = execution.last_bid;
+        snap.quotes.my_ask = execution.last_ask;
+        snap.quotes.current_bid_size = execution.current_bid_size;
+        snap.quotes.current_ask_size = execution.current_ask_size;
 
         snap.execution.bid_queue = bid_queue;
         snap.execution.ask_queue = ask_queue;
         snap.execution.bid_pressure = bid_queue / (bid_size + 1e-9);
         snap.execution.ask_pressure = ask_queue / (ask_size + 1e-9);
-
-        snap.execution.buy_order = orderPointerToString(execution.get_open_order("BUY"));
-        snap.execution.sell_order = orderPointerToString(execution.get_open_order("SELL"));
-        snap.execution.last_fill_candidate = orderOptionalToString(state.last_fill_candidate);
-        snap.execution.last_order_update = orderOptionalToString(state.last_order_update);
+        snap.execution.buy_order = orderToString(execution.get_open_order("BUY"));
+        snap.execution.sell_order = orderToString(execution.get_open_order("SELL"));
+        snap.execution.last_fill_candidate = orderToString(state.last_fill_candidate);
+        snap.execution.last_order_update = orderToString(state.last_order_update);
 
         snap.risk.inventory = state.inventory;
         snap.risk.realized_pnl = state.realized_pnl;
@@ -6017,30 +5748,8 @@ public:
         snap.system.time = config.format_ms_precise(config.now_ms());
         snap.system.last_trade_ts = config.format_ms_precise(state.last_trade_ts);
         snap.system.last_depth_ts = config.format_ms_precise(state.last_depth_ts);
-        snap.system.latency_ms = latency_ms;
 
         return snap;
-    }
-
-    void build_header(){
-        std_string parts;
-
-        auto add = [&](const std_string& s){
-            if(s.empty()) return;
-            if(!parts.empty()) parts += " | ";
-            parts += s;
-        };
-
-        add(params["models"]["struct_model"].get<std_string>());
-        add(params["models"]["regime_model"].get<std_string>());
-        add(params["models"]["micro_signal_model"].get<std_string>());
-        add(params["models"]["residual_model"].get<std_string>());
-        add(params["models"]["toxicity_model"].get<std_string>());
-        add(params["mode"].get<std_string>());
-        add(params["exchange"].get<std_string>());
-        add(params["instrument"].get<std_string>());
-
-        header = parts;
     }
 };
 
@@ -6140,43 +5849,19 @@ public:
             });
         };
 
-        auto make_title = [](const Snapshot& snap){
-            vector<std_string> parts;
-
-            auto add = [&](const std_string& s){
-                if(!s.empty()) parts.push_back(s);
-            };
-
-            stringstream ss(snap.title.header);
-            std_string item;
-
-            while(getline(ss, item, '|')){
-                // trim spaces
-                item.erase(0, item.find_first_not_of(" "));
-                item.erase(item.find_last_not_of(" ") + 1);
-                add(item);
-            }
-
-            ftxui::Elements rendered;
-
-            for(size_t i = 0; i < parts.size(); i++){
-                if(i > 0) rendered.push_back(text(" | ") | dim);
-                rendered.push_back(text(parts[i]) | italic);
-            }
-
-            rendered.push_back(text(" | ") | dim);
-            rendered.push_back(text(snap.title.regime) | italic);
-            rendered.push_back(text(" | ") | dim);
-            rendered.push_back(text("pnl=") | italic);
-            rendered.push_back(text((snap.title.pnl_pct > 0 ? "+" : "") + format("{:.4f}", snap.title.pnl_pct) + "%") | italic);
-
-            return hbox(move(rendered)) | color(Color::GrayLight) | center;
-        };
-
         return ftxui::Renderer([&]{
             Snapshot snap = snapshot_store.get();
 
-            auto title = make_title(snap);
+            auto title = hbox({
+                text(snap.title.struct_model) | italic, text(" | ") | dim,
+                text(snap.title.mode) | italic, text(" | ") | dim,
+                text(snap.title.exchange) | italic, text(" | ") | dim,
+                text(snap.title.instrument) | italic, text(" | ") | dim,
+                text(snap.title.regime) | italic, text(" | ") | dim,
+                text("pnl=") | italic,
+                text((snap.title.pnl_pct > 0 ? "+" : "") + format("{:.4f}", snap.title.pnl_pct)) | italic,
+                text("%") | italic
+            }) | color(Color::GrayLight) | center;
 
             auto header = hbox({
                 text(" "), text("Metric") | bold | color(Color::White) | size(WIDTH, EQUAL, 30),
@@ -6186,7 +5871,6 @@ public:
             auto market = vbox({
                 row_title("MARKET", ""),
                 row_text("Mid", format("{:<15.4f}", snap.market.mid)),
-                row_text("Microprice", format("{:<15.4f}", snap.market.microprice)),
                 row_text("Spread", format("{:<15.4f}", snap.market.spread)),
                 row_text("Best Bid / Size", format("{:<10.4f}", snap.market.best_bid) + " (" + format("{:<6.4f}", snap.market.bid_size) + ")"),
                 row_text("Best Ask / Size", format("{:<10.4f}", snap.market.best_ask) + " (" + format("{:<6.4f}", snap.market.bid_size) + ")"),
@@ -6207,17 +5891,11 @@ public:
 
             auto signals = vbox({
                 row_title("SIGNALS", ""),
-                row_text("Spread Multiplier", format("{:<15.4f}", snap.signals.spread_multiplier)),
-                row_text("Inventory Target", format("{:<15.2f}", snap.signals.inventory_target)),
-                row_text("Alpha Order Imb", format("{:<15.2f}", snap.signals.alpha_order_imb)),
-                row_text("Alpha Trade Imb", format("{:<15.2f}", snap.signals.alpha_trade_imb)),
-                row_text("Alpha Struct", format("{:<15.2f}", snap.signals.alpha_struct)),
                 row_text("Fair Value", format("{:<15.4f}", snap.signals.fair)),
                 row_text("Inventory Skew", format("{:<15.4f}", snap.signals.skew)),
-                row_text("Residual Signal Quality", format("{:<15.2f}", snap.signals.residual_signal_quality)),
-                row_text("Toxicity", format("{:<15.2f}", snap.signals.tox)),
                 row_text("Reservation", format("{:<15.4f}", snap.signals.reservation)),
-                
+                row_text("Alpha Struct", format("{:<15.2f}", snap.signals.alpha_struct)),
+                row_text("ML Signal Quality", format("{:<15.2f}", snap.signals.signal_quality)),
                 row_text("", "")
             });
             
@@ -6257,13 +5935,12 @@ public:
                 row_text("Time", snap.system.time),
                 row_text("Last Trade ts", snap.system.last_trade_ts),
                 row_text("Last Depth ts", snap.system.last_depth_ts),
-                row_text("Latency", snap.system.latency_ms),
                 row_text("", "")
             });
 
             auto content = vbox({title, separator(), header, separator(), market, regime, signals, 
                     quotes, execution, risk, system, separator()});
-        
+
             return content | border | color(Color::GrayLight);
         });
     };
@@ -6392,7 +6069,10 @@ public:
     json snapshot_to_json(const Snapshot& snap){
         return {
             {"title", {
-                {"header", snap.title.header},
+                {"struct_model", snap.title.struct_model},
+                {"mode", snap.title.mode},
+                {"exchange", snap.title.exchange},
+                {"instrument", snap.title.instrument},
                 {"regime", snap.title.regime},
                 {"pnl_pct", snap.title.pnl_pct}
             }},
@@ -6423,7 +6103,7 @@ public:
                 {"k0", snap.signals.k0},
                 {"spread_multiplier", snap.signals.spread_multiplier},
                 {"inventory_target", snap.signals.inventory_target},
-                {"residual_signal_quality", snap.signals.residual_signal_quality},
+                {"signal_quality", snap.signals.signal_quality},
                 {"tox", snap.signals.tox},
                 {"k1", snap.signals.k1},
                 {"k2", snap.signals.k2},
@@ -6455,7 +6135,6 @@ public:
                 {"time", snap.system.time},
                 {"last_trade_ts", snap.system.last_trade_ts},
                 {"last_depth_ts", snap.system.last_depth_ts},
-                {"latency_ms", snap.system.latency_ms},
             }}
         };
     }
@@ -6464,13 +6143,16 @@ public:
 class TradingSystem {
 public:
     const json& params;
+
+    queue<Signal> signal_queue;
+    mutex signal_mtx;
+
     MarketConfig config;
     State state;
+
     MarketMakingStrategy strategy;
     DatasetRecorder recorder;
 
-    EventNotifier dashboard_event;
-    EventNotifier execution_event;
     SnapshotStore snapshot_store;
     DashboardTerminal dashboard_terminal;
     DashboardServer dashboard_server;
@@ -6487,7 +6169,7 @@ public:
 
     vector<thread> threads;
 
-    TradingSystem(const json& params) : 
+   TradingSystem(const json& params) : 
         params(params), config(params), state(config, params), strategy(config, params), recorder(config, state, params),
         dashboard_terminal(snapshot_store), dashboard_server(snapshot_store, params) {initialize();}
 
@@ -6503,7 +6185,7 @@ public:
             execution = make_unique<PaperExecution>(config, state, recorder, params);
         }
 
-        engine = make_unique<Engine>(config, state, strategy, *execution, recorder, execution_event, dashboard_event, params);
+        engine = make_unique<Engine>(config, state, strategy, *execution, recorder, params, signal_queue);
 
         std_string exchange = params["exchange"].get<std_string>();
         auto on_trade_event = [this](const Trade& trade) {engine->on_trade_event(trade);};
@@ -6540,15 +6222,7 @@ public:
         if(user_stream) user_stream->start();
 
         start_dashboard_loop();
-        
-        if(params["latency_ms"].get<uint64_t>() == 0){
-            cout << "Starting execution loop\n";
-            start_execution_loop();
-        }
-        else{
-            cout << "Starting execution latency loop\n";
-            start_execution_latency_loop();
-        }
+        start_execution_loop();
         
         // Wait 5 seconds
         this_thread::sleep_for(seconds(5)); //FOR TESTING
@@ -6560,21 +6234,13 @@ public:
     void start_dashboard_loop(){
         threads.emplace_back([this](){
             while(dashboard_running){
-                {
-                    unique_lock<mutex> lock(dashboard_event.signal_mtx);
-                    dashboard_event.signal_cv.wait(lock, [this]{
-                        return dashboard_event.signal_pending || !dashboard_running;});
-
-                    if(!dashboard_running) break;
-                    dashboard_event.signal_pending = false;
-                }
-
                 Snapshot snap = engine->build_snapshot();
                 snapshot_store.set(snap);
 
                 dashboard_terminal.refresh();
                 dashboard_server.publish();
-                // cout << "dashboard signal received, unlocking... ts: " << snap.system.last_depth_ts << "\n";
+
+                this_thread::sleep_for(milliseconds(20));
             }
         });
     }
@@ -6582,49 +6248,22 @@ public:
     void start_execution_loop(){
         threads.emplace_back([this](){
             while(engine_running){
-                Signal signal;
-                
-                {
-                    unique_lock<mutex> lock(execution_event.signal_mtx);
-                    execution_event.signal_cv.wait(lock, [this]{
-                        return execution_event.signal_pending || !engine_running;});
+                // lock_guard<mutex>lock(signal_mtx);
 
-                    if(!engine_running) break;
-
-                    signal = *state.last_signal;
-                    execution_event.signal_pending = false;
-                }
-                execution->place_quotes(signal);
-                // cout << "execution signal received, unlocking... ts: " << signal.ts << "\n";
-            }
-        });
-    }
-
-    void start_execution_latency_loop(){ //polling driven
-        threads.emplace_back([this](){
-            while(engine_running){
-                Signal signal;
-                bool has_signal = false;
-
-                {
-                    unique_lock<mutex> lock(execution_event.signal_mtx);
-                    execution_event.signal_cv.wait_for(lock, milliseconds(1), [this]{
-                        return execution_event.signal_pending || !engine_running;});
-
-                    if(!engine_running) break;
-
-                    if(execution_event.signal_pending){
-                        signal = *state.last_signal;
-                        execution_event.signal_pending = false;
-                        has_signal = true;
-                    }
+                if(signal_queue.empty()){
+                    this_thread::sleep_for(milliseconds(1));
+                    continue;
                 }
 
-                // 1. Put new event quote into latency queue
-                if(has_signal) execution->place_quotes_latency(signal);
+                Signal signal = signal_queue.front();
 
-                // 2. Execute orders whose latency expired
-                execution->process_latency_queue();
+                signal_queue.pop();
+
+                state.last_signal = signal;
+
+                // execution->place_quotes(signal);
+
+                // process_latency_queue(signal);
             }
         });
     }
@@ -6633,7 +6272,7 @@ public:
         while(engine_running) this_thread::sleep_for(seconds(1));
         shutdown();
     }
-            
+
     void shutdown(){
         cout << "INTERRUPT RECEIVED - SHUTTING DOWN\n";
 
@@ -6646,7 +6285,7 @@ public:
         cout << "CLOSING OPEN POSITIONS\n";
         execution->cancel_all_orders();
 
-        while(execution->get_open_order("BUY") || execution->get_open_order("SELL")){
+        while(!execution->open_orders.empty()){
             this_thread::sleep_for(milliseconds(50));
         }
 

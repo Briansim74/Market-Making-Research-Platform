@@ -98,10 +98,10 @@ public:
     std_string quotes_path;
     std_string fills_path;
 
-    static constexpr size_t SNAPSHOT_CHUNK = 10000;
+    static constexpr size_t SNAPSHOT_CHUNK = 5000;
     static constexpr size_t TRADE_CHUNK = 10000;
-    static constexpr size_t QUOTE_CHUNK = 10000;
-    static constexpr size_t FILL_CHUNK  = 5000;   // usually smaller
+    static constexpr size_t QUOTE_CHUNK = 5000;
+    static constexpr size_t FILL_CHUNK  = 3000;   // usually smaller
 
     int snapshots_id = 0;
     int trades_id = 0;
@@ -245,12 +245,16 @@ public:
         // manifest
         json manifest = params;
         std_string manifest_path = folder_path + "/manifest.json";
+        PerformanceMetrics performance = state.compute_performance();
 
         manifest["run_id"] = run_id;
         manifest["folder_path"] = folder_path;
         manifest["performance"] = {
             {"pnl", round(state.get_pnl(state.market_book.mid()) * 10000.0) / 10000.0},
-            {"sharpe", round(state.compute_sharpe() * 10000.0) / 10000.0},
+            {"sharpe", round(performance.sharpe * 10000.0) / 10000.0},
+            {"annualized_sharpe", round(performance.annualized_sharpe * 10000.0) / 10000.0},
+            {"sortino", round(performance.sortino * 10000.0) / 10000.0},
+            {"sortino", round(performance.annualized_sortino * 10000.0) / 10000.0},
             {"fees_paid", round(state.fees_paid * 10000.0) / 10000.0},
             {"fees_per_fill", state.fees_paid / (fills.size() + 1e-9)},
             {"pnl_per_fill", state.get_pnl(state.market_book.mid()) / (fills.size() + 1e-9)}
@@ -263,7 +267,7 @@ public:
 
     void log_snapshot(const Signal& signal){
         SnapshotRow row;
-
+  
         row.ts = signal.ts;
         row.symbol = instrument_upper;
 
@@ -284,7 +288,7 @@ public:
         row.volatility = signal.volatility;
         row.queue_ahead_bid = signal.queue_ahead_bid;
         row.queue_ahead_ask = signal.queue_ahead_ask;
-        
+
         row.inventory = signal.inventory;
         row.realized_pnl = signal.realized_pnl;
         row.unrealized_pnl = signal.unrealized_pnl;
@@ -307,7 +311,7 @@ public:
         row.k0 = signal.k0;
         row.spread_multiplier = signal.spread_multiplier;
         row.inventory_target = signal.inventory_target;
-        row.signal_quality = signal.signal_quality;
+        row.residual_signal_quality = signal.residual_signal_quality;
         row.tox = signal.toxicity.tox;
         row.k1 = signal.toxicity.k1;
         row.k2 = signal.toxicity.k2;
@@ -325,7 +329,7 @@ public:
         row.bid_delta = signal.bid_delta;
         row.ask_delta = signal.ask_delta;
         row.quote_churn = signal.quote_churn;
-
+    
         snapshots.push_back(move(row));
 
         if(snapshots.size() >= SNAPSHOT_CHUNK){
@@ -384,7 +388,7 @@ public:
         DoubleBuilder k0_b(pool);
         DoubleBuilder spread_multiplier_b(pool);
         DoubleBuilder inventory_target_b(pool);
-        DoubleBuilder signal_quality_b(pool);
+        DoubleBuilder residual_signal_quality_b(pool);
         DoubleBuilder tox_b(pool);
         DoubleBuilder k1_b(pool);
         DoubleBuilder k2_b(pool);
@@ -450,7 +454,7 @@ public:
             k0_b.Append(r.k0);
             spread_multiplier_b.Append(r.spread_multiplier);
             inventory_target_b.Append(r.inventory_target);
-            signal_quality_b.Append(r.signal_quality);
+            residual_signal_quality_b.Append(r.residual_signal_quality);
             tox_b.Append(r.tox);
             k1_b.Append(r.k1);
             k2_b.Append(r.k2);
@@ -483,7 +487,7 @@ public:
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
         shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
         shared_ptr<Array> k0_arr, spread_multiplier_arr, inventory_target_arr;
-        shared_ptr<Array> signal_quality_arr, tox_arr, k1_arr, k2_arr;
+        shared_ptr<Array> residual_signal_quality_arr, tox_arr, k1_arr, k2_arr;
         shared_ptr<Array> my_bid_arr, my_ask_arr, my_bid_tick_arr, my_ask_tick_arr;
         shared_ptr<Array> bid_distance_touch_arr, ask_distance_touch_arr;
         shared_ptr<Array> bid_distance_spread_arr, ask_distance_spread_arr;
@@ -532,7 +536,7 @@ public:
         k0_b.Finish(&k0_arr);
         spread_multiplier_b.Finish(&spread_multiplier_arr);
         inventory_target_b.Finish(&inventory_target_arr);
-        signal_quality_b.Finish(&signal_quality_arr);
+        residual_signal_quality_b.Finish(&residual_signal_quality_arr);
         tox_b.Finish(&tox_arr);
         k1_b.Finish(&k1_arr);
         k2_b.Finish(&k2_arr);
@@ -598,7 +602,7 @@ public:
             field("k0", float64()),
             field("spread_multiplier", float64()),
             field("inventory_target", float64()),
-            field("signal_quality", float64()),
+            field("residual_signal_quality", float64()),
             field("tox", float64()),
             field("k1", float64()),
             field("k2", float64()),
@@ -632,7 +636,7 @@ public:
             regime_arr, regime_id_arr, regime_prob_arr,
             alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,
             k0_arr, spread_multiplier_arr, inventory_target_arr,
-            signal_quality_arr, tox_arr, k1_arr, k2_arr,
+            residual_signal_quality_arr, tox_arr, k1_arr, k2_arr,
             my_bid_arr, my_ask_arr, my_bid_tick_arr, my_ask_tick_arr,
             bid_distance_touch_arr, ask_distance_touch_arr,
             bid_distance_spread_arr, ask_distance_spread_arr,
@@ -904,7 +908,7 @@ public:
 
         double price = config.from_tick(order.price_tick);
 
-        row.ts = order.ts;
+        row.ts = config.now_ms();
         row.symbol = instrument_upper;
         row.client_oid = order.client_oid;
         row.side = side;
@@ -950,7 +954,7 @@ public:
         row.k0 = order.signal.k0;
         row.spread_multiplier = order.signal.spread_multiplier;
         row.inventory_target = order.signal.inventory_target;
-        row.signal_quality = order.signal.signal_quality;
+        row.residual_signal_quality = order.signal.residual_signal_quality;
         row.tox = order.signal.toxicity.tox;
         row.k1 = order.signal.toxicity.k1;
         row.k2 = order.signal.toxicity.k2;
@@ -1017,7 +1021,7 @@ public:
         DoubleBuilder k0_b(pool);
         DoubleBuilder spread_multiplier_b(pool);
         DoubleBuilder inventory_target_b(pool);
-        DoubleBuilder signal_quality_b(pool);
+        DoubleBuilder residual_signal_quality_b(pool);
         DoubleBuilder tox_b(pool);
         DoubleBuilder k1_b(pool);
         DoubleBuilder k2_b(pool);
@@ -1072,7 +1076,7 @@ public:
             k0_b.Append(r.k0);
             spread_multiplier_b.Append(r.spread_multiplier);
             inventory_target_b.Append(r.inventory_target);
-            signal_quality_b.Append(r.signal_quality);
+            residual_signal_quality_b.Append(r.residual_signal_quality);
             tox_b.Append(r.tox);
             k1_b.Append(r.k1);
             k2_b.Append(r.k2);
@@ -1100,7 +1104,7 @@ public:
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
         shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
         shared_ptr<Array> k0_arr, spread_multiplier_arr, inventory_target_arr;
-        shared_ptr<Array> signal_quality_arr, tox_arr, k1_arr, k2_arr;
+        shared_ptr<Array> residual_signal_quality_arr, tox_arr, k1_arr, k2_arr;
 
         ts_b.Finish(&ts_arr);
         symbol_b.Finish(&symbol_arr);
@@ -1148,7 +1152,7 @@ public:
         k0_b.Finish(&k0_arr);
         spread_multiplier_b.Finish(&spread_multiplier_arr);
         inventory_target_b.Finish(&inventory_target_arr);
-        signal_quality_b.Finish(&signal_quality_arr);
+        residual_signal_quality_b.Finish(&residual_signal_quality_arr);
         tox_b.Finish(&tox_arr);
         k1_b.Finish(&k1_arr);
         k2_b.Finish(&k2_arr);
@@ -1203,7 +1207,7 @@ public:
             field("k0", float64()),
             field("spread_multiplier", float64()),
             field("inventory_target", float64()),
-            field("signal_quality", float64()),
+            field("residual_signal_quality", float64()),
             field("tox", float64()),
             field("k1", float64()),
             field("k2", float64())
@@ -1226,7 +1230,7 @@ public:
             regime_arr, regime_id_arr, regime_prob_arr,
             alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,
             k0_arr, spread_multiplier_arr, inventory_target_arr,
-            signal_quality_arr, tox_arr, k1_arr, k2_arr
+            residual_signal_quality_arr, tox_arr, k1_arr, k2_arr
         });
 
         // -------------------------
@@ -1237,7 +1241,7 @@ public:
         parquet::arrow::WriteTable(*table, pool, out, 1024);
     }
 
-    void log_fill(const double& qty, const Order& order, const bool& is_maker){
+    void log_fill(const Order& order, const double& fill_qty, const bool& is_maker){
         FillRow row;
 
         auto& book = state.market_book;
@@ -1258,7 +1262,7 @@ public:
         row.side = order.side;
         row.price = config.from_tick(order.price_tick);
         row.price_tick = order.price_tick;
-        row.qty = qty;
+        row.qty = fill_qty;
 
         row.is_maker = is_maker;
         row.fill_sign = (order.side == "BUY") ? 1 : -1;
@@ -1310,7 +1314,7 @@ public:
         row.k0 = order.signal.k0;
         row.spread_multiplier = order.signal.spread_multiplier;
         row.inventory_target = order.signal.inventory_target;
-        row.signal_quality = order.signal.signal_quality;
+        row.residual_signal_quality = order.signal.residual_signal_quality;
         row.tox = order.signal.toxicity.tox;
         row.k1 = order.signal.toxicity.k1;
         row.k2 = order.signal.toxicity.k2;
@@ -1397,7 +1401,7 @@ public:
         DoubleBuilder k0_b(pool);
         DoubleBuilder spread_multiplier_b(pool);
         DoubleBuilder inventory_target_b(pool);
-        DoubleBuilder signal_quality_b(pool);
+        DoubleBuilder residual_signal_quality_b(pool);
         DoubleBuilder tox_b(pool);
         DoubleBuilder k1_b(pool);
         DoubleBuilder k2_b(pool);
@@ -1473,7 +1477,7 @@ public:
             k0_b.Append(r.k0);
             spread_multiplier_b.Append(r.spread_multiplier);
             inventory_target_b.Append(r.inventory_target);
-            signal_quality_b.Append(r.signal_quality);
+            residual_signal_quality_b.Append(r.residual_signal_quality);
             tox_b.Append(r.tox);
             k1_b.Append(r.k1);
             k2_b.Append(r.k2);
@@ -1511,7 +1515,7 @@ public:
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
         shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
         shared_ptr<Array> k0_arr, spread_multiplier_arr, inventory_target_arr;
-        shared_ptr<Array> signal_quality_arr, tox_arr, k1_arr, k2_arr;
+        shared_ptr<Array> residual_signal_quality_arr, tox_arr, k1_arr, k2_arr;
 
         shared_ptr<Array> my_bid_arr, my_ask_arr, my_bid_tick_arr, my_ask_tick_arr;
         shared_ptr<Array> bid_dist_touch_arr, ask_dist_touch_arr;
@@ -1574,7 +1578,7 @@ public:
         k0_b.Finish(&k0_arr);
         spread_multiplier_b.Finish(&spread_multiplier_arr);
         inventory_target_b.Finish(&inventory_target_arr);
-        signal_quality_b.Finish(&signal_quality_arr);
+        residual_signal_quality_b.Finish(&residual_signal_quality_arr);
         tox_b.Finish(&tox_arr);
         k1_b.Finish(&k1_arr);
         k2_b.Finish(&k2_arr);
@@ -1649,7 +1653,7 @@ public:
             field("k0", float64()),
             field("spread_multiplier", float64()),
             field("inventory_target", float64()),
-            field("signal_quality", float64()),
+            field("residual_signal_quality", float64()),
             field("tox", float64()),
             field("k1", float64()),
             field("k2", float64()),
@@ -1683,7 +1687,7 @@ public:
             regime_arr, regime_id_arr, regime_prob_arr,
             alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,
             k0_arr, spread_multiplier_arr, inventory_target_arr,
-            signal_quality_arr, tox_arr, k1_arr, k2_arr,
+            residual_signal_quality_arr, tox_arr, k1_arr, k2_arr,
             my_bid_arr, my_ask_arr, my_bid_tick_arr, my_ask_tick_arr,
             bid_dist_touch_arr, ask_dist_touch_arr,
             bid_dist_spread_arr, ask_dist_spread_arr

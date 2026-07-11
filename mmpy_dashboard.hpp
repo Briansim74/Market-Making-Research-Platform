@@ -241,7 +241,7 @@ public:
                 row_text("Alpha Struct", format("{:<15.2f}", snap.signals.alpha_struct)),
                 row_text("Fair Value", format("{:<15.4f}", snap.signals.fair)),
                 row_text("Inventory Skew", format("{:<15.4f}", snap.signals.skew)),
-                row_text("Residual Signal Quality", format("{:<15.2f}", snap.signals.signal_quality)),
+                row_text("Residual Signal Quality", format("{:<15.2f}", snap.signals.residual_signal_quality)),
                 row_text("Toxicity", format("{:<15.2f}", snap.signals.tox)),
                 row_text("Reservation", format("{:<15.4f}", snap.signals.reservation)),
                 
@@ -284,6 +284,7 @@ public:
                 row_text("Time", snap.system.time),
                 row_text("Last Trade ts", snap.system.last_trade_ts),
                 row_text("Last Depth ts", snap.system.last_depth_ts),
+                row_text("Latency", snap.system.latency_ms),
                 row_text("", "")
             });
 
@@ -449,7 +450,7 @@ public:
                 {"k0", snap.signals.k0},
                 {"spread_multiplier", snap.signals.spread_multiplier},
                 {"inventory_target", snap.signals.inventory_target},
-                {"signal_quality", snap.signals.signal_quality},
+                {"residual_signal_quality", snap.signals.residual_signal_quality},
                 {"tox", snap.signals.tox},
                 {"k1", snap.signals.k1},
                 {"k2", snap.signals.k2},
@@ -481,6 +482,7 @@ public:
                 {"time", snap.system.time},
                 {"last_trade_ts", snap.system.last_trade_ts},
                 {"last_depth_ts", snap.system.last_depth_ts},
+                {"latency_ms", snap.system.latency_ms},
             }}
         };
     }

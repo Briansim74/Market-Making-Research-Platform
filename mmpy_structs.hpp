@@ -181,7 +181,7 @@ struct Signal {
     double k0;
     double spread_multiplier;
     double inventory_target;
-    double signal_quality;
+    double residual_signal_quality;
     Toxicity toxicity;
 
     double bid_delta;
@@ -201,9 +201,12 @@ struct Order {
     std_string status;
     uint64_t ts;
     std_string owner;
-    json resp;
     Signal signal;
     double queue_ahead_at_join;
+    json resp;
+
+    uint64_t exchange_ts;     // when user stream NEW arrived
+    uint64_t ack_latency_ms;
 };
 
 struct ResidualPred {
@@ -240,6 +243,18 @@ struct MarketFeatureState {
 
     double prev_best_bid = 0.0;
     double prev_best_ask = 0.0;
+};
+
+struct LatencyEvent {
+    uint64_t execute_ts;
+    std_string type;
+    Signal signal;
+};
+
+struct Compare {
+    bool operator()(const LatencyEvent& a, const LatencyEvent& b){
+        return a.execute_ts > b.execute_ts; // "Does a have lower priority than b?" -> min heap
+    }
 };
 
 struct EventsRow {
@@ -284,7 +299,7 @@ struct Snapshot {
         double k0;
         double spread_multiplier;
         double inventory_target;
-        double signal_quality;
+        double residual_signal_quality;
         double tox;
         double k1;
         double k2;
@@ -320,6 +335,7 @@ struct Snapshot {
         std_string time;
         std_string last_trade_ts;
         std_string last_depth_ts;
+        std_string latency_ms;
     } system;
 };
 
@@ -367,7 +383,7 @@ struct SnapshotRow {
     double k0;
     double spread_multiplier;
     double inventory_target;
-    double signal_quality;
+    double residual_signal_quality;
     double tox;
     double k1;
     double k2;
@@ -470,7 +486,7 @@ struct QuoteRow {
     double k0;
     double spread_multiplier;
     double inventory_target;
-    double signal_quality;
+    double residual_signal_quality;
     double tox;
     double k1;
     double k2;
@@ -534,7 +550,7 @@ struct FillRow {
     double k0;
     double spread_multiplier;
     double inventory_target;
-    double signal_quality;
+    double residual_signal_quality;
     double tox;
     double k1;
     double k2;
@@ -548,4 +564,11 @@ struct FillRow {
     double ask_distance_touch;
     double bid_distance_spread;
     double ask_distance_spread;
+};
+
+struct PerformanceMetrics {
+    double sharpe = NAN;
+    double annualized_sharpe = NAN;
+    double sortino = NAN;
+    double annualized_sortino = NAN;
 };
