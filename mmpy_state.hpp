@@ -35,11 +35,17 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_io.hpp>
+#include <boost/uuid/random_generator.hpp>
+
 #include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
 #include <xgboost/c_api.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
@@ -108,12 +114,14 @@ public:
     uint64_t last_fill_match_ts = 0;
 
     optional<Trade> last_trade;
+    optional<Order> last_fill_candidate;
+    optional<Order> last_order_update;
+
     uint64_t last_trade_ts = 0;
     uint64_t last_depth_ts = 0;
-    shared_ptr<Order> last_fill_candidate;
-    shared_ptr<Order> last_order_update;
-    // optional<Order> last_fill_candidate;
-    // optional<Order> last_order_update;
+    uint64_t trade_latency = 0;
+    uint64_t depth_latency = 0;
+    uint64_t ack_latency = 0;
 
     bool initialized = false;
 
@@ -147,7 +155,7 @@ public:
         order_imbalance = (bid_size - ask_size) / (bid_size + ask_size + 1e-9);
     }
 
-    void on_fill(const double& price, double fill_qty, const std_string& side, const std_string& liquidity){
+    void on_fill(const double& price, double fill_qty, const std_string& side, const bool& is_maker){
 
         // if (toxicity_model) {
             //     ToxicityPrediction p;
@@ -167,7 +175,7 @@ public:
         double old_avg = avg_entry_price;
 
         double fill_value = price * fill_qty;
-        double fee_rate = (liquidity == "maker") ? maker_fee_rate : taker_fee_rate;
+        double fee_rate = is_maker ? maker_fee_rate : taker_fee_rate;
         double fee = fill_value * fee_rate;
         fees_paid += fee;
 
@@ -387,16 +395,15 @@ public:
     }
 
     // void update_toxicity_realization(){
-    //        uint64_t now = std::max(last_depth_ts, last_trade_ts);
+    //     uint64_t now = std::max(last_depth_ts, last_trade_ts);
     //     while(!mfs.toxicity_predictions.empty() && 
     //     now - mfs.toxicity_predictions.front().ts >= mfs.toxicity_predictions.front().horizon_ms){
-    //         auto& entry = mfs.toxicity_predictions.front();
-    //         mfs.toxicity_predictions.pop_front();
-
             
+    //         auto& entry = mfs.toxicity_predictions.front();
+    //         mfs.toxicity_predictions.pop_front();           
             
     //         entry.realized = p.fill_sign * (last_mid - entry.fill_price);
-    //         push_limited(mfs.toxicity_signal_log, entry, 2000);
+    //         push_limited(mfs.toxicity_signal_log, entry, 2000); //2000 in queue, 200s window
     //     }
     // }
 

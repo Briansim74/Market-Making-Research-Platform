@@ -35,17 +35,11 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_io.hpp>
-#include <boost/uuid/random_generator.hpp>
-
 #include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
 #include <xgboost/c_api.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
@@ -90,9 +84,11 @@ class BinanceSpotFeed : public Feed {
 public:
     MarketConfig& config;
     State& state;
-    ExecutionEventQueue& execution_event;
     std_string instrument;
     std_string instrument_upper;
+
+    function<void(const Trade&)> on_trade_event;
+    function<void()> on_depth_event;
 
     function<void(const std_string&, const uint64_t&, const std_string&)> log_event;
     function<void(const json&)> log_orderbook_snapshot;
@@ -103,21 +99,22 @@ public:
     mutex cv_mtx; //condition variable lock
     mutex buffer_mtx;
     condition_variable cv;
-    vector<Depth> depth_buffer;
-
     atomic<bool> running{false};
     atomic<bool> buffering{true};
     atomic<bool> first_depth_received{false};
 
-    BinanceSpotFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event,
+    vector<Depth> depth_buffer;
+
+    BinanceSpotFeed(MarketConfig& config, State& state,
+                    function<void(const Trade&)> on_trade_event, function<void()> on_depth_event,
                     function<void(const std_string&, const uint64_t&, const std_string&)> log_event,
                     function<void(const json&)> log_orderbook_snapshot, const json& params):
-                    config(config), state(state), execution_event(execution_event), log_event(move(log_event)),
-                    log_orderbook_snapshot(move(log_orderbook_snapshot))
-                    {
-                        instrument = params["instrument"].get<std_string>();
-                        instrument_upper = params["instrument"].get<std_string>();
-                        transform(instrument_upper.begin(), instrument_upper.end(), instrument_upper.begin(), [](unsigned char c){return toupper(c);});
+                    config(config), state(state), on_trade_event(move(on_trade_event)),
+                    on_depth_event(move(on_depth_event)), log_event(move(log_event)),
+                    log_orderbook_snapshot(move(log_orderbook_snapshot)), 
+                    instrument(params["instrument"].get<std_string>()),
+                    instrument_upper(instrument) {
+                        ranges::transform(instrument_upper, instrument_upper.begin(), [](unsigned char c){ return toupper(c);});
                     }
 
     void parse_book(simdjson::ondemand::object obj, Depth& entry){
@@ -186,7 +183,7 @@ public:
             auto doc = parser.iterate(json);
 
             Trade trade;
-            trade.ts = uint64_t(doc["T"]);
+            trade.ts = doc["T"];
             trade.side  = bool(doc["m"]) ? "SELL" : "BUY";
             trade.price = double(doc["p"].get_double_in_string());
             trade.qty   = double(doc["q"].get_double_in_string());
@@ -194,10 +191,11 @@ public:
 
             log_event("trade", trade.ts, msg);
 
-            ExecutionEvent ev;
-            ev.type = ExecutionEventType::TRADE_UPDATE;
-            ev.trade = trade;
-            execution_event.push(ev);
+            state.last_trade = trade;
+            state.last_trade_ts = trade.ts;
+            state.trade_latency = trade.latency;
+
+            on_trade_event(trade);
         }
     }
 
@@ -245,30 +243,33 @@ public:
             simdjson::padded_string json(msg);
             auto doc = parser.iterate(json);
 
-            Depth depth;
-            depth.ts = uint64_t(doc["E"]);
-            depth.U = uint64_t(doc["U"]);
-            depth.u = uint64_t(doc["u"]);
-            depth.latency = config.now_ms() - depth.ts;
-            parse_book(doc.get_object(), depth);
+            Depth entry;
+            entry.ts = uint64_t(doc["E"]);
+            entry.U = uint64_t(doc["U"]);
+            entry.u = uint64_t(doc["u"]);
+            entry.latency = config.now_ms() - entry.ts;
+            parse_book(doc.get_object(), entry);
 
             first_depth_received = true;
             cv.notify_all();
 
-            log_event("depth", depth.ts, msg);
+            log_event("depth", entry.ts, msg);
 
             {
                 lock_guard<mutex> lock(buffer_mtx);
                 if(buffering){
-                    depth_buffer.push_back(depth);
+                    depth_buffer.push_back(entry);
                     continue;
                 }
             }
             
-            ExecutionEvent ev;
-            ev.type = ExecutionEventType::DEPTH_UPDATE_SPOT;
-            ev.depth = depth;
-            execution_event.push(ev);
+            // -------------------------
+            // LIVE PROCESSING
+            // -------------------------
+            state.last_depth_ts = entry.ts;
+            state.depth_latency = entry.latency;
+
+            on_depth(entry);
         }
     }
 
@@ -361,15 +362,61 @@ public:
 
         cout << "BINANCE FEED STOPPED\n";
     }
+
+    void on_depth(const Depth& entry){
+
+        auto& book = state.market_book;
+        // cout << "entry.u: " << entry.u << " entry.ts: " << entry.ts << " entry.U: " << entry.U << '\n';
+        // -----------------------------
+        // DROP OLD EVENTS
+        // -----------------------------
+        if(entry.u <= book.last_update_id) return;
+
+        // -----------------------------
+        // GAP DETECTION
+        // -----------------------------
+        if(entry.U > book.last_update_id + 1){
+            cout << "GAP DETECTED expected " << book.last_update_id + 1 << " got " << entry.U << "\n";
+            state.initialized = false;
+            return;
+        }
+
+        // -----------------------------
+        // APPLY DELTA (FAST LOCK ONLY)
+        // -----------------------------
+        {
+            lock_guard<recursive_mutex> lock(book.mtx);
+            state.update_queue_from_depth(entry);
+            book.apply_delta(entry);
+            book.last_update_id = entry.u;
+        }
+
+        // -----------------------------
+        // HEAVY FEATURES OUTSIDE LOCK (IMPORTANT)
+        // -----------------------------
+        state.update_vol();
+        state.compute_order_imbalance();
+        state.update_market_feature_state();
+        state.update_residual_realization();
+        state.update_performance();
+        // state.update_toxicity_realization();
+
+        // -----------------------------
+        // STRATEGY ONLY AFTER INIT
+        // -----------------------------
+        if(state.initialized) on_depth_event();
+    }
 };
 
 class BinanceFuturesFeed : public Feed {
 public:
     MarketConfig& config;
     State& state;
-    ExecutionEventQueue& execution_event;
     std_string instrument;
     std_string instrument_upper;
+
+    function<void(const Trade&)> on_trade_event;
+    function<void()> on_depth_event;
 
     function<void(const std_string&, const uint64_t&, const std_string&)> log_event;
     function<void(const json&)> log_orderbook_snapshot;
@@ -380,21 +427,22 @@ public:
     mutex cv_mtx; //condition variable lock
     mutex buffer_mtx;
     condition_variable cv;
-    vector<Depth> depth_buffer;
-
     atomic<bool> running{false};
     atomic<bool> buffering{true};
     atomic<bool> first_depth_received{false};
 
-    BinanceFuturesFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event,
+    vector<Depth> depth_buffer;
+
+    BinanceFuturesFeed(MarketConfig& config, State& state,
+                    function<void(const Trade&)> on_trade_event, function<void()> on_depth_event,
                     function<void(const std_string&, const uint64_t&, const std_string&)> log_event,
                     function<void(const json&)> log_orderbook_snapshot, const json& params):
-                    config(config), state(state), execution_event(execution_event), log_event(move(log_event)),
-                    log_orderbook_snapshot(move(log_orderbook_snapshot))
-                    {
-                        instrument = params["instrument"].get<std_string>();
-                        instrument_upper = params["instrument"].get<std_string>();
-                        transform(instrument_upper.begin(), instrument_upper.end(), instrument_upper.begin(), [](unsigned char c){return toupper(c);});
+                    config(config), state(state), on_trade_event(move(on_trade_event)),
+                    on_depth_event(move(on_depth_event)), log_event(move(log_event)),
+                    log_orderbook_snapshot(move(log_orderbook_snapshot)), 
+                    instrument(params["instrument"].get<std_string>()),
+                    instrument_upper(instrument) {
+                        ranges::transform(instrument_upper, instrument_upper.begin(), [](unsigned char c){ return toupper(c);});
                     }
 
     void parse_book(simdjson::ondemand::object obj, Depth& entry){
@@ -471,10 +519,11 @@ public:
 
             log_event("trade", trade.ts, msg);
 
-            ExecutionEvent ev;
-            ev.type = ExecutionEventType::TRADE_UPDATE;
-            ev.trade = trade;
-            execution_event.push(ev);
+            state.last_trade = trade;
+            state.last_trade_ts = trade.ts;
+            state.trade_latency = trade.latency;
+
+            on_trade_event(trade);
         }
     }
 
@@ -522,31 +571,34 @@ public:
             simdjson::padded_string json(msg);
             auto doc = parser.iterate(json);
 
-            Depth depth;
-            depth.ts = uint64_t(doc["E"]);
-            depth.pu = uint64_t(doc["pu"]);
-            depth.U = uint64_t(doc["U"]);
-            depth.u = uint64_t(doc["u"]);
-            depth.latency = config.now_ms() - depth.ts;
-            parse_book(doc.get_object(), depth);
+            Depth entry;
+            entry.ts = uint64_t(doc["E"]);
+            entry.pu = uint64_t(doc["pu"]);
+            entry.U = uint64_t(doc["U"]);
+            entry.u = uint64_t(doc["u"]);
+            entry.latency = config.now_ms() - entry.ts;
+            parse_book(doc.get_object(), entry);
 
             first_depth_received = true;
             cv.notify_all();
 
-            log_event("depth", depth.ts, msg);
+            log_event("depth", entry.ts, msg);
 
             {
                 lock_guard<mutex> lock(buffer_mtx);
                 if(buffering){
-                    depth_buffer.push_back(depth);
+                    depth_buffer.push_back(entry);
                     continue;
                 }
             }
+            
+            // -------------------------
+            // LIVE PROCESSING
+            // -------------------------
+            state.last_depth_ts = entry.ts;
+            state.depth_latency = entry.latency;
 
-            ExecutionEvent ev;
-            ev.type = ExecutionEventType::DEPTH_UPDATE_FUTURES;
-            ev.depth = depth;
-            execution_event.push(ev);
+            on_depth(entry);
         }
     }
 
@@ -641,14 +693,52 @@ public:
 
         cout << "BINANCE FEED STOPPED\n";
     }
+
+    void on_depth(const Depth& entry){
+        
+        auto& book = state.market_book;
+        // -----------------------------
+        // DROP OLD EVENTS
+        // -----------------------------
+        if(entry.u <= book.last_update_id) return;
+
+        if(entry.pu != book.last_update_id) {
+            cout << "GAP DETECTED expected " << book.last_update_id << " got " << entry.pu << "\n";
+            state.initialized = false;
+            return;
+        }
+
+        // -----------------------------
+        // APPLY DELTA (FAST LOCK ONLY)
+        // -----------------------------
+        {
+            lock_guard<recursive_mutex> lock(book.mtx);
+            state.update_queue_from_depth(entry);
+            book.apply_delta(entry);
+            book.last_update_id = entry.u;
+        }
+
+        // -----------------------------
+        // HEAVY FEATURES OUTSIDE LOCK (IMPORTANT)
+        // -----------------------------
+        state.update_vol();
+        state.compute_order_imbalance();
+        state.update_market_feature_state();
+        state.update_residual_realization();
+        state.update_performance();
+        // state.update_toxicity_realization();
+
+        // -----------------------------
+        // STRATEGY ONLY AFTER INIT
+        // -----------------------------
+        if(state.initialized) on_depth_event();
+    }
 };
 
 class BinanceSpotReplayFeed : public Feed {
 public:
-    MarketConfig& config;
     State& state;
-    ExecutionEventQueue& execution_event;
-
+    MarketConfig& config;
     std_string events_path;
     std_string orderbook_snapshot_path;
     vector<EventsRow> events;
@@ -664,7 +754,6 @@ public:
 
     mutex cv_mtx; //condition variable lock
     condition_variable cv;
-
     atomic<bool> running{false};
     atomic<bool> snapshot_aligned{false};
     atomic<bool> first_depth_received{false};
@@ -675,11 +764,14 @@ public:
 
     simdjson::ondemand::parser parser;
     
-    BinanceSpotReplayFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event,
+    BinanceSpotReplayFeed(MarketConfig& config, State& state,
+                    function<void(const Trade&)> on_trade_event, function<void()> on_depth_event,
                     function<void(const std_string&, const uint64_t&, const std_string&)> log_event,
                     function<void(const json&)> log_orderbook_snapshot, const json& params):
-                    config(config), state(state), execution_event(execution_event), log_event(move(log_event)),
+                    config(config), state(state), on_trade_event(move(on_trade_event)),
+                    on_depth_event(move(on_depth_event)), log_event(move(log_event)),
                     log_orderbook_snapshot(move(log_orderbook_snapshot))
+
     {
         events_path   = params["folder_path"].get<std_string>() + "/" +
                         params["files"]["replay_events"]["events"].get<std_string>();
@@ -713,7 +805,8 @@ public:
         );
 
         auto msg_col = static_pointer_cast<StringArray>(
-            table->GetColumnByName("msg")->chunk(0)
+            table->GetColumnByName("message")->chunk(0)
+            // table->GetColumnByName("msg")->chunk(0) // TO BE CHANGED ONCE LOG EVENT IS SETTLED
         );
 
         size_t n = table->num_rows();
@@ -761,18 +854,17 @@ public:
         auto doc = parser.iterate(json);
 
         Trade trade;
-        trade.ts    = uint64_t(doc["T"]);
+        trade.ts    = doc["T"];
         trade.side  = bool(doc["m"]) ? "SELL" : "BUY";
         trade.price = double(doc["p"].get_double_in_string());
         trade.qty   = double(doc["q"].get_double_in_string());
-        trade.latency = 0;
         
         log_event("trade", trade.ts, msg);
 
-        ExecutionEvent ev;
-        ev.type = ExecutionEventType::TRADE_UPDATE;
-        ev.trade = trade;
-        execution_event.push(ev);
+        state.last_trade = trade;
+        state.last_trade_ts = trade.ts;
+
+        on_trade_event(trade);
     }
 
     void on_depth_message(const std_string& msg){
@@ -780,25 +872,24 @@ public:
         simdjson::padded_string json(msg);
         auto doc = parser.iterate(json);
 
-        Depth depth;
-        depth.ts = uint64_t(doc["E"]);
-        depth.U  = uint64_t(doc["U"]);
-        depth.u  = uint64_t(doc["u"]);
-        depth.latency = 0;
-        parse_book(doc.get_object(), depth);
+        Depth entry;
+        entry.ts = uint64_t(doc["E"]);
+        entry.U  = uint64_t(doc["U"]);
+        entry.u  = uint64_t(doc["u"]);
+        parse_book(doc.get_object(), entry);
 
         first_depth_received = true;
         cv.notify_all();
   
-        log_event("depth", depth.ts, msg);
+        log_event("depth", entry.ts, msg);
         
         if(!snapshot_aligned.load()){
-            if(depth.U <= state.market_book.last_update_id + 1 && state.market_book.last_update_id + 1 <= depth.u){
-                cout << "BUFFER U: " << depth.U << " snapshot_id + 1: " << state.market_book.last_update_id + 1 << " u: " << depth.u << "\n";
+            if(entry.U <= state.market_book.last_update_id + 1 && state.market_book.last_update_id + 1 <= entry.u){
+                cout << "BUFFER U: " << entry.U << " snapshot_id + 1: " << state.market_book.last_update_id + 1 << " u: " << entry.u << "\n";
                 snapshot_aligned = true;
 
-                state.market_book.apply_delta(depth);
-                state.market_book.last_update_id = depth.u;
+                state.market_book.apply_delta(entry);
+                state.market_book.last_update_id = entry.u;
                 state.update_vol();
 
                 cout << "BOOK SYNCHRONIZED\n";
@@ -806,10 +897,12 @@ public:
             return;
         }
 
-        ExecutionEvent ev;
-        ev.type = ExecutionEventType::DEPTH_UPDATE_SPOT;
-        ev.depth = depth;
-        execution_event.push(ev);
+        // -------------------------
+        // LIVE PROCESSING
+        // -------------------------
+        state.last_depth_ts = entry.ts;
+
+        on_depth(entry);
     }
 
     void run(){
@@ -823,8 +916,8 @@ public:
 
             last_ts = event.ts;
 
-            if(event.type == "trade") on_trade_message(event.msg);
-            else if(event.type == "depth") on_depth_message(event.msg);
+            if(event.type == "depth") on_depth_message(event.msg);
+            else if(event.type == "trade") on_trade_message(event.msg);
 
             i++;
         }
@@ -864,18 +957,63 @@ public:
 
         cout << "REPLAY STOPPED\n";
     }
+
+    void on_depth(const Depth& entry){
+
+        auto& book = state.market_book;
+        // cout << " entry.U: " << entry.U << " state.market_book.last_update_id: " << state.market_book.last_update_id << " entry.u: " << entry.u << '\n';
+        // -----------------------------
+        // DROP OLD EVENTS
+        // -----------------------------
+        if(entry.u <= book.last_update_id) return;
+
+        // -----------------------------
+        // GAP DETECTION
+        // -----------------------------
+        if(entry.U > book.last_update_id + 1){
+            cout << "GAP DETECTED expected " << book.last_update_id + 1 << " got " << entry.U << "\n";
+            state.initialized = false;
+            return;
+        }
+
+        // -----------------------------
+        // APPLY DELTA (FAST LOCK ONLY)
+        // -----------------------------
+        {
+            lock_guard<recursive_mutex> lock(book.mtx);
+            state.update_queue_from_depth(entry);
+            book.apply_delta(entry);
+            book.last_update_id = entry.u;
+        }
+
+        // -----------------------------
+        // HEAVY FEATURES OUTSIDE LOCK (IMPORTANT)
+        // -----------------------------
+        state.update_vol();
+        state.compute_order_imbalance();
+        state.update_market_feature_state();
+        state.update_residual_realization();
+        state.update_performance();
+        // state.update_toxicity_realization();
+
+        // -----------------------------
+        // STRATEGY ONLY AFTER INIT
+        // -----------------------------
+        if(state.initialized) on_depth_event();
+    }
 };
 
 class BinanceFuturesReplayFeed : public Feed {
 public:
-    MarketConfig& config;
     State& state;
-    ExecutionEventQueue& execution_event;
-
+    MarketConfig& config;
     std_string events_path;
     std_string orderbook_snapshot_path;
     vector<EventsRow> events;
     json orderbook_snapshot;
+
+    function<void(const Trade&)> on_trade_event;
+    function<void()> on_depth_event;
 
     function<void(const std_string&, const uint64_t&, const std_string&)> log_event;
     function<void(const json&)> log_orderbook_snapshot;
@@ -884,7 +1022,6 @@ public:
 
     mutex cv_mtx; //condition variable lock
     condition_variable cv;
-    
     atomic<bool> running{false};
     atomic<bool> snapshot_aligned{false};
     atomic<bool> first_depth_received{false};
@@ -895,10 +1032,12 @@ public:
 
     simdjson::ondemand::parser parser;
     
-    BinanceFuturesReplayFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event,
+    BinanceFuturesReplayFeed(MarketConfig& config, State& state,
+                    function<void(const Trade&)> on_trade_event, function<void()> on_depth_event,
                     function<void(const std_string&, const uint64_t&, const std_string&)> log_event,
                     function<void(const json&)> log_orderbook_snapshot, const json& params):
-                    config(config), state(state), execution_event(execution_event), log_event(move(log_event)),
+                    config(config), state(state), on_depth_event(move(on_depth_event)),
+                    on_trade_event(move(on_trade_event)), log_event(move(log_event)),
                     log_orderbook_snapshot(move(log_orderbook_snapshot))
 
     {
@@ -982,18 +1121,17 @@ public:
         auto doc = parser.iterate(json);
 
         Trade trade;
-        trade.ts    = uint64_t(doc["T"]);
         trade.side  = bool(doc["m"]) ? "SELL" : "BUY";
         trade.price = double(doc["p"].get_double_in_string());
         trade.qty   = double(doc["q"].get_double_in_string());
-        trade.latency = 0;
+        trade.ts    = doc["T"];
 
         log_event("trade", trade.ts, msg);
 
-        ExecutionEvent ev;
-        ev.type = ExecutionEventType::TRADE_UPDATE;
-        ev.trade = trade;
-        execution_event.push(ev);
+        state.last_trade = trade;
+        state.last_trade_ts = trade.ts;
+
+        on_trade_event(trade);
     }
 
     void on_depth_message(const std_string& msg){
@@ -1001,26 +1139,24 @@ public:
         simdjson::padded_string json(msg);
         auto doc = parser.iterate(json);
 
-        Depth depth;
-        depth.ts = uint64_t(doc["E"]);
-        depth.pu = uint64_t(doc["pu"]);
-        depth.U  = uint64_t(doc["U"]);
-        depth.u  = uint64_t(doc["u"]);
-        depth.latency = 0;
-        parse_book(doc.get_object(), depth);
+        Depth entry;
+        entry.ts = uint64_t(doc["E"]);
+        entry.U  = uint64_t(doc["U"]);
+        entry.u  = uint64_t(doc["u"]);
+        parse_book(doc.get_object(), entry);
 
         first_depth_received = true;
         cv.notify_all();
   
-        log_event("depth", depth.ts, msg);
+        log_event("depth", entry.ts, msg);
         
         if(!snapshot_aligned.load()){
-            if(depth.U <= state.market_book.last_update_id && state.market_book.last_update_id <= depth.u){
-                cout << "BUFFER pu: " << depth.pu << " U: " << depth.U << " snapshot_id: " << state.market_book.last_update_id << " u: " << depth.u << "\n";
+            if(entry.U <= state.market_book.last_update_id && state.market_book.last_update_id <= entry.u){
+                cout << "BUFFER U: " << entry.U << " snapshot_id: " << state.market_book.last_update_id << " u: " << entry.u << "\n";
                 snapshot_aligned = true;
 
-                state.market_book.apply_delta(depth);
-                state.market_book.last_update_id = depth.u;
+                state.market_book.apply_delta(entry);
+                state.market_book.last_update_id = entry.u;
                 state.update_vol();
 
                 cout << "BOOK SYNCHRONIZED\n";
@@ -1028,10 +1164,12 @@ public:
             return;
         }
 
-        ExecutionEvent ev;
-        ev.type = ExecutionEventType::DEPTH_UPDATE_FUTURES;
-        ev.depth = depth;
-        execution_event.push(ev);
+        // -------------------------
+        // LIVE PROCESSING
+        // -------------------------
+        state.last_depth_ts = entry.ts;
+
+        on_depth(entry);
     }
 
     void run(){
@@ -1085,5 +1223,49 @@ public:
         if(replay_thread.joinable()) replay_thread.join();
 
         cout << "REPLAY STOPPED\n";
+    }
+
+    void on_depth(const Depth& entry){
+
+        auto& book = state.market_book;
+        // cout << " entry.U: " << entry.U << " state.market_book.last_update_id: " << state.market_book.last_update_id << " entry.u: " << entry.u << '\n';
+        // -----------------------------
+        // DROP OLD EVENTS
+        // -----------------------------
+        if(entry.u <= book.last_update_id) return;
+
+        // -----------------------------
+        // GAP DETECTION
+        // -----------------------------
+        if(entry.pu != book.last_update_id) {
+            cout << "GAP DETECTED expected " << book.last_update_id << " got " << entry.pu << "\n";
+            state.initialized = false;
+            return;
+        }
+
+        // -----------------------------
+        // APPLY DELTA (FAST LOCK ONLY)
+        // -----------------------------
+        {
+            lock_guard<recursive_mutex> lock(book.mtx);
+            state.update_queue_from_depth(entry);
+            book.apply_delta(entry);
+            book.last_update_id = entry.u;
+        }
+
+        // -----------------------------
+        // HEAVY FEATURES OUTSIDE LOCK (IMPORTANT)
+        // -----------------------------
+        state.update_vol();
+        state.compute_order_imbalance();
+        state.update_market_feature_state();
+        state.update_residual_realization();
+        state.update_performance();
+        // state.update_toxicity_realization();
+
+        // -----------------------------
+        // STRATEGY ONLY AFTER INIT
+        // -----------------------------
+        if(state.initialized) on_depth_event();
     }
 };

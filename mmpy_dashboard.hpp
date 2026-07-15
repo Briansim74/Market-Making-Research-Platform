@@ -35,11 +35,17 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_io.hpp>
+#include <boost/uuid/random_generator.hpp>
+
 #include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
 #include <xgboost/c_api.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
@@ -76,9 +82,9 @@ public:
     mutex mtx;
     Snapshot latest;
 
-    void set(const Snapshot& snap){
+    void set(Snapshot snap){
         lock_guard<mutex> lock(mtx);
-        latest = snap;
+        latest = move(snap);
     }
 
     Snapshot get(){
@@ -284,7 +290,9 @@ public:
                 row_text("Time", snap.system.time),
                 row_text("Last Trade ts", snap.system.last_trade_ts),
                 row_text("Last Depth ts", snap.system.last_depth_ts),
-                row_text("Latency", snap.system.latency_ms),
+                row_text("Trade Latency", format("{:<10}", snap.system.trade_latency)),
+                row_text("Depth Latency", format("{:<10}", snap.system.depth_latency)),
+                row_text("Ack Latency", format("{:<10}", snap.system.ack_latency)),
                 row_text("", "")
             });
 
@@ -298,38 +306,38 @@ public:
 
 class WsSession : public enable_shared_from_this<WsSession> {
 public:
-        websocket::stream<tcp::socket> ws; 
-        boost::beast::flat_buffer buffer; 
-        mutex write_mtx;
+    websocket::stream<tcp::socket> ws; 
+    boost::beast::flat_buffer buffer; 
+    mutex write_mtx;
+    
+    explicit WsSession(tcp::socket socket) : ws(move(socket)) {} 
         
-        explicit WsSession(tcp::socket socket) : ws(move(socket)) {} 
-         
-        void run(){
-            auto self = shared_from_this();
-            ws.set_option(websocket::stream_base::timeout::suggested(boost::beast::role_type::server));
+    void run(){
+        auto self = shared_from_this();
+        ws.set_option(websocket::stream_base::timeout::suggested(boost::beast::role_type::server));
 
-            ws.async_accept([self](boost::system::error_code ec){
-                if(ec)return;
+        ws.async_accept([self](boost::system::error_code ec){
+            if(ec)return;
 
-                self->ws.text(true);
-                cout << "DASHBOARD CLIENT CONNECTED\n";
-            });
-        }
-        
-        bool send(const std_string& msg){
-            lock_guard<mutex> lock(write_mtx);
-            boost::system::error_code ec;
-            ws.write(boost::asio::buffer(msg), ec);
+            self->ws.text(true);
+            cout << "DASHBOARD CLIENT CONNECTED\n";
+        });
+    }
+    
+    bool send(const std_string& msg){
+        lock_guard<mutex> lock(write_mtx);
+        boost::system::error_code ec;
+        ws.write(boost::asio::buffer(msg), ec);
 
-            if(ec) return false;  // IMPORTANT: signal failure instead of throwing
-            return true;
-        }
-        
-        void close(){ 
-            boost::system::error_code ec; 
-            ws.close(websocket::close_code::normal, ec); 
-        }
-    };
+        if(ec) return false;  // IMPORTANT: signal failure instead of throwing
+        return true;
+    }
+    
+    void close(){ 
+        boost::system::error_code ec; 
+        ws.close(websocket::close_code::normal, ec); 
+    }
+};
 
 class DashboardServer {
 public:
@@ -482,7 +490,9 @@ public:
                 {"time", snap.system.time},
                 {"last_trade_ts", snap.system.last_trade_ts},
                 {"last_depth_ts", snap.system.last_depth_ts},
-                {"latency_ms", snap.system.latency_ms},
+                {"trade_latency", snap.system.trade_latency},
+                {"depth_latency", snap.system.depth_latency},
+                {"ack_latency", snap.system.ack_latency},
             }}
         };
     }

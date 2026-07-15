@@ -35,11 +35,17 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_io.hpp>
+#include <boost/uuid/random_generator.hpp>
+
 #include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
 #include <xgboost/c_api.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
@@ -70,10 +76,11 @@ using ssl_stream = boost::asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
 
 struct Trade {
+    uint64_t ts;
     std_string side;
     double price;
     double qty;
-    uint64_t ts;
+    uint64_t latency;
 };
 
 struct Depth {
@@ -81,14 +88,84 @@ struct Depth {
     uint64_t U;
     uint64_t u;
     uint64_t pu;
+    uint64_t latency;
     vector<pair<int64_t, double>> bid_delta;
     vector<pair<int64_t, double>> ask_delta;
+};
+
+struct Stream {
+    std_string client_oid;
+    std_string side;
+    std_string status;
+    std_string exec_type;
+    std_string order_type;
+    double price;
+    double qty;
+    double fill_price;
+    double fill_qty;
+    uint64_t exchange_ts;
 };
 
 struct EventNotifier {
     mutex signal_mtx;
     condition_variable signal_cv;
     bool signal_pending = false;
+};
+
+enum class ExecutionEventType{
+    TRADE_UPDATE,
+    DEPTH_UPDATE_SPOT,
+    DEPTH_UPDATE_FUTURES,
+    STREAM_UPDATE
+};
+
+struct ExecutionEvent{
+    ExecutionEventType type;
+    Trade trade;
+    Depth depth;
+    Stream stream;
+};
+
+struct ExecutionEventQueue {
+    mutex mtx;
+    condition_variable cv;
+    queue<ExecutionEvent> queue;
+
+    void push(ExecutionEvent ev){
+        {
+            lock_guard<mutex> lock(mtx);
+            queue.push(move(ev));
+        }
+        cv.notify_one();
+    }
+
+    bool pop(ExecutionEvent& ev, atomic<bool>& running){
+
+        unique_lock<mutex> lock(mtx);
+        cv.wait(lock, [&]{return !queue.empty() || !running;});
+
+        if(queue.empty() && !running) return false;
+
+        ev = move(queue.front());
+        queue.pop();
+
+        return true;
+    }
+
+    bool pop_timeout(ExecutionEvent& ev, atomic<bool>& running, milliseconds timeout){
+        
+        unique_lock<mutex> lock(mtx);
+        cv.wait_for(lock, timeout, [&]{return !queue.empty() || !running;});
+
+        if(queue.empty() && !running) return false;
+
+        if(queue.empty()) return false; // timeout, no event
+
+        ev = move(queue.front());
+        queue.pop();
+
+        return true;
+    }
 };
 
 struct Regime {
@@ -145,6 +222,8 @@ struct Toxicity {
 
 struct Signal {
     uint64_t ts;
+    uint64_t trade_latency;
+    uint64_t depth_latency;
     double mid;
     double microprice;
     double microprice_dev;
@@ -199,14 +278,27 @@ struct Order {
     double qty;
     double remaining;
     std_string status;
+    bool pending_cancel = false;
     uint64_t ts;
+    uint64_t exchange_ts = 0;
+    uint64_t ack_latency = 0;
+    uint64_t live_ts = 0;
     std_string owner;
     Signal signal;
     double queue_ahead_at_join;
     json resp;
+};
 
-    uint64_t exchange_ts;     // when user stream NEW arrived
-    uint64_t ack_latency_ms;
+struct LatencyEvent {
+    uint64_t execute_ts;
+    std_string type;
+    Signal signal;
+};
+
+struct Compare {
+    bool operator()(const LatencyEvent& a, const LatencyEvent& b){
+        return a.execute_ts > b.execute_ts; // "Does a have lower priority than b?" -> min heap
+    }
 };
 
 struct ResidualPred {
@@ -243,18 +335,6 @@ struct MarketFeatureState {
 
     double prev_best_bid = 0.0;
     double prev_best_ask = 0.0;
-};
-
-struct LatencyEvent {
-    uint64_t execute_ts;
-    std_string type;
-    Signal signal;
-};
-
-struct Compare {
-    bool operator()(const LatencyEvent& a, const LatencyEvent& b){
-        return a.execute_ts > b.execute_ts; // "Does a have lower priority than b?" -> min heap
-    }
 };
 
 struct EventsRow {
@@ -335,12 +415,17 @@ struct Snapshot {
         std_string time;
         std_string last_trade_ts;
         std_string last_depth_ts;
-        std_string latency_ms;
+        uint64_t trade_latency;
+        uint64_t depth_latency;
+        std_string ack_latency;
     } system;
 };
 
 struct SnapshotRow {
     uint64_t ts;
+    uint64_t trade_latency;
+    uint64_t depth_latency;
+    uint64_t ack_latency;
     std_string symbol;
 
     double mid;
@@ -404,7 +489,7 @@ struct SnapshotRow {
 };
 
 struct TradeRow {
-    int64_t ts;
+    uint64_t ts;
     std_string symbol;
 
     double price;
@@ -440,7 +525,9 @@ struct TradeRow {
 };
 
 struct QuoteRow {
-    int64_t ts;
+    uint64_t ts;
+    uint64_t exchange_ts;
+    uint64_t ack_latency;
     std_string symbol;
     std_string client_oid;
     std_string side;
@@ -493,7 +580,10 @@ struct QuoteRow {
 };
 
 struct FillRow {
-    int64_t ts;
+    uint64_t ts;
+    uint64_t exchange_ts;
+    uint64_t ack_latency;
+    uint64_t time_to_fill;
     std_string symbol;
     std_string side;
     double price;

@@ -35,11 +35,17 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_io.hpp>
+#include <boost/uuid/random_generator.hpp>
+
 #include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
 #include <xgboost/c_api.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
@@ -142,6 +148,22 @@ public:
 
     double round_price(double price) const{
         return llround(price / tick_size) * tick_size;
+    }
+
+    double normalize_qty(double qty) const {
+        double rounded = floor(qty / step_size) * step_size;
+
+        if(rounded < step_size) return 0.0;
+
+        return rounded;
+    }
+
+    double normalize_bid(double price) const {
+        return floor(price / tick_size) * tick_size;
+    }
+
+    double normalize_ask(double price) const {
+        return ceil(price / tick_size) * tick_size;
     }
 
     uint64_t now_ms() const{

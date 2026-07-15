@@ -2,22 +2,19 @@
   "run_id": 0,
   "mode": "live",
   "models": {
-    "regime_model": "regime_model_5",
-    "struct_model": "blended_AS",
-    "micro_signal_model": "micro_signal_model_4",
-    "residual_model": "residual_model_4",
-    "toxicity_model": "toxicity_model_2"
+    "struct_model": "mm-core",
+    "micro_signal_model": "",
+    "edge_model": "",
+    "regime_model": "",
+    "toxicity_model": ""
   },
   "exchange": "binance_futures",
   "instrument": "btcusdt",
   "tick_size": 0.01,
   "step_size": 0.0001,
-  "ack_latency": 0,
   "gamma": 0.1,
   "base_size": 0.2,
-  "max_inv": 1.0,
-  "cash": 100000.0,
-  "initial_cash": 100000.0,
+  "max_inv": 0.8,
   "fees": {
     "maker_fee_rate": 0.0002,
     "taker_fee_rate": 0.0002
@@ -40,9 +37,6 @@
   "performance": {
     "pnl": 0.0,
     "sharpe": 0.0,
-    "annualized_sharpe": 0.0,
-    "sortino": 0.0,
-    "annualized_sortino": 0.0,
     "fees_paid": 0.0,
     "fees_per_fill": 0.0,
     "pnl_per_fill": 0.0

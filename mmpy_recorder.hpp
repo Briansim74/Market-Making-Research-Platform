@@ -35,11 +35,17 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_io.hpp>
+#include <boost/uuid/random_generator.hpp>
+
 #include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
 #include <xgboost/c_api.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
@@ -265,10 +271,13 @@ public:
         cout << "Saved run → " << folder_path << "\n";
     }
 
-    void log_snapshot(const Signal& signal){
+    void log_snapshot(const Signal& signal, const uint64_t& ack_latency){
         SnapshotRow row;
   
         row.ts = signal.ts;
+        row.trade_latency = signal.trade_latency;
+        row.depth_latency = signal.depth_latency;
+        row.ack_latency = ack_latency;
         row.symbol = instrument_upper;
 
         row.mid = signal.mid;
@@ -346,6 +355,9 @@ public:
         // BUILDERS
         // -------------------------
         Int64Builder ts_b(pool);
+        Int64Builder trade_latency_b(pool);
+        Int64Builder depth_latency_b(pool);
+        Int64Builder ack_latency_b(pool);
         StringBuilder symbol_b(pool);
 
         DoubleBuilder mid_b(pool);
@@ -412,6 +424,9 @@ public:
         // -------------------------
         for(const auto& r: snapshots){
             ts_b.Append(r.ts);
+            trade_latency_b.Append(r.trade_latency);
+            depth_latency_b.Append(r.depth_latency);
+            ack_latency_b.Append(r.ack_latency);
             symbol_b.Append(r.symbol);
 
             mid_b.Append(r.mid);
@@ -477,7 +492,7 @@ public:
         // -------------------------
         // FINISH ARRAYS
         // -------------------------
-        shared_ptr<Array> ts_arr, symbol_arr, mid_arr, mid_tick_arr;
+        shared_ptr<Array> ts_arr, trade_latency_arr, depth_latency_arr, ack_latency_arr, symbol_arr, mid_arr, mid_tick_arr;
         shared_ptr<Array> microprice_arr, microprice_dev_arr, microprice_error_arr, spread_arr;
         shared_ptr<Array> best_bid_arr, best_ask_arr, best_bid_tick_arr, best_ask_tick_arr;
         shared_ptr<Array> order_imbalance_arr, trade_imbalance_arr, volatility_arr;
@@ -494,6 +509,9 @@ public:
         shared_ptr<Array> bid_delta_arr, ask_delta_arr, quote_churn_arr;
 
         ts_b.Finish(&ts_arr);
+        trade_latency_b.Finish(&trade_latency_arr);
+        depth_latency_b.Finish(&depth_latency_arr);
+        ack_latency_b.Finish(&ack_latency_arr);
         symbol_b.Finish(&symbol_arr);
 
         mid_b.Finish(&mid_arr);
@@ -560,6 +578,9 @@ public:
         // -------------------------
         auto schema = arrow::schema({
             field("ts", int64()),
+            field("trade_latency", int64()),
+            field("depth_latency", int64()),
+            field("ack_latency", int64()),
             field("symbol", utf8()),
 
             field("mid", float64()),
@@ -626,7 +647,7 @@ public:
         // TABLE
         // -------------------------
         auto table = arrow::Table::Make(schema, {
-            ts_arr, symbol_arr, mid_arr, mid_tick_arr,
+            ts_arr, trade_latency_arr, depth_latency_arr, ack_latency_arr, symbol_arr, mid_arr, mid_tick_arr,
             microprice_arr, microprice_dev_arr, microprice_error_arr, spread_arr,
             best_bid_arr, best_ask_arr, best_bid_tick_arr, best_ask_tick_arr,
             order_imbalance_arr, trade_imbalance_arr, volatility_arr,
@@ -908,7 +929,9 @@ public:
 
         double price = config.from_tick(order.price_tick);
 
-        row.ts = config.now_ms();
+        row.ts = order.ts;
+        row.exchange_ts = order.exchange_ts;
+        row.ack_latency = order.ack_latency;
         row.symbol = instrument_upper;
         row.client_oid = order.client_oid;
         row.side = side;
@@ -975,6 +998,8 @@ public:
         // BUILDERS
         // -------------------------
         Int64Builder ts_b(pool);
+        Int64Builder exchange_ts_b(pool);
+        Int64Builder ack_latency_b(pool);
         StringBuilder symbol_b(pool);
         StringBuilder client_oid_b(pool);
         StringBuilder side_b(pool);
@@ -1031,6 +1056,8 @@ public:
         // -------------------------
         for(const auto& r: quotes){
             ts_b.Append(r.ts);
+            exchange_ts_b.Append(r.exchange_ts);
+            ack_latency_b.Append(r.ack_latency);
             symbol_b.Append(r.symbol);
             client_oid_b.Append(r.client_oid);
             side_b.Append(r.side);
@@ -1085,7 +1112,7 @@ public:
         // -------------------------
         // FINISH ARRAYS
         // -------------------------
-        shared_ptr<Array> ts_arr, symbol_arr, client_oid_arr;
+        shared_ptr<Array> ts_arr, exchange_ts_arr, ack_latency_arr, symbol_arr, client_oid_arr;
         shared_ptr<Array> side_arr, event_type_arr;
 
         shared_ptr<Array> price_arr, price_tick_arr, qty_arr;
@@ -1107,6 +1134,8 @@ public:
         shared_ptr<Array> residual_signal_quality_arr, tox_arr, k1_arr, k2_arr;
 
         ts_b.Finish(&ts_arr);
+        exchange_ts_b.Finish(&exchange_ts_arr);
+        ack_latency_b.Finish(&ack_latency_arr);
         symbol_b.Finish(&symbol_arr);
         client_oid_b.Finish(&client_oid_arr);
         side_b.Finish(&side_arr);
@@ -1162,6 +1191,8 @@ public:
         // -------------------------
         auto schema = arrow::schema({
             field("ts", int64()),
+            field("exchange_ts", int64()),
+            field("ack_latency", int64()),
             field("symbol", utf8()),
             field("client_oid", utf8()),
             field("side", utf8()),
@@ -1217,7 +1248,7 @@ public:
         // TABLE
         // -------------------------
         auto table = arrow::Table::Make(schema, {
-            ts_arr, symbol_arr, client_oid_arr,
+            ts_arr, exchange_ts_arr, ack_latency_arr, symbol_arr, client_oid_arr,
             side_arr, event_type_arr,
             price_arr, price_tick_arr, qty_arr,
             mid_arr, microprice_arr, microprice_dev_arr, microprice_error_arr, spread_arr,
@@ -1258,6 +1289,9 @@ public:
         double volatility_at_fill = state.get_vol();
 
         row.ts = state.last_trade_ts;
+        // row.exchange_ts = order.exchange_ts;
+        // row.ack_latency = order.ack_latency;
+        // row.time_to_fill = order.exchange_ts - order.live_ts;
         row.symbol = instrument_upper;
         row.side = order.side;
         row.price = config.from_tick(order.price_tick);

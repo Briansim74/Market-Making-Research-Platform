@@ -35,17 +35,11 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_io.hpp>
-#include <boost/uuid/random_generator.hpp>
-
 #include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
 #include <xgboost/c_api.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
@@ -65,6 +59,13 @@
 #include "mmpy_state.hpp" //state & market feature state
 #include "mmpy_recorder.hpp" //dataset recorder
 #include "mmpy_strategy.hpp" // models & strategy
+
+#include <boost/uuid/random_generator.hpp>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_io.hpp>
+
+#include <openssl/hmac.h> // for signing
+#include <openssl/evp.h>
 
 using std::cout;
 using json = nlohmann::json;
@@ -91,13 +92,13 @@ public:
     virtual double get_current_ask_size() = 0;
     virtual uint64_t get_avg_latency() = 0;
     virtual void place_quotes_latency(const Signal&) = 0; //paper
-    virtual bool process_latency_queue() = 0; //paper
+    virtual void process_latency_queue() = 0; //paper
     virtual void process_trade(const Trade&) = 0;
-    virtual Order* get_open_order(const std_string&) = 0;
+    virtual shared_ptr<Order> get_open_order(const std_string&) = 0;
+    virtual optional<Order> get_open_order_snapshot(const std_string&) = 0;
     virtual void cancel_all_orders() = 0;
     virtual void place_quotes(const Signal&) = 0;
     virtual void place_market() = 0;
-    virtual void apply_stream_update(const Stream&) = 0;
     virtual ~Execution() = default;
 };
 
@@ -108,7 +109,7 @@ public:
     State& state;
     DatasetRecorder& recorder;
 
-    unordered_map<std_string, Order> open_orders;
+    unordered_map<std_string, shared_ptr<Order>> open_orders;
 
     double current_bid_size = 0.0;
     double current_ask_size = 0.0;
@@ -121,6 +122,7 @@ public:
 
     mt19937 rng;
     uniform_real_distribution<double> dist;
+    mutex orders_mtx;
 
     uint64_t ack_latency;
     priority_queue<LatencyEvent, vector<LatencyEvent>, Compare> latency_queue;
@@ -171,9 +173,7 @@ public:
         latency_queue.push(event);
     }
 
-    bool process_latency_queue() override {
-
-        bool changed = false;
+    void process_latency_queue() override {
         lock_guard<mutex> lock(latency_mtx);
 
         while(!latency_queue.empty()){
@@ -182,15 +182,14 @@ public:
 
             latency_queue.pop();
             place_quotes(event.signal);
-
-            changed = true;
         }
-        return changed;
     }
 
-    Order* get_fill_candidate_order(const std_string& side, const int64_t& price_tick){
+    shared_ptr<Order> get_fill_candidate_order(const std_string& side, const int64_t& price_tick){
+        lock_guard<mutex> lock(orders_mtx);
+
         for(auto& [client_oid, order]: open_orders){
-            if(order.side == side && order.price_tick == price_tick && order.status == "LIVE") return &order;
+            if(order->side == side && order->price_tick == price_tick && order->status == "LIVE") return order;
         }
         return nullptr;
     }
@@ -246,29 +245,35 @@ public:
 
         size = max(0.05, min(size, 2.0));
 
-        double bid_size = size * bid_multiplier;
-        double ask_size = size * ask_multiplier;
-
-        // inventory limits
-        double max_buy = max(0.0, max_inv - inv); // NEW RISK GUARD HERE, PREVENT EXCEEDING MARGIN
-        double max_sell = max(0.0, max_inv + inv);
-
-        bid_size = min(bid_size, max_buy);
-        ask_size = min(ask_size, max_sell);
-
-        // exchange LOT_SIZE normalization
-        bid_size = config.normalize_qty(bid_size);
-        ask_size = config.normalize_qty(ask_size);
-
         return {
-            bid_size,
-            ask_size
+            size * bid_multiplier,
+            size * ask_multiplier
         };
     }
 
-    Order* get_open_order(const std_string& side) override {     
-        for(auto& [client_oid, order]: open_orders) if(order.side == side) return &order;
+    shared_ptr<Order> get_open_order(const std_string& side) override {
+        lock_guard<mutex> lock(orders_mtx);
+        
+        for(auto& [client_oid, order]: open_orders) if(order->side == side) return order;
         return nullptr;
+    }
+
+    optional<Order> get_open_order_snapshot(const std_string& side) override {
+        lock_guard<mutex> lock(orders_mtx);
+        
+        for(auto& [client_oid, order]: open_orders) if(order->side == side) return *order;
+        return nullopt;
+    }
+
+    bool can_quote(const std_string& side){
+        double inv = state.inventory;
+
+        if(abs(inv) >= max_inv){
+            if(side == "BUY" && inv < 0) return true;
+            if(side == "SELL" && inv > 0) return true;
+            return false;
+        }
+        return true;
     }
 
     std_string uuid16(){
@@ -279,30 +284,38 @@ public:
         return s.substr(0, 16);
     }
 
-    void place_limit(const std_string& side, const double& price, const double& size, const Signal& signal){
+    void place_limit(const std_string& side, const double& price, const double& size, 
+                        const Signal& signal, const std_string& event_type){
 
-        std_string client_oid = "MM-" + uuid16();
-        int64_t price_tick = config.to_tick(price);
+        auto order = make_shared<Order>();
 
-        Order& order = open_orders[client_oid]; // <-- insert into map
+        {
+            lock_guard<mutex> lock(orders_mtx);
+            std_string client_oid = "MM-" + uuid16();
+            int64_t price_tick = config.to_tick(price);
 
-        order.client_oid = client_oid;
-        order.side = side;
-        order.price_tick = price_tick;
-        order.qty = size;
-        order.remaining = size;
-        order.status = "LIVE";
-        order.ts = config.now_ms();
-        order.owner = "self";
-        order.signal = signal;
-        order.queue_ahead_at_join = state.set_queue_position(side, price_tick);
+            order->client_oid = client_oid;
+            order->side = side;
+            order->price_tick = price_tick;
+            order->qty = size;
+            order->remaining = size;
+            order->status = "LIVE";
+            order->ts = config.now_ms();
+            order->owner = "self";
+            order->signal = signal;
+            order->queue_ahead_at_join = state.set_queue_position(side, price_tick);
 
-        open_orders[client_oid] = order;   // <-- insert into map
+            open_orders[client_oid] = order;   // <-- insert into map
+        }
 
-        recorder.log_quote(order, (side == "BUY") ? "BID" : "ASK", "NEW");
+        recorder.log_quote(*order, (side == "BUY") ? "BID" : "ASK", event_type);
     }
 
     void place_market() override {
+
+        auto order = make_shared<Order>();
+
+        lock_guard<mutex> lock(orders_mtx);
 
         double pos = state.inventory;
         auto& book = state.market_book;
@@ -313,46 +326,43 @@ public:
         std_string client_oid = "MM-" + uuid16();
         int64_t price_tick = (pos > 0) ? bid_tick : ask_tick;
         std_string side = (pos > 0) ? "SELL" : "BUY";
-
-        Order& order = open_orders[client_oid]; // <-- insert into map
         
-        order.client_oid = client_oid;
-        order.side = side;
-        order.price_tick = price_tick;
-        order.qty = abs(pos);
-        order.remaining = abs(pos);
-        order.status = "LIVE";
-        order.ts = config.now_ms();
-        order.owner = "self";
-        order.signal = *state.last_signal;
-        order.queue_ahead_at_join = 0.0;
+        order->client_oid = client_oid;
+        order->side = side;
+        order->price_tick = price_tick;
+        order->qty = abs(pos);
+        order->remaining = abs(pos);
+        order->status = "LIVE";
+        order->ts = config.now_ms();
+        order->owner = "self";
+        order->signal = *state.last_signal;
+        order->queue_ahead_at_join = 0.0;
 
         open_orders[client_oid] = order;   // <-- insert into map
 
-        execute_market(&order);
+        execute_market(order);
     }
 
-    void cancel_order(Order* order){
+    void cancel_order(const shared_ptr<Order>& order){
+        
+        {
+            lock_guard<mutex> lock(orders_mtx);
 
-        order->ts = config.now_ms();
-        order->status = "CANCELED";
-        state.last_order_update = *order;
-        state.reset_queue_ahead(order->side, order->price_tick);
+            order->status = "CANCELED";
+            state.last_order_update = order;
+            open_orders.erase(order->client_oid);
+            state.reset_queue_ahead(order->side, order->price_tick);
+        }
 
         recorder.log_quote(*order, (order->side == "BUY") ? "BID" : "ASK", "CANCELED");
-
-        open_orders.erase(order->client_oid);
     }
 
     void cancel_all_orders() override {
-        Order* bid_order = get_open_order("BUY");
-        Order* ask_order = get_open_order("SELL");
+        shared_ptr<Order> bid_order = get_open_order("BUY");
+        shared_ptr<Order> ask_order = get_open_order("SELL");
 
-        if(bid_order && !bid_order->pending_cancel &&
-        (bid_order->status == "LIVE" || bid_order->status == "PARTIALLY_FILLED")) cancel_order(bid_order);
-
-        if(ask_order && !ask_order->pending_cancel &&
-        (ask_order->status == "LIVE" || ask_order->status == "PARTIALLY_FILLED")) cancel_order(ask_order);
+        if(bid_order) cancel_order(bid_order);
+        if(ask_order) cancel_order(ask_order);
     }
 
     void place_quotes(const Signal& signal) override {
@@ -363,8 +373,8 @@ public:
         auto [bid_size, ask_size] = compute_order_size(signal);
         double tick = config.tick_size;
 
-        Order* bid_order = get_open_order("BUY");
-        Order* ask_order = get_open_order("SELL");
+        shared_ptr<Order> bid_order = get_open_order("BUY");
+        shared_ptr<Order> ask_order = get_open_order("SELL");
 
         current_bid_size = bid_size;
         current_ask_size = ask_size;
@@ -372,20 +382,17 @@ public:
         // -------------------------
         // BID ORDERS
         // -------------------------
-        if(!bid_order && bid_size > 0.0){ // if no bid order
-            if(bid_size > 0.0){
-                place_limit("BUY", desired_bid, bid_size, signal);
-                last_bid = desired_bid;
-            }
+        if(!bid_order && can_quote("BUY")){ // if no bid order
+            place_limit("BUY", desired_bid, bid_size, signal, "NEW");
+            last_bid = desired_bid;
         }
-        
+
         // if bid change
-        else if(abs(desired_bid - config.from_tick(bid_order->price_tick)) >= tick && !bid_order->pending_cancel &&
-        (bid_order->status == "LIVE" || bid_order->status == "PARTIALLY_FILLED")){
+        else if(abs(desired_bid - config.from_tick(bid_order->price_tick)) >= tick){
             cancel_order(bid_order);
 
-            if(bid_size > 0.0){
-                place_limit("BUY", desired_bid, bid_size, signal);
+            if(can_quote("BUY")){
+                place_limit("BUY", desired_bid, bid_size, signal, "REPLACE");
                 last_bid = desired_bid;
             }
         }
@@ -393,20 +400,17 @@ public:
         // -------------------------
         // ASK ORDERS
         // -------------------------
-        if(!ask_order && ask_size > 0.0){ // if no ask order
-            if(ask_size > 0.0){
-                place_limit("SELL", desired_ask, ask_size, signal);
-                last_ask = desired_ask;
-            }
+        if(!ask_order && can_quote("SELL")){ // if no ask order
+            place_limit("SELL", desired_ask, ask_size, signal, "NEW");
+            last_ask = desired_ask;
         }
 
         // else if ask change
-        else if(abs(desired_ask - config.from_tick(ask_order->price_tick)) >= tick && !ask_order->pending_cancel &&
-        (ask_order->status == "LIVE" || ask_order->status == "PARTIALLY_FILLED")){
+        else if(abs(desired_ask - config.from_tick(ask_order->price_tick)) >= tick){
             cancel_order(ask_order);
 
-            if(ask_size > 0.0){
-                place_limit("SELL", desired_ask, ask_size, signal);
+            if(can_quote("SELL")){
+                place_limit("SELL", desired_ask, ask_size, signal, "REPLACE");
                 last_ask = desired_ask;
             }
         }
@@ -441,15 +445,17 @@ public:
         // -------------------------
         // FILL CANDIDATE
         // -------------------------
-        Order* order = get_fill_candidate_order(side, price_tick);
+        shared_ptr<Order> order = get_fill_candidate_order(side, price_tick);
 
         if(!order) return;
 
-        state.last_fill_candidate = *order;
+        state.last_fill_candidate = order;
 
         // -------------------------
         // QUEUE + FLOW MODEL
         // -------------------------
+        lock_guard<mutex> lock(orders_mtx);
+
         double queue_ahead = state.compute_queue_ahead(side, price_tick);
         double trade_rate = get_trade_rate(trade);
 
@@ -497,28 +503,27 @@ public:
         double fill_qty = min(order->remaining, qty);
         order->remaining -= fill_qty;
 
-        state.on_fill(trade.price, fill_qty, order->side, true);
+        state.on_fill(trade.price, fill_qty, order->side, "maker");
 
         order->status = "PARTIALLY_FILLED";
 
         if(order->remaining == 0){
             order->status = "FILLED";
+            open_orders.erase(order->client_oid);
             state.reset_queue_ahead(side, order->price_tick);
         }
 
-        state.last_order_update = *order;
+        state.last_order_update = order;
 
         recorder.log_fill(*order, fill_qty, true);
-
-        if(order->remaining == 0) open_orders.erase(order->client_oid);
     }
 
-    void orderMarketToString(Order* order, const double& fill_qty){
-        cout << format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
-            order->side, config.from_tick(order->price_tick), fill_qty, order->status) << "\n";
+    std_string orderMarketToString(const shared_ptr<Order>& order, const double& fill_qty){
+        return format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
+            order->side, config.from_tick(order->price_tick), fill_qty, order->status);
     }
 
-    void execute_market(Order* order){
+    void execute_market(const shared_ptr<Order>& order){
 
         auto& book = state.market_book;
 
@@ -534,11 +539,11 @@ public:
                 if(order->remaining == 0) order->status = "FILLED";
                 else order->status = "PARTIALLY_FILLED";
 
-                state.on_fill(config.from_tick(it->first), fill_qty, "BUY", false);
+                state.on_fill(config.from_tick(it->first), fill_qty, "BUY", "taker");
 
-                state.last_fill_candidate = *order;
-                state.last_order_update = *order;
-                orderMarketToString(order, fill_qty);
+                state.last_fill_candidate = order;
+                state.last_order_update = order;
+                cout << orderMarketToString(order, fill_qty) << "\n";
 
                 recorder.log_fill(*order, fill_qty, false);
 
@@ -558,11 +563,11 @@ public:
                 if(order->remaining == 0) order->status = "FILLED";
                 else order->status = "PARTIALLY_FILLED";
 
-                state.on_fill(config.from_tick(it->first), fill_qty, "SELL", false);
+                state.on_fill(config.from_tick(it->first), fill_qty, "SELL", "taker");
 
-                state.last_fill_candidate = *order;
-                state.last_order_update = *order;
-                orderMarketToString(order, fill_qty);
+                state.last_fill_candidate = order;
+                state.last_order_update = order;
+                cout << orderMarketToString(order, fill_qty) << "\n";
 
                 recorder.log_fill(*order, fill_qty, false);
 
@@ -571,8 +576,6 @@ public:
             }
         }
     }
-
-    void apply_stream_update(const Stream& stream) override {}
 };
 class BinanceBroker {
 public:
@@ -581,7 +584,7 @@ public:
     std_string api_key;
     std_string api_secret;
     std_string base_url;
-    std_string instrument_upper;
+    std_string instrument;
 
     std_string listen_key;
     atomic<bool> keepalive_running{false};
@@ -593,8 +596,8 @@ public:
         api_key = params["api"]["api_key"].get<std_string>();
         api_secret = params["api"]["api_secret"].get<std_string>();
         base_url = params["api"]["base_url"].get<std_string>();
-        instrument_upper = params["instrument"].get<std_string>();
-        transform(instrument_upper.begin(), instrument_upper.end(), instrument_upper.begin(), [](unsigned char c){return toupper(c);});
+        instrument = params["instrument"].get<std_string>();
+        transform(instrument.begin(), instrument.end(), instrument.begin(), [](unsigned char c){return toupper(c);});
     }
 
     // -------------------------
@@ -623,8 +626,10 @@ public:
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L);
 
+        // curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1); // NEW
+
         // Enable verbose output
-        // curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L); // TO DELETE ONCE PROBLEM IS SORTED OUT
+        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L); // TO DELETE ONCE PROBLEM IS SORTED OUT
 
         // headers
         curl_slist* header_list = nullptr;
@@ -642,6 +647,11 @@ public:
         if(method == "GET"){
             // Default behavior, nothing to set.
         }
+        // else if(method == "POST"){
+        //     curl_easy_setopt(curl, CURLOPT_POST, 1L);
+
+        //     if(!body.empty()) curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        // }
         else if(method == "POST"){
             curl_easy_setopt(curl, CURLOPT_POST, 1L);
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.empty() ? "" : body.c_str());
@@ -656,7 +666,17 @@ public:
             curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.empty() ? "" : body.c_str());
             curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
-        }
+            }
+        // else if(method == "PUT"){
+        //     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+
+        //     if(!body.empty()) curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        // }
+        // else if(method == "DELETE"){
+        //     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+
+        //     if(!body.empty()) curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        // }
         else throw runtime_error("unsupported method: " + method);
 
         CURLcode res = curl_easy_perform(curl);
@@ -678,9 +698,11 @@ public:
         curl_easy_cleanup(curl);
 
         if(status >= 400){
-            cout << "ERROR: status >= 400: HTTP " + to_string(status) + ": " + response << "\n";
-            // throw runtime_error("HTTP " + to_string(status) + ": " + response);
+            cout << "status >= 400: HTTP " + to_string(status) + ": " + response << "\n";
+            throw runtime_error("HTTP " + to_string(status) + ": " + response);
         }
+        
+
         return response;
     }
 
@@ -727,7 +749,8 @@ public:
     void stop_keepalive(){
         keepalive_running = false;
 
-        if(keepalive_thread.joinable()) keepalive_thread.join();
+        if(keepalive_thread.joinable())
+            keepalive_thread.join();
     }
 
     // -------------------------
@@ -767,22 +790,22 @@ public:
         
         auto arr = json::parse(res);
         for(auto& p: arr){
-            if(p["symbol"] == instrument_upper) return stod(p["positionAmt"].get<std_string>());
+            if(p["symbol"] == instrument) return stod(p["positionAmt"].get<std_string>());
         }
         return 0.0;
     }
 
-    json place_limit(const Order& order, const double& price, const double& size){
+    json place_limit(const shared_ptr<Order>& order, const double& price, const double& size){
         
         ostringstream q;        
-        q << "newClientOrderId=" << order.client_oid
-          << "&symbol=" << instrument_upper
-          << "&side=" << order.side
+        q << "newClientOrderId=" << order->client_oid
+          << "&symbol=" << instrument
+          << "&side=" << order->side
           << "&type=LIMIT"
           << "&timeInForce=GTC"
           << "&quantity=" << fixed << setprecision(config.qty_precision) << size
           << "&price=" << fixed << setprecision(config.price_precision) << price
-          << "&timestamp=" << order.ts
+          << "&timestamp=" << order->ts
           << "&recvWindow=5000";
 
         std_string query = q.str();
@@ -795,16 +818,16 @@ public:
         return json::parse(res);
     }
 
-    json place_market(const Order& order){
+    json place_market(const shared_ptr<Order>& order){
 
         ostringstream q;
-        q << "newClientOrderId=" << order.client_oid
-          << "&symbol=" << instrument_upper
-          << "&side=" << order.side
+        q << "newClientOrderId=" << order->client_oid
+          << "&symbol=" << instrument
+          << "&side=" << order->side
           << "&type=MARKET"
-          << "&quantity=" << fixed << setprecision(config.qty_precision) << order.qty
+          << "&quantity=" << fixed << setprecision(config.qty_precision) << order->qty
           << "&reduceOnly=true"
-          << "&timestamp=" << order.ts
+          << "&timestamp=" << order->ts
           << "&recvWindow=5000";
 
         std_string query = q.str();
@@ -817,11 +840,11 @@ public:
         return json::parse(res);
     }
 
-    json cancel_order(const Order& order){
+    json cancel_order(const shared_ptr<Order>& order){
         
         ostringstream q;
-        q << "origClientOrderId=" << order.client_oid
-          << "&symbol=" << instrument_upper << "&timestamp=" << order.ts;
+        q << "origClientOrderId=" << order->client_oid
+          << "&symbol=" << instrument << "&timestamp=" << order->ts;
 
         std_string query = q.str();
         std_string signature = sign(query);
@@ -842,7 +865,9 @@ public:
     DatasetRecorder& recorder;
     BinanceBroker& broker;
 
-    unordered_map<std_string, Order> open_orders;
+    function<void()> on_stream_event;
+
+    unordered_map<std_string, shared_ptr<Order>> open_orders;
 
     double current_bid_size = 0.0;
     double current_ask_size = 0.0;
@@ -853,15 +878,23 @@ public:
     double base_size;
     double max_inv;
 
+    mutex orders_mtx;
+
     deque<uint64_t> latency_window;
     uint64_t latency_sum = 0;
     mutex latency_mtx;
 
-    LiveExecution(MarketConfig& config, State& state, DatasetRecorder& recorder, BinanceBroker& broker, const json& params)
-        : config(config), state(state), recorder(recorder), broker(broker), params(params)
+    LiveExecution(MarketConfig& config, State& state, DatasetRecorder& recorder, BinanceBroker& broker, 
+        const json& params)
+        : config(config), state(state), recorder(recorder), broker(broker), 
+        params(params)
     {
         base_size = params["base_size"];
         max_inv = params["max_inv"];
+    }
+
+    void set_on_stream_event(function<void()> callback){
+        on_stream_event = move(callback);
     }
 
     double get_last_bid() override {
@@ -880,32 +913,36 @@ public:
         return current_ask_size;
     }
 
-    void place_quotes_latency(const Signal& signal) override {}
-    // Live execution has no simulated latency queue
-
-    bool process_latency_queue() override {
-        return true; // Live execution processes immediately through exchange events
+    void place_quotes_latency(const Signal& signal) override {
+        // Live execution has no simulated latency queue
     }
 
-    Order* get_fill_candidate_order(const std_string& side, const int64_t& price_tick){
+    void process_latency_queue() override {
+        // Live execution processes immediately through exchange events
+    }
+
+    shared_ptr<Order> get_fill_candidate_order(const std_string& side, const int64_t& price_tick){
+        lock_guard<mutex> lock(orders_mtx);
+
         for(auto& [client_oid, order]: open_orders){
-            if(order.side == side && order.price_tick == price_tick && order.status == "LIVE") return &order;
+            if(order->side == side && order->price_tick == price_tick && order->status == "LIVE") return order;
         }
         return nullptr;
     }
 
     void process_trade(const Trade& trade) override {
+
         update_trade_flow_buckets(trade);
         update_trade_flow(trade);
 
         std_string side = (trade.side == "BUY") ? "SELL" : "BUY";
         int64_t price_tick = config.to_tick(trade.price);
 
-        Order* order = get_fill_candidate_order(side, price_tick);
+        shared_ptr<Order> order = get_fill_candidate_order(side, price_tick);
 
         if(!order) return;
 
-        state.last_fill_candidate = *order;
+        state.last_fill_candidate = order;
     }
 
     void update_trade_flow_buckets(const Trade& trade){
@@ -930,7 +967,7 @@ public:
 
         state.trade_imbalance = alpha * flow + (1 - alpha) * state.trade_imbalance;
     }
-
+    
     pair<double, double> compute_order_size(const Signal& signal){
         double inv = state.inventory;
         double vol = state.get_vol();
@@ -952,29 +989,35 @@ public:
 
         size = max(0.05, min(size, 2.0));
 
-        double bid_size = size * bid_multiplier;
-        double ask_size = size * ask_multiplier;
-
-        // inventory limits
-        double max_buy = max(0.0, max_inv - inv); // NEW RISK GUARD HERE, PREVENT EXCEEDING MARGIN
-        double max_sell = max(0.0, max_inv + inv);
-
-        bid_size = min(bid_size, max_buy);
-        ask_size = min(ask_size, max_sell);
-
-        // exchange LOT_SIZE normalization
-        bid_size = config.normalize_qty(bid_size);
-        ask_size = config.normalize_qty(ask_size);
-
         return {
-            bid_size,
-            ask_size
+            size * bid_multiplier,
+            size * ask_multiplier
         };
     }
 
-    Order* get_open_order(const std_string& side) override {     
-        for(auto& [client_oid, order]: open_orders) if(order.side == side) return &order;
+    shared_ptr<Order> get_open_order(const std_string& side) override {
+        lock_guard<mutex> lock(orders_mtx);
+        
+        for(auto& [client_oid, order]: open_orders) if(order->side == side) return order;
         return nullptr;
+    }
+
+    optional<Order> get_open_order_snapshot(const std_string& side) override {
+        lock_guard<mutex> lock(orders_mtx);
+        
+        for(auto& [client_oid, order]: open_orders) if(order->side == side) return *order;
+        return nullopt;
+    }
+
+    bool can_quote(const std_string& side){
+        double inv = state.inventory;
+
+        if(abs(inv) >= max_inv){
+            if(side == "BUY" && inv < 0) return true;
+            if(side == "SELL" && inv > 0) return true;
+            return false;
+        }
+        return true;
     }
 
     std_string uuid16(){
@@ -986,106 +1029,107 @@ public:
     }
 
     void place_limit(const std_string& side, const double& price, const double& size, const Signal& signal){
+        
+        auto order = make_shared<Order>();
 
-        std_string client_oid = "MM-" + uuid16();
-        int64_t price_tick = config.to_tick(price);
+        {
+            lock_guard<mutex> lock(orders_mtx);
+            std_string client_oid = "MM-" + uuid16();
+            int64_t price_tick = config.to_tick(price);
 
-        Order& order = open_orders[client_oid]; // <-- insert into map
+            order->client_oid = client_oid;
+            order->side = side;
+            order->price_tick = price_tick;
+            order->qty = size;
+            order->remaining = size;
+            order->status = "PENDING_NEW";
+            order->ts = config.now_ms();
+            order->owner = "self";
+            order->signal = signal;
 
-        order.client_oid = client_oid;
-        order.side = side;
-        order.price_tick = price_tick;
-        order.qty = size;
-        order.remaining = size;
-        order.status = "PENDING_NEW";
-        order.ts = config.now_ms();
-        order.owner = "self";
-        order.signal = signal;
-
-        cout << "- PLACE LIMIT ORDER - client_oid: " << order.client_oid << 
-        ", status: " << order.status << ", timestamp: " << order.ts << "\n";
-
-        json resp = broker.place_limit(order, price, size);
-        order.resp = resp;
-
-        if(resp.contains("code")){ // TO BE DELETED
-            int code = resp["code"];
-
-            if(code == -4003){
-                cout << "Limit order rejected: Quantity less than or equal to zero.\n";
-                return;
-            }
-            // other exchange errors
-            cout << "Limit order failed: " << resp.dump() << "\n";
+            open_orders[client_oid] = order;   // <-- insert into map
         }
 
-        recorder.log_quote(order, (side == "BUY") ? "BID" : "ASK", "NEW_SUBMITTED");
+        cout << "- PLACE LIMIT ORDER - client_oid: " << order->client_oid << 
+        ", status: " << order->status << ", timestamp: " << order->ts << "\n";
+
+        json resp = broker.place_limit(order, price, size);
+
+        {
+            lock_guard<mutex> lock(orders_mtx);
+            order->resp = resp;
+        }
+
+        recorder.log_quote(*order, (side == "BUY") ? "BID" : "ASK", "NEW_SUBMITTED");
     }
 
     void place_market() override {
 
         double pos = broker.get_position();
-        auto& book = state.market_book;
+        auto order = make_shared<Order>();
 
-        auto [bid_tick, bid_size] = book.best_bid();
-        auto [ask_tick, ask_size] = book.best_ask();
+        {
+            lock_guard<mutex> lock(orders_mtx);
 
-        std_string client_oid = "MM-" + uuid16();
-        int64_t price_tick = (pos > 0) ? bid_tick : ask_tick;
-        std_string side = (pos > 0) ? "SELL" : "BUY";
+            auto& book = state.market_book;
 
-        Order& order = open_orders[client_oid]; // <-- insert into map
+            auto [bid_tick, bid_size] = book.best_bid();
+            auto [ask_tick, ask_size] = book.best_ask();
 
-        order.client_oid = client_oid;
-        order.side = side;
-        order.price_tick = price_tick;
-        order.qty = abs(pos);
-        order.remaining = abs(pos);
-        order.status = "PENDING_NEW";
-        order.ts = config.now_ms();
-        order.owner = "self";
-        order.signal = *state.last_signal;
-        order.queue_ahead_at_join = 0.0;
+            std_string client_oid = "MM-" + uuid16();
+            int64_t price_tick = (pos > 0) ? bid_tick : ask_tick;
+            std_string side = (pos > 0) ? "SELL" : "BUY";
+
+            order->client_oid = client_oid;
+            order->side = side;
+            order->price_tick = price_tick;
+            order->qty = abs(pos);
+            order->remaining = abs(pos);
+            order->status = "PENDING_NEW";
+            order->ts = config.now_ms();
+            order->owner = "self";
+            order->signal = *state.last_signal;
+            order->queue_ahead_at_join = 0.0;
+
+            open_orders[client_oid] = order;   // <-- insert into map
+        }
 
         json resp = broker.place_market(order);
-        order.resp = resp;
+
+        lock_guard<mutex> lock(orders_mtx);
+        order->resp = resp;
     }
 
-    void cancel_order(Order* order){
-        
-        order->ts = config.now_ms();
-        order->status = "PENDING_CANCEL";
-        order->pending_cancel = true;
-        
+    void cancel_order(const shared_ptr<Order>& order){
+        {
+            lock_guard<mutex> lock(orders_mtx);
+            order->ts = config.now_ms();
+            order->status = "PENDING_CANCEL";
+        }
+
         cout << "- CANCEL LIMIT ORDER - client_oid: " << order->client_oid << 
         ", status: " << order->status << ", timestamp: " << order->ts << "\n";
 
-        json resp = broker.cancel_order(*order);
-        order->resp = resp;
+        json resp = broker.cancel_order(order);
 
-        if(resp.contains("code")){ // TO BE DELETED
-            int code = resp["code"];
-
-            if(code == -2011){ // Order already filled/canceled
-                cout << "Cancel rejected: order no longer open\n";
-                return;
-            }
-            // other exchange errors
-            cout << "Cancel failed: " << resp.dump() << "\n";
+        {
+            lock_guard<mutex> lock(orders_mtx);
+            order->resp = resp;
         }
 
         recorder.log_quote(*order, (order->side == "BUY") ? "BID" : "ASK", "CANCEL_SUBMITTED");
     }
 
     void cancel_all_orders() override {
-        Order* bid_order = get_open_order("BUY");
-        Order* ask_order = get_open_order("SELL");
+        shared_ptr<Order> bid_order = get_open_order("BUY");
+        shared_ptr<Order> ask_order = get_open_order("SELL");
 
-        if(bid_order && !bid_order->pending_cancel &&
-        (bid_order->status == "LIVE" || bid_order->status == "PARTIALLY_FILLED")) cancel_order(bid_order);
-
-        if(ask_order && !ask_order->pending_cancel &&
-        (ask_order->status == "LIVE" || ask_order->status == "PARTIALLY_FILLED")) cancel_order(ask_order);
+        if(bid_order && bid_order->status != "PENDING_NEW" && bid_order->status != "PENDING_CANCEL"){
+            cancel_order(bid_order);
+        }
+        if(ask_order && ask_order->status != "PENDING_NEW" && ask_order->status != "PENDING_CANCEL"){
+            cancel_order(ask_order);
+        }
     }
 
     void place_quotes(const Signal& signal) override {
@@ -1096,8 +1140,8 @@ public:
         auto [bid_size, ask_size] = compute_order_size(signal);
         double tick = config.tick_size;
 
-        Order* bid_order = get_open_order("BUY");
-        Order* ask_order = get_open_order("SELL");
+        shared_ptr<Order> bid_order = get_open_order("BUY");
+        shared_ptr<Order> ask_order = get_open_order("SELL");
 
         current_bid_size = bid_size;
         current_ask_size = ask_size;
@@ -1105,37 +1149,41 @@ public:
         // -------------------------
         // BID ORDERS
         // -------------------------
-        if(!bid_order){ // if no bid order
-            if(bid_size > 0.0) place_limit("BUY", desired_bid, bid_size, signal);
+        if(!bid_order && can_quote("BUY")){ // if no bid order
+            place_limit("BUY", desired_bid, bid_size, signal);
         }
 
-        else if(abs(desired_bid - config.from_tick(bid_order->price_tick)) >= tick && !bid_order->pending_cancel &&
-        (bid_order->status == "LIVE" || bid_order->status == "PARTIALLY_FILLED")){
+        // if bid change and bid order is not pending
+        else if(abs(desired_bid - config.from_tick(bid_order->price_tick)) >= tick &&
+        bid_order->status != "PENDING_NEW" && bid_order->status != "PENDING_CANCEL"){
             cancel_order(bid_order);
         }
 
         // -------------------------
         // ASK ORDERS
         // -------------------------
-        if(!ask_order){ // if no ask order
-            if(ask_size > 0.0) place_limit("SELL", desired_ask, ask_size, signal);
+        if(!ask_order && can_quote("SELL")){ // if no ask order
+            place_limit("SELL", desired_ask, ask_size, signal);
         }
-
-        else if(abs(desired_ask - config.from_tick(ask_order->price_tick)) >= tick && !ask_order->pending_cancel &&
-        (ask_order->status == "LIVE" || ask_order->status == "PARTIALLY_FILLED")){
+        
+        // else if ask change and ask order is not pending
+        else if(abs(desired_ask - config.from_tick(ask_order->price_tick)) >= tick &&
+        ask_order->status != "PENDING_NEW" && ask_order->status != "PENDING_CANCEL"){
             cancel_order(ask_order);
         }
     }
 
-    Order* get_order(const std_string& msg_client_oid){
-        for(auto& [client_oid, order]: open_orders) if(client_oid == msg_client_oid) return &order;
+    shared_ptr<Order> get_order(const std_string& msg_client_oid){
+        lock_guard<mutex> lock(orders_mtx);
+        
+        for(auto& [client_oid, order]: open_orders) if(client_oid == msg_client_oid) return order;
         return nullptr;
     }
 
     // -------------------------
     // LATENCY
     // -------------------------
-    uint64_t get_avg_latency() override {
+    uint64_t get_avg_latency(){
         lock_guard<mutex> lock(latency_mtx);
 
         if(latency_window.empty()) return 0.0;
@@ -1155,39 +1203,40 @@ public:
         }
     }
 
-    void orderMarketToString(Order* order, const Stream& stream){
-        cout << format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
-            order->side, stream.fill_price, stream.fill_qty, order->status) << "\n";
-    }
-
     // -------------------------
     // BINANCE USER STREAM SIGNAL
     // -------------------------
-    void apply_stream_update(const Stream& stream) override {
+    void apply_stream_update(const Stream& stream){
 
-        Order* order = get_order(stream.client_oid);
+        shared_ptr<Order> order = get_order(stream.client_oid);
 
         if(!order) return;
 
         // -------------------------
         // EXCHANGE LATENCY
         // -------------------------
-        order->exchange_ts = stream.exchange_ts;
-        order->ack_latency = stream.exchange_ts - order->ts;
+        {
+            lock_guard<mutex> lock(orders_mtx);
+            order->exchange_ts = stream.exchange_ts;
+            order->ack_latency = stream.exchange_ts - order->ts;
+        }
         
         push_latency(order->ack_latency);
- 
+
         // -------------------------
         // NEW
         // -------------------------
         if(stream.exec_type == "NEW"){
-            
-            order->live_ts = stream.exchange_ts;
-            order->status = "LIVE";
-            order->queue_ahead_at_join = state.set_queue_position(stream.side, order->price_tick);
-            
-            (stream.side == "BUY") ? last_bid = stream.price : last_ask = stream.price;
-            state.last_order_update = *order;
+            {
+                lock_guard<mutex> lock(orders_mtx);
+                
+                order->live_ts = stream.exchange_ts;
+                order->status = "LIVE";
+                order->queue_ahead_at_join = state.set_queue_position(stream.side, order->price_tick);
+                
+                (stream.side == "BUY") ? last_bid = stream.price : last_ask = stream.price;
+                state.last_order_update = order;
+            }
 
             cout << "- PLACE LIMIT ORDER - client_oid: " << order->client_oid << 
             ", status: " << order->status << ", timestamp: " << order->exchange_ts << "\n";
@@ -1199,100 +1248,89 @@ public:
         // CANCELED
         // -------------------------
         else if(stream.exec_type == "CANCELED"){
-            
-            order->status = "CANCELED";
-            state.reset_queue_ahead(stream.side, order->price_tick);
-            state.last_order_update = *order;
+            {
+                lock_guard<mutex> lock(orders_mtx);
+                
+                order->status = "CANCELED";
+                open_orders.erase(order->client_oid);
+                state.reset_queue_ahead(stream.side, order->price_tick);
+                state.last_order_update = order;
+            }
 
             cout << "- CANCEL LIMIT ORDER - client_oid: " << order->client_oid << 
             ", status: " << order->status << ", timestamp: " << order->exchange_ts << "\n";
 
             recorder.log_quote(*order, (stream.side == "BUY") ? "BID" : "ASK", "CANCELED");
-
-            open_orders.erase(order->client_oid);
         }
 
         // -------------------------
         // REJECTED - PENDING NEW ORDER REJECTED
         // -------------------------
         else if(stream.exec_type == "REJECTED"){
-            
-            order->status = "REJECTED";
-            state.last_order_update = *order;
+            {
+                lock_guard<mutex> lock(orders_mtx);
+                
+                order->status = "REJECTED";
+                open_orders.erase(order->client_oid);
+                state.last_order_update = order;
+            }
 
             cout << "- REJECTED LIMIT ORDER - client_oid: " << order->client_oid << 
             ", status: " << order->status << ", timestamp: " << order->exchange_ts << "\n";
             
             recorder.log_quote(*order, (stream.side == "BUY") ? "BID" : "ASK", "REJECTED");
-
-            open_orders.erase(order->client_oid);
-        }
-
-        // -------------------------
-        // EXPIRED - FOR EXPIRED_IN_MATCH, IF EXCHANGE LAGS BEHIND NEW QUOTES
-        // -------------------------
-        else if(stream.exec_type == "EXPIRED"){
-            
-            order->status = "EXPIRED";
-            state.reset_queue_ahead(stream.side, order->price_tick);
-            state.last_order_update = *order;
-
-            cout << "- EXPIRED LIMIT ORDER - client_oid: " << order->client_oid << 
-            ", status: " << order->status << ", timestamp: " << order->exchange_ts << "\n";
-
-            recorder.log_quote(*order, (stream.side == "BUY") ? "BID" : "ASK", "EXPIRED");
-
-            open_orders.erase(order->client_oid);
         }
 
         // -------------------------
         // TRADE
         // -------------------------
         else if(stream.exec_type == "TRADE"){
+            {
+                lock_guard<mutex> lock(orders_mtx);
                 
-            // if(toxicity_model){
-            //     ToxicityPrediction p;
-                    // p.ts = stream.exchange_ts;
-                // //p.ts = state.last_depth_ts;   // or ts, but be consistent with your system clock
-            //     p.horizon_ms = toxicity_model->horizon_ms;
+                // if(toxicity_model){
+                //     ToxicityPrediction p;
+                        // p.ts = stream.exchange_ts;
+                    // //p.ts = state.last_depth_ts;   // or ts, but be consistent with your system clock
+                //     p.horizon_ms = toxicity_model->horizon_ms;
 
-            //     p.pred = order.last_signal.cached_toxicity_pred;  // IMPORTANT: computed at quote time
-            //     p.fill_price = fill_price;
+                //     p.pred = order.last_signal.cached_toxicity_pred;  // IMPORTANT: computed at quote time
+                //     p.fill_price = fill_price;
 
-            //     p.side = (side == "BUY") ? +1 : -1;
+                //     p.side = (side == "BUY") ? +1 : -1;
 
-            //     state.market_feature_state.toxicity_predictions.push_back(move(p));
-            // }
+                //     state.market_feature_state.toxicity_predictions.push_back(move(p));
+                // }
 
-            state.on_fill(stream.fill_price, stream.fill_qty, stream.side, true);
-            
-            if(stream.status == "PARTIALLY_FILLED"){
-                order->status = "PARTIALLY_FILLED";
-                order->remaining -= stream.fill_qty;
+                state.on_fill(stream.fill_price, stream.fill_qty, stream.side, "maker");
 
-                cout << "- PARTIALLY FILLED LIMIT ORDER - client_oid: " << order->client_oid << 
-            ", status: " << order->status << ", timestamp: " << order->exchange_ts << "\n";
+                if(stream.status == "PARTIALLY_FILLED"){
+                    order->status = "PARTIALLY_FILLED";
+                    order->remaining -= stream.fill_qty;
+                }
+
+                else if(stream.status == "FILLED"){
+                    order->status = "FILLED";
+                    order->remaining = 0.0;
+                    open_orders.erase(order->client_oid);
+                    state.reset_queue_ahead(stream.side, order->price_tick);
+                }
+
+                state.last_order_update = order;
             }
 
-            else if(stream.status == "FILLED"){
-                order->status = "FILLED";
-                order->remaining = 0.0;
-                state.reset_queue_ahead(stream.side, order->price_tick);
-
-                cout << "- FILLED LIMIT ORDER - client_oid: " << order->client_oid << 
+            cout << "- FILLED / PARTIALLY FILLED LIMIT ORDER - client_oid: " << order->client_oid << 
             ", status: " << order->status << ", timestamp: " << order->exchange_ts << "\n";
-            }
-     
-            state.last_order_update = *order;
 
             if(stream.order_type == "MARKET"){
-                orderMarketToString(order, stream);
+                cout << format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
+                    order->side, stream.fill_price, stream.fill_qty, order->status) << "\n";
                 recorder.log_fill(*order, stream.fill_qty, false);
             }
             else recorder.log_fill(*order, stream.fill_qty, true);
-       
-            if(stream.status == "FILLED") open_orders.erase(order->client_oid);
         }
+
+        on_stream_event();
     }
 };
 
@@ -1301,83 +1339,157 @@ public:
     State& state;
     LiveExecution& execution;
     BinanceBroker& broker;
-    ExecutionEventQueue& execution_event;
     DatasetRecorder& recorder;
 
     simdjson::ondemand::parser parser;
     
-    atomic<bool> running{false};
     atomic<bool> connected{false};
-    thread stream_thread;
+    thread userstream_thread;
+    atomic<bool> running{false};
 
     mutex connection_mtx;
     condition_variable connection_cv;
 
-    BinanceUserStream(State& state, LiveExecution& execution, BinanceBroker& broker, ExecutionEventQueue& execution_event, DatasetRecorder& recorder)
-        : state(state), execution(execution), broker(broker), execution_event(execution_event), recorder(recorder) {}
+    BinanceUserStream(State& state, LiveExecution& execution,
+                      BinanceBroker& broker, DatasetRecorder& recorder)
+        : state(state), execution(execution), broker(broker), recorder(recorder) {}
 
     void start(){
         running = true;
-        stream_thread = thread([this](){run();});
-        wait_until_connected();
+        userstream_thread = thread([this](){run();});
     }
 
     void wait_until_connected(){
         unique_lock<mutex> lock(connection_mtx);
-        connection_cv.wait(lock, [this]{return connected.load();});
+
+        connection_cv.wait(lock, [this]{
+            return connected.load();
+        });
     }
 
     void run(){
-        broker.start_user_stream();
+        try{
+            broker.start_user_stream();
 
-        asio::io_context ioc;
-        ssl::context ctx(ssl::context::tlsv12_client);
-        ctx.set_default_verify_paths();
+            asio::io_context ioc;
+            ssl::context ctx(ssl::context::tlsv12_client);
+            ctx.set_default_verify_paths();
 
-        tcp::resolver resolver(ioc);
-        auto results = resolver.resolve("stream.binancefuture.com", "443");
-        
-        // -------------------------
-        // STEP 1: TCP SOCKET
-        // -------------------------
-        tcp::socket socket(ioc);
-        asio::connect(socket, results);
+            tcp::resolver resolver(ioc);
+            auto results = resolver.resolve("stream.binancefuture.com", "443");
+            
+            // -------------------------
+            // STEP 1: TCP SOCKET
+            // -------------------------
+            tcp::socket socket(ioc);
+            asio::connect(socket, results);
 
-        // -------------------------
-        // STEP 2: TLS LAYER
-        // -------------------------
-        ssl_stream ssl_sock(move(socket), ctx);
-        SSL_set_tlsext_host_name(ssl_sock.native_handle(), "stream.binancefuture.com");
-        ssl_sock.handshake(ssl::stream_base::client);
+            // -------------------------
+            // STEP 2: TLS LAYER
+            // -------------------------
+            ssl_stream ssl_sock(move(socket), ctx);
+            SSL_set_tlsext_host_name(ssl_sock.native_handle(), "stream.binancefuture.com");
+            ssl_sock.handshake(ssl::stream_base::client);
 
-        // -------------------------
-        // STEP 3: WEBSOCKET LAYER
-        // -------------------------
-        ws_stream ws(move(ssl_sock));
-        ws.handshake("stream.binancefuture.com", "/ws/" + broker.listen_key);
+            // -------------------------
+            // STEP 3: WEBSOCKET LAYER
+            // -------------------------
+            ws_stream ws(move(ssl_sock));
+            ws.handshake("stream.binancefuture.com", "/ws/" + broker.listen_key);
 
-        {
-            lock_guard<mutex> lock(connection_mtx);
-            connected = true;
+            {
+                lock_guard<mutex> lock(connection_mtx);
+                connected = true;
+            }
+
+            connection_cv.notify_one();
+
+            beast::flat_buffer buffer;
+  
+            while(running){
+                ws.read(buffer);
+                std_string msg = beast::buffers_to_string(buffer.data());
+                buffer.consume(buffer.size()); // NEW
+
+                on_message(msg);
+            }
         }
-        connection_cv.notify_one();
-
-        beast::flat_buffer buffer;
-
-        while(running){
-            ws.read(buffer);
-            std_string msg = beast::buffers_to_string(buffer.data());
-            buffer.consume(buffer.size()); // NEW
-
-            on_message(msg);
+        catch(const exception& e){
+            cout << "User stream error: " << e.what() << "\n";
         }
+        connected = false;
     }
+
+    // void run(){ //polling wait for
+    //     try{
+    //         broker.start_user_stream();
+    //         cout << "userstream started0...\n";
+    //         asio::io_context ioc;
+    //         ssl::context ctx(ssl::context::tlsv12_client);
+    //         ctx.set_default_verify_paths();
+
+    //         tcp::resolver resolver(ioc);
+    //         auto results = resolver.resolve("stream.binancefuture.com", "443");
+            
+    //         // -------------------------
+    //         // STEP 1: TCP SOCKET
+    //         // -------------------------
+    //         tcp::socket socket(ioc);
+    //         asio::connect(socket, results);
+
+    //         // -------------------------
+    //         // STEP 2: TLS LAYER
+    //         // -------------------------
+    //         ssl_stream ssl_sock(move(socket), ctx);
+    //         SSL_set_tlsext_host_name(ssl_sock.native_handle(), "stream.binancefuture.com");
+    //         ssl_sock.handshake(ssl::stream_base::client);
+
+    //         // -------------------------
+    //         // STEP 3: WEBSOCKET LAYER
+    //         // -------------------------
+    //         ws_stream ws(move(ssl_sock));
+    //         ws.handshake("stream.binancefuture.com", "/ws/" + broker.listen_key);
+
+    //         connected = true;
+    //         beast::flat_buffer buffer;
+  
+    //         while(running){
+    //             ws.read(buffer);
+    //             std_string msg = beast::buffers_to_string(buffer.data());
+    //             buffer.consume(buffer.size()); // NEW
+
+    //             on_message(msg);
+    //         }
+    //     }
+    //     catch(const exception& e){
+    //         cout << "User stream error: " << e.what() << "\n";
+    //     }
+    //     connected = false;
+    // }
 
     void stop(){
         running = false;
 
-        if(stream_thread.joinable()) stream_thread.join();
+        if(userstream_thread.joinable())
+            userstream_thread.join();
     }
+
+    // void start(){
+    //     std_string listen_key = broker.start_user_stream();
+    //     std_string url = "wss://stream.binancefuture.com/ws/" + listen_key;
+
+    //     websocketpp::client<websocketpp::config::asio_client> client;
+    //     client.init_asio();
+    //     client.set_message_handler([this](auto hdl, auto msg){on_message(msg->get_payload());});
+
+    //     websocketpp::lib::error_code ec;
+    //     auto conn = client.get_connection(url, ec);
+    //     client.connect(conn);
+
+    //     thread([&](){client.run();}).detach(); // SOLVE THIS USING THREAD
+
+    //     connected = true;
+    // }
 
     void on_message(const std_string& msg){
         simdjson::padded_string json(msg);
@@ -1400,10 +1512,7 @@ public:
         stream.fill_qty = double(o["l"].get_double_in_string());
         stream.exchange_ts = uint64_t(o["T"]);
 
-        ExecutionEvent ev;
-        ev.type = ExecutionEventType::STREAM_UPDATE;
-        ev.stream = stream;
-        execution_event.push(ev);
+        execution.apply_stream_update(stream);
     }
 };
 
@@ -1414,41 +1523,25 @@ public:
     State& state;
     MarketMakingStrategy& strategy;
     Execution& execution;
-    ExecutionEventQueue& execution_event;
-    EventNotifier& dashboard_event;
-    SnapshotStore& snapshot_store;
     DatasetRecorder& recorder;
 
+    EventNotifier& execution_event;
+    EventNotifier& dashboard_event;
     std_string header;
 
     atomic<bool> running{false};
-    
-    Engine(MarketConfig& config, State& state, MarketMakingStrategy& strategy, Execution& execution, ExecutionEventQueue& execution_event,
-            EventNotifier& dashboard_event, SnapshotStore& snapshot_store, DatasetRecorder& recorder, const json& params)
-        : config(config), state(state), strategy(strategy), execution(execution), execution_event(execution_event),
-        dashboard_event(dashboard_event), snapshot_store(snapshot_store), recorder(recorder), params(params) {build_header();}
 
-    void process_event(const ExecutionEvent& ev){
-        switch(ev.type){
-            case ExecutionEventType::TRADE_UPDATE:
-                on_trade_event(ev.trade);
-                break;
-
-            case ExecutionEventType::DEPTH_UPDATE_SPOT:
-                on_depth_event_spot(ev.depth);
-                break;
-            
-            case ExecutionEventType::DEPTH_UPDATE_FUTURES:
-                on_depth_event_futures(ev.depth);
-                break;
-
-            case ExecutionEventType::STREAM_UPDATE:
-                on_stream_event(ev.stream);
-                break;
+    Engine(MarketConfig& config, State& state, MarketMakingStrategy& strategy, Execution& execution,
+            DatasetRecorder& recorder, EventNotifier& execution_event, EventNotifier& dashboard_event, const json& params)
+        : config(config), state(state), strategy(strategy), execution(execution), recorder(recorder),
+        execution_event(execution_event), dashboard_event(dashboard_event), params(params)
+        {
+            build_header();
         }
 
-        Snapshot snap = build_snapshot();
-        snapshot_store.set(move(snap));
+    void on_trade_event(const Trade& trade){
+        recorder.log_trade(trade);
+        execution.process_trade(trade);
 
         {
             lock_guard<mutex> lock(dashboard_event.signal_mtx);
@@ -1457,267 +1550,54 @@ public:
         dashboard_event.signal_cv.notify_one();
     }
 
-    void process_event_latency(const ExecutionEvent& ev){
-        switch(ev.type){
-            case ExecutionEventType::TRADE_UPDATE:
-                cout << "trade_event\n";
-                on_trade_event(ev.trade);
-                break;
-
-            case ExecutionEventType::DEPTH_UPDATE_SPOT:
-                cout << "depth_event\n";
-                on_depth_event_spot_latency(ev.depth);
-                break;
-            
-            case ExecutionEventType::DEPTH_UPDATE_FUTURES:
-                cout << "depth_event\n";
-                on_depth_event_futures_latency(ev.depth);
-                break;
-        }
-    }
-
-    void on_trade_event(const Trade& trade){
-        state.last_trade = trade;
-        state.last_trade_ts = trade.ts;
-        state.trade_latency = trade.latency;
-
-        recorder.log_trade(trade);
-        execution.process_trade(trade);
-    }
-
-    void on_depth_event_spot(const Depth& depth){
-        // -------------------------
-        // LIVE PROCESSING
-        // -------------------------
-        state.last_depth_ts = depth.ts;
-        state.depth_latency = depth.latency;
-        
-        auto& book = state.market_book;
-
-        // -----------------------------
-        // DROP OLD EVENTS
-        // -----------------------------
-        if(depth.u <= book.last_update_id) return;
-
-        // -----------------------------
-        // GAP DETECTION
-        // -----------------------------
-        if(depth.U > book.last_update_id + 1){
-            cout << "GAP DETECTED expected " << book.last_update_id + 1 << " got " << depth.U << "\n";
-            state.initialized = false;
-            return;
-        }
-
-        // -----------------------------
-        // APPLY DELTA (FAST LOCK ONLY)
-        // -----------------------------
-        {
-            lock_guard<recursive_mutex> lock(book.mtx);
-            state.update_queue_from_depth(depth);
-            book.apply_delta(depth);
-            book.last_update_id = depth.u;
-        }
-
-        // -----------------------------
-        // HEAVY FEATURES OUTSIDE LOCK (IMPORTANT)
-        // -----------------------------
-        state.update_vol();
-        state.compute_order_imbalance();
-        state.update_market_feature_state();
-        state.update_residual_realization();
-        state.update_performance();
-        // state.update_toxicity_realization();
-
-        // -----------------------------
-        // STRATEGY ONLY AFTER INIT
-        // -----------------------------
+    void on_depth_event(){
         if(!state.initialized) return;
 
         Signal signal = strategy.generate_quotes(state);
         recorder.log_snapshot(signal, execution.get_avg_latency());
-        state.last_signal = signal;
-        execution.place_quotes(signal);
-    }
 
-    void on_depth_event_futures(const Depth& depth){
-        // -------------------------
-        // LIVE PROCESSING
-        // -------------------------
-        state.last_depth_ts = depth.ts;
-        state.depth_latency = depth.latency;
-        
-        auto& book = state.market_book;
-
-        // -----------------------------
-        // DROP OLD EVENTS
-        // -----------------------------
-        if(depth.u <= book.last_update_id) return;
-
-        // -----------------------------
-        // GAP DETECTION
-        // -----------------------------
-        if(depth.pu != book.last_update_id){
-            cout << "GAP DETECTED expected " << book.last_update_id << " got " << depth.pu << "\n";
-            state.initialized = false;
-            return;
-        }
-
-        // -----------------------------
-        // APPLY DELTA (FAST LOCK ONLY)
-        // -----------------------------
         {
-            lock_guard<recursive_mutex> lock(book.mtx);
-            state.update_queue_from_depth(depth);
-            book.apply_delta(depth);
-            book.last_update_id = depth.u;
+            lock_guard<mutex> lock(execution_event.signal_mtx);
+            state.last_signal = signal;
+            execution_event.signal_pending = true;
         }
 
-        // -----------------------------
-        // HEAVY FEATURES OUTSIDE LOCK (IMPORTANT)
-        // -----------------------------
-        state.update_vol();
-        state.compute_order_imbalance();
-        state.update_market_feature_state();
-        state.update_residual_realization();
-        state.update_performance();
-        // state.update_toxicity_realization();
-
-        // -----------------------------
-        // STRATEGY ONLY AFTER INIT
-        // -----------------------------
-        if(!state.initialized) return;
-
-        Signal signal = strategy.generate_quotes(state);
-        recorder.log_snapshot(signal, execution.get_avg_latency());
-        state.last_signal = signal;
-        execution.place_quotes(signal);
-    }
-
-    void on_depth_event_spot_latency(const Depth& depth){
-        // -------------------------
-        // LIVE PROCESSING
-        // -------------------------
-        state.last_depth_ts = depth.ts;
-        state.depth_latency = depth.latency;
-        
-        auto& book = state.market_book;
-
-        // -----------------------------
-        // DROP OLD EVENTS
-        // -----------------------------
-        if(depth.u <= book.last_update_id) return;
-
-        // -----------------------------
-        // GAP DETECTION
-        // -----------------------------
-        if(depth.U > book.last_update_id + 1){
-            cout << "GAP DETECTED expected " << book.last_update_id + 1 << " got " << depth.U << "\n";
-            state.initialized = false;
-            return;
-        }
-
-        // -----------------------------
-        // APPLY DELTA (FAST LOCK ONLY)
-        // -----------------------------
         {
-            lock_guard<recursive_mutex> lock(book.mtx);
-            state.update_queue_from_depth(depth);
-            book.apply_delta(depth);
-            book.last_update_id = depth.u;
+            lock_guard<mutex> lock(dashboard_event.signal_mtx);
+            dashboard_event.signal_pending = true;
         }
 
-        // -----------------------------
-        // HEAVY FEATURES OUTSIDE LOCK (IMPORTANT)
-        // -----------------------------
-        state.update_vol();
-        state.compute_order_imbalance();
-        state.update_market_feature_state();
-        state.update_residual_realization();
-        state.update_performance();
-        // state.update_toxicity_realization();
-
-        // -----------------------------
-        // STRATEGY ONLY AFTER INIT
-        // -----------------------------
-        if(!state.initialized) return;
-
-        Signal signal = strategy.generate_quotes(state);
-        recorder.log_snapshot(signal, execution.get_avg_latency());
-        state.last_signal = signal;
-        execution.place_quotes_latency(signal);
+        execution_event.signal_cv.notify_one();
+        dashboard_event.signal_cv.notify_one();
+        // cout << "signal sending, locking..., ts: " << signal.ts << "\n";
     }
 
-    void on_depth_event_futures_latency(const Depth& depth){
-        // -------------------------
-        // LIVE PROCESSING
-        // -------------------------
-        state.last_depth_ts = depth.ts;
-        state.depth_latency = depth.latency;
-        
-        auto& book = state.market_book;
-
-        // -----------------------------
-        // DROP OLD EVENTS
-        // -----------------------------
-        if(depth.u <= book.last_update_id) return;
-
-        // -----------------------------
-        // GAP DETECTION
-        // -----------------------------
-        if(depth.pu != book.last_update_id){
-            cout << "GAP DETECTED expected " << book.last_update_id << " got " << depth.pu << "\n";
-            state.initialized = false;
-            return;
-        }
-
-        // -----------------------------
-        // APPLY DELTA (FAST LOCK ONLY)
-        // -----------------------------
+    void on_stream_event(){
         {
-            lock_guard<recursive_mutex> lock(book.mtx);
-            state.update_queue_from_depth(depth);
-            book.apply_delta(depth);
-            book.last_update_id = depth.u;
+            lock_guard<mutex> lock(execution_event.signal_mtx);
+            execution_event.signal_pending = true;
         }
 
-        // -----------------------------
-        // HEAVY FEATURES OUTSIDE LOCK (IMPORTANT)
-        // -----------------------------
-        state.update_vol();
-        state.compute_order_imbalance();
-        state.update_market_feature_state();
-        state.update_residual_realization();
-        state.update_performance();
-        // state.update_toxicity_realization();
-
-        // -----------------------------
-        // STRATEGY ONLY AFTER INIT
-        // -----------------------------
-        if(!state.initialized) return;
-
-        Signal signal = strategy.generate_quotes(state);
-        recorder.log_snapshot(signal, execution.get_avg_latency());
-        state.last_signal = signal;
-        execution.place_quotes_latency(signal);
-    }
-
-    void on_stream_event(const Stream& stream){
-        execution.apply_stream_update(stream);
-        execution.place_quotes(*state.last_signal);
+        {
+            lock_guard<mutex> lock(dashboard_event.signal_mtx);
+            dashboard_event.signal_pending = true;
+        }
+        execution_event.signal_cv.notify_one();
+        dashboard_event.signal_cv.notify_one();
     }
 
     std_string tradeToString(const optional<Trade>& trade){
         return trade ? format("{:<5} | {:>10.4f} | {:>8.6f}", trade->side, trade->price, trade->qty) : "—";
     }
 
-    std_string orderPointerToString(Order* order){
+    std_string orderOptionalToString(const optional<Order>& order){
         return order ? format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
-            order->side, config.from_tick(order->price_tick), order->remaining, order->status) : "—";
+            order->side, config.from_tick(order->price_tick), order->qty, order->status) : "—";
     }
 
-    std_string orderToString(const optional<Order>& order){
+    std_string orderSharedToString(const shared_ptr<Order>& order){
         return order ? format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
-            order->side, config.from_tick(order->price_tick), order->remaining, order->status) : "—";
+            order->side, config.from_tick(order->price_tick), order->qty, order->status) : "—";
     }
 
     Snapshot build_snapshot(){
@@ -1781,11 +1661,11 @@ public:
         snap.execution.bid_pressure = bid_queue / (bid_size + 1e-9);
         snap.execution.ask_pressure = ask_queue / (ask_size + 1e-9);
 
-        snap.execution.buy_order = orderPointerToString(execution.get_open_order("BUY"));
-        snap.execution.sell_order = orderPointerToString(execution.get_open_order("SELL"));
-        snap.execution.last_fill_candidate = orderToString(state.last_fill_candidate);
-        snap.execution.last_order_update = orderToString(state.last_order_update);
-        
+        snap.execution.buy_order = orderOptionalToString(execution.get_open_order_snapshot("BUY"));
+        snap.execution.sell_order = orderOptionalToString(execution.get_open_order_snapshot("SELL"));
+        snap.execution.last_fill_candidate = orderSharedToString(state.last_fill_candidate);
+        snap.execution.last_order_update = orderSharedToString(state.last_order_update);
+
         snap.risk.inventory = state.inventory;
         snap.risk.realized_pnl = state.realized_pnl;
         snap.risk.unrealized_pnl = state.get_unrealized_pnl(mid);
@@ -1831,8 +1711,8 @@ public:
     MarketMakingStrategy strategy;
     DatasetRecorder recorder;
 
-    ExecutionEventQueue execution_event;
     EventNotifier dashboard_event;
+    EventNotifier execution_event;
     SnapshotStore snapshot_store;
     DashboardTerminal dashboard_terminal;
     DashboardServer dashboard_server;
@@ -1858,33 +1738,41 @@ public:
         if(mode == "live"){
             broker = make_unique<BinanceBroker>(config, params);
             execution = make_unique<LiveExecution>(config, state, recorder, *broker, params);
-            user_stream = make_unique<BinanceUserStream>(state, *dynamic_cast<LiveExecution*>(execution.get()), *broker, execution_event, recorder);
         }
         
         else if(mode != "live"){
             execution = make_unique<PaperExecution>(config, state, recorder, params);
         }
 
-        engine = make_unique<Engine>(config, state, strategy, *execution, execution_event, dashboard_event, snapshot_store, recorder, params);
+        engine = make_unique<Engine>(config, state, strategy, *execution, recorder, execution_event, dashboard_event, params);
+
+        if(mode == "live"){
+            auto live_execution = dynamic_cast<LiveExecution*>(execution.get());
+            auto on_stream_event = [this]() {engine->on_stream_event();};
+            live_execution->set_on_stream_event([this]() {engine->on_stream_event();});
+            user_stream = make_unique<BinanceUserStream>(state, *live_execution, *broker, recorder);
+        }
 
         std_string exchange = params["exchange"].get<std_string>();
+        auto on_trade_event = [this](const Trade& trade) {engine->on_trade_event(trade);};
+        auto on_depth_event = [this]() {engine->on_depth_event();};
         auto log_event = [this](const std_string& type, const uint64_t& ts, const std_string& msg) {recorder.log_event(type, ts, msg);};
         auto log_orderbook_snapshot = [this](const json& snapshot) {recorder.log_orderbook_snapshot(snapshot);};
         
         if(exchange == "binance_spot" && mode != "replay"){
-            feed = make_unique<BinanceSpotFeed>(config, state, execution_event, log_event, log_orderbook_snapshot, params);
+            feed = make_unique<BinanceSpotFeed>(config, state, on_trade_event, on_depth_event, log_event, log_orderbook_snapshot, params);
         }
 
-        if(exchange == "binance_futures" && mode != "replay"){
-            feed = make_unique<BinanceFuturesFeed>(config, state, execution_event, log_event, log_orderbook_snapshot, params);
+        else if(exchange == "binance_futures" && mode != "replay"){
+            feed = make_unique<BinanceFuturesFeed>(config, state, on_trade_event, on_depth_event, log_event, log_orderbook_snapshot, params);
         }
 
         else if(exchange == "binance_spot" && mode == "replay"){
-            feed = make_unique<BinanceSpotReplayFeed>(config, state, execution_event, log_event, log_orderbook_snapshot, params);
+            feed = make_unique<BinanceSpotReplayFeed>(config, state, on_trade_event, on_depth_event, log_event, log_orderbook_snapshot, params);
         }
 
         else if(exchange == "binance_futures" && mode == "replay"){
-            feed = make_unique<BinanceFuturesReplayFeed>(config, state, execution_event, log_event, log_orderbook_snapshot, params);
+            feed = make_unique<BinanceFuturesReplayFeed>(config, state, on_trade_event, on_depth_event, log_event, log_orderbook_snapshot, params);
         }
     }
 
@@ -1897,7 +1785,14 @@ public:
 
         feed->start();
 
-        if(user_stream) user_stream->start();
+        if(user_stream){
+            user_stream->start();
+            user_stream->wait_until_connected();
+        }
+
+        // while (!user_stream->connected) {
+        //     this_thread::sleep_for(milliseconds(10));
+        // }
 
         start_dashboard_loop();
 
@@ -1929,6 +1824,9 @@ public:
                     dashboard_event.signal_pending = false;
                 }
 
+                Snapshot snap = engine->build_snapshot();
+                snapshot_store.set(snap);
+
                 // dashboard_terminal.refresh();
                 dashboard_server.publish();
                 // cout << "dashboard signal received, unlocking... ts: " << snap.system.last_depth_ts << "\n";
@@ -1939,11 +1837,20 @@ public:
     void start_execution_loop(){
         threads.emplace_back([this](){
             while(engine_running){
-                ExecutionEvent ev;
+                Signal signal;
+                
+                {
+                    unique_lock<mutex> lock(execution_event.signal_mtx);
+                    execution_event.signal_cv.wait(lock, [this]{
+                        return execution_event.signal_pending || !engine_running;});
 
-                if(!execution_event.pop(ev, engine_running)) break;
+                    if(!engine_running) break;
 
-                engine->process_event(ev);
+                    signal = *state.last_signal;
+                    execution_event.signal_pending = false;
+                }
+                execution->place_quotes(signal);
+                // cout << "execution signal received, unlocking... ts: " << signal.ts << "\n";
             }
         });
     }
@@ -1951,28 +1858,28 @@ public:
     void start_execution_latency_loop(){ //polling driven
         threads.emplace_back([this](){
             while(engine_running){
-                ExecutionEvent ev;
-                bool state_changed = false;
+                Signal signal;
+                bool has_signal = false;
 
-                if(execution_event.pop_timeout(ev, engine_running, 1ms)){
-                    engine->process_event_latency(ev);
-                    state_changed = true;
-                }
+                {
+                    unique_lock<mutex> lock(execution_event.signal_mtx);
+                    execution_event.signal_cv.wait_for(lock, milliseconds(1), [this]{
+                        return execution_event.signal_pending || !engine_running;});
 
-                if(execution->process_latency_queue()){
-                    state_changed = true;
-                }
+                    if(!engine_running) break;
 
-                if(state_changed){
-                    Snapshot snap = engine->build_snapshot();
-                    snapshot_store.set(move(snap));
-
-                    {
-                        lock_guard<mutex> lock(dashboard_event.signal_mtx);
-                        dashboard_event.signal_pending = true;
+                    if(execution_event.signal_pending){
+                        signal = *state.last_signal;
+                        execution_event.signal_pending = false;
+                        has_signal = true;
                     }
-                    dashboard_event.signal_cv.notify_one();
                 }
+
+                // 1. Put new event quote into latency queue
+                if(has_signal) execution->place_quotes_latency(signal);
+
+                // 2. Execute orders whose latency expired
+                execution->process_latency_queue();
             }
         });
     }
@@ -2032,6 +1939,8 @@ int main(){
         cerr << "curl init failed: " << curl_easy_strerror(rc) << endl;
         return 1;
     }
+
+    cout << curl_version() << endl;
 
     // std_string path = "D:\\OneDrive\\Trading\\manifest_live.json";
     std_string path = "D:\\OneDrive\\Trading\\manifest_replay.json";

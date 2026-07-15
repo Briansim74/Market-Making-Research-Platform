@@ -16,6 +16,23 @@
                 "UNICODE",
                 "_UNICODE"
             ]
+        },
+        {
+            "name": "MINGW64 Zenbook",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "C:/Program Files (x86)/msys64/mingw64/include",
+                "C:/Program Files (x86)/msys64/usr/include"
+            ],
+            "compilerPath": "C:/Program Files (x86)/msys64/mingw64/bin/g++.exe",
+            "cppStandard": "c++23",
+            "cStandard": "c17",
+            "intelliSenseMode": "windows-gcc-x64",
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE"
+            ]
         }
     ],
     "version": 4

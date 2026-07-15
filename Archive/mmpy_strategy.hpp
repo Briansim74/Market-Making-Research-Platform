@@ -35,17 +35,11 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_io.hpp>
-#include <boost/uuid/random_generator.hpp>
-
 #include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
 #include <xgboost/c_api.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
@@ -744,8 +738,8 @@ public:
             ask = best_ask + tick;
         }
 
-        bid = config.normalize_bid(bid);
-        ask = config.normalize_ask(ask);
+        bid = config.round_price(bid);
+        ask = config.round_price(ask);
 
         double bid_delta = abs(best_bid - state.mfs.prev_best_bid);
         double ask_delta = abs(best_ask - state.mfs.prev_best_ask);

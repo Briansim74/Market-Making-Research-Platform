@@ -301,8 +301,18 @@ export default function Dashboard() {
           />
 
           <Row
-            label="Latency"
-            value={sys.latency_ms}
+            label="Trade Latency"
+            value={sys.trade_latency}
+          />
+
+          <Row
+            label="Depth Latency"
+            value={sys.depth_latency}
+          />
+
+          <Row
+            label="Ack Latency"
+            value={sys.ack_latency}
           />
 
         </tbody>

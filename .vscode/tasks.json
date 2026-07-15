@@ -42,6 +42,24 @@
 		"problemMatcher": []
 		},
 		{
+		"label": "Build mmpy with MSVC Zenbook",
+		"type": "shell",
+		"command": "C:\\Users\\brian\\OneDrive\\Trading\\Market Making\\build\\build_msvc_zenbook.bat",
+		"args": [
+			"${file}"
+		],
+		"options": {
+			"shell": {
+			"executable": "C:\\Windows\\System32\\cmd.exe",
+			"args": ["/d", "/c"]
+			}
+		},
+		"group": {
+			"kind": "build"
+		},
+		"problemMatcher": []
+		},
+		{
 			"type": "cppbuild",
 			"label": "Build with g++ Zenbook",
 			"command": "C:\\Program Files (x86)\\msys64\\mingw64\\bin\\g++.exe",
