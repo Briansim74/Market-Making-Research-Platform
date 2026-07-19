@@ -32,6 +32,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast.hpp>
+#include <boost/beast/http.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
@@ -39,7 +40,6 @@
 #include <boost/uuid/uuid_io.hpp>
 #include <boost/uuid/random_generator.hpp>
 
-#include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
@@ -72,10 +72,11 @@ using namespace std::chrono;
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
+namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
 using tcp = asio::ip::tcp;
-using ssl_stream = boost::asio::ssl::stream<tcp::socket>;
+using ssl_stream = asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
 
 class State {
@@ -108,20 +109,20 @@ public:
     unordered_map<std_string, unordered_map<int64_t, double>> queue_flow;
     unordered_map<std_string, unordered_map<int64_t, double>> my_queue_position;
     unordered_map<std_string, unordered_map<int64_t, deque<Trade>>> trade_buckets;
-    uint64_t trade_flow_window_ms = 1000; // for trade flow buckets
+    int64_t trade_flow_window_ms = 1000; // for trade flow buckets
 
     double dt = 0.0;
-    uint64_t last_fill_match_ts = 0;
+    int64_t last_fill_match_ts = 0;
 
     optional<Trade> last_trade;
     optional<Order> last_fill_candidate;
     optional<Order> last_order_update;
 
-    uint64_t last_trade_ts = 0;
-    uint64_t last_depth_ts = 0;
-    uint64_t trade_latency = 0;
-    uint64_t depth_latency = 0;
-    uint64_t ack_latency = 0;
+    int64_t last_trade_ts = 0;
+    int64_t last_depth_ts = 0;
+    int64_t trade_latency = 0;
+    int64_t depth_latency = 0;
+    int64_t exchange_latency = 0;
 
     bool initialized = false;
 
@@ -395,7 +396,7 @@ public:
     }
 
     // void update_toxicity_realization(){
-    //     uint64_t now = std::max(last_depth_ts, last_trade_ts);
+    //     int64_t now = std::max(last_depth_ts, last_trade_ts);
     //     while(!mfs.toxicity_predictions.empty() && 
     //     now - mfs.toxicity_predictions.front().ts >= mfs.toxicity_predictions.front().horizon_ms){
             

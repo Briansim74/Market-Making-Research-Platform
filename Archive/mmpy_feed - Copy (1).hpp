@@ -32,7 +32,6 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast.hpp>
-#include <boost/beast/http.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
@@ -40,6 +39,7 @@
 #include <boost/uuid/uuid_io.hpp>
 #include <boost/uuid/random_generator.hpp>
 
+#include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
@@ -61,7 +61,10 @@
 #include "mmpy_structs.hpp" //structs
 #include "mmpy_config_orderbook.hpp" //market config & orderbook
 #include "mmpy_state.hpp" //state & market_feature_state
+
 #include "mmpy_clock.hpp" // clock
+
+#include <boost/beast/http.hpp>
 
 using std::cout;
 using json = nlohmann::json;
@@ -74,12 +77,13 @@ using namespace std::chrono;
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
-namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
 using tcp = asio::ip::tcp;
-using ssl_stream = asio::ssl::stream<tcp::socket>;
+using ssl_stream = boost::asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
+
+namespace http = boost::beast::http;
 
 class Feed {
 public:
@@ -94,10 +98,10 @@ public:
     State& state;
     ExecutionEventQueue& execution_event;
     BinanceClock& clock;
-    // std_string instrument;
-    // std_string instrument_upper;
+    std_string instrument;
+    std_string instrument_upper;
 
-    function<void(const std_string&, const int64_t&, const std_string&)> log_event;
+    function<void(const std_string&, const uint64_t&, const std_string&)> log_event;
     function<void(const json&)> log_orderbook_snapshot;
 
     thread depth_thread;
@@ -113,14 +117,14 @@ public:
     atomic<bool> first_depth_received{false};
 
     BinanceSpotFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event, BinanceClock& clock,
-                    function<void(const std_string&, const int64_t&, const std_string&)> log_event,
+                    function<void(const std_string&, const uint64_t&, const std_string&)> log_event,
                     function<void(const json&)> log_orderbook_snapshot, const json& params):
                     config(config), state(state), execution_event(execution_event), clock(clock), log_event(move(log_event)),
                     log_orderbook_snapshot(move(log_orderbook_snapshot))
                     {
-                        // instrument = params["instrument"].get<std_string>();
-                        // instrument_upper = params["instrument"].get<std_string>();
-                        // transform(instrument_upper.begin(), instrument_upper.end(), instrument_upper.begin(), [](unsigned char c){return toupper(c);});
+                        instrument = params["instrument"].get<std_string>();
+                        instrument_upper = params["instrument"].get<std_string>();
+                        transform(instrument_upper.begin(), instrument_upper.end(), instrument_upper.begin(), [](unsigned char c){return toupper(c);});
                     }
 
     void parse_book(simdjson::ondemand::object obj, Depth& entry){
@@ -150,7 +154,7 @@ public:
         ctx.set_default_verify_paths();
 
         tcp::resolver resolver(ioc);
-        auto results = resolver.resolve(config.hostname, "443");
+        auto results = resolver.resolve("stream.binance.com", "443");
 
         // -------------------------
         // STEP 1: TCP SOCKET
@@ -162,14 +166,14 @@ public:
         // STEP 2: TLS LAYER
         // -------------------------
         ssl_stream ssl_sock(move(socket), ctx);
-        SSL_set_tlsext_host_name(ssl_sock.native_handle(), config.hostname.c_str());
+        SSL_set_tlsext_host_name(ssl_sock.native_handle(), "stream.binance.com");
         ssl_sock.handshake(ssl::stream_base::client);
 
         // -------------------------
         // STEP 3: WEBSOCKET LAYER
         // -------------------------
         ws_stream ws(move(ssl_sock));
-        ws.handshake(config.hostname, "/ws/" + config.instrument + "@trade");
+        ws.handshake("stream.binance.com", "/ws/" + instrument + "@trade");
 
         beast::flat_buffer buffer;
         simdjson::ondemand::parser parser;
@@ -189,11 +193,11 @@ public:
             auto doc = parser.iterate(json);
 
             Trade trade;
-            trade.ts = int64_t(doc["T"]);
+            trade.ts = uint64_t(doc["T"]);
             trade.side  = bool(doc["m"]) ? "SELL" : "BUY";
             trade.price = double(doc["p"].get_double_in_string());
             trade.qty   = double(doc["q"].get_double_in_string());
-            trade.latency = clock.compute_feed_latency(clock.now_ms(), trade.ts);
+            trade.latency = clock.compute_feed_latency(trade.ts);
 
             log_event("trade", trade.ts, msg);
 
@@ -210,7 +214,7 @@ public:
         ctx.set_default_verify_paths();
 
         tcp::resolver resolver(ioc);
-        auto results = resolver.resolve(config.hostname, "443");
+        auto results = resolver.resolve("stream.binance.com", "443");
 
         // -------------------------
         // STEP 1: TCP SOCKET
@@ -222,14 +226,14 @@ public:
         // STEP 2: TLS LAYER
         // -------------------------
         ssl_stream ssl_sock(move(socket), ctx);
-        SSL_set_tlsext_host_name(ssl_sock.native_handle(), config.hostname.c_str());
+        SSL_set_tlsext_host_name(ssl_sock.native_handle(), "stream.binance.com");
         ssl_sock.handshake(ssl::stream_base::client);
 
         // -------------------------
         // STEP 3: WEBSOCKET LAYER
         // -------------------------
         ws_stream ws(move(ssl_sock));
-        ws.handshake(config.hostname, "/ws/" + config.instrument + "@depth@100ms");
+        ws.handshake("stream.binance.com", "/ws/" + instrument + "@depth@100ms");
 
         beast::flat_buffer buffer;
         simdjson::ondemand::parser parser;
@@ -249,10 +253,10 @@ public:
             auto doc = parser.iterate(json);
 
             Depth depth;
-            depth.ts = int64_t(doc["E"]);
-            depth.U = int64_t(doc["U"]);
-            depth.u = int64_t(doc["u"]);
-            depth.latency = clock.compute_feed_latency(clock.now_ms(), depth.ts);
+            depth.ts = uint64_t(doc["E"]);
+            depth.U = uint64_t(doc["U"]);
+            depth.u = uint64_t(doc["u"]);
+            depth.latency = clock.compute_feed_latency(depth.ts);
             parse_book(doc.get_object(), depth);
 
             first_depth_received = true;
@@ -293,7 +297,7 @@ public:
             cv.wait_for(lock, 5s, [&]{ return first_depth_received.load(); });
         }
 
-        auto [snapshot_id, snapshot] = state.market_book.initialize_from_binance(config.instrument_upper, 1000);
+        auto [snapshot_id, snapshot] = state.market_book.initialize_from_binance(instrument_upper, 1000);
 
         log_orderbook_snapshot(snapshot);
 
@@ -372,10 +376,10 @@ public:
     State& state;
     ExecutionEventQueue& execution_event;
     BinanceClock& clock;
-    // std_string instrument;
-    // std_string instrument_upper;
+    std_string instrument;
+    std_string instrument_upper;
 
-    function<void(const std_string&, const int64_t&, const std_string&)> log_event;
+    function<void(const std_string&, const uint64_t&, const std_string&)> log_event;
     function<void(const json&)> log_orderbook_snapshot;
 
     thread depth_thread;
@@ -391,14 +395,14 @@ public:
     atomic<bool> first_depth_received{false};
 
     BinanceFuturesFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event, BinanceClock& clock,
-                    function<void(const std_string&, const int64_t&, const std_string&)> log_event,
+                    function<void(const std_string&, const uint64_t&, const std_string&)> log_event,
                     function<void(const json&)> log_orderbook_snapshot, const json& params):
                     config(config), state(state), execution_event(execution_event), clock(clock), log_event(move(log_event)),
                     log_orderbook_snapshot(move(log_orderbook_snapshot))
                     {
-                        // instrument = params["instrument"].get<std_string>();
-                        // instrument_upper = params["instrument"].get<std_string>();
-                        // transform(instrument_upper.begin(), instrument_upper.end(), instrument_upper.begin(), [](unsigned char c){return toupper(c);});
+                        instrument = params["instrument"].get<std_string>();
+                        instrument_upper = params["instrument"].get<std_string>();
+                        transform(instrument_upper.begin(), instrument_upper.end(), instrument_upper.begin(), [](unsigned char c){return toupper(c);});
                     }
 
     void parse_book(simdjson::ondemand::object obj, Depth& entry){
@@ -428,7 +432,7 @@ public:
         ctx.set_default_verify_paths();
 
         tcp::resolver resolver(ioc);
-        auto results = resolver.resolve(config.hostname, "443");
+        auto results = resolver.resolve("stream.binancefuture.com", "443");
 
         // -------------------------
         // STEP 1: TCP SOCKET
@@ -440,14 +444,14 @@ public:
         // STEP 2: TLS LAYER
         // -------------------------
         ssl_stream ssl_sock(move(socket), ctx);
-        SSL_set_tlsext_host_name(ssl_sock.native_handle(), config.hostname.c_str());
+        SSL_set_tlsext_host_name(ssl_sock.native_handle(), "stream.binancefuture.com");
         ssl_sock.handshake(ssl::stream_base::client);
 
         // -------------------------
         // STEP 3: WEBSOCKET LAYER
         // -------------------------
         ws_stream ws(move(ssl_sock));
-        ws.handshake(config.hostname, "/ws/" + config.instrument + "@trade");
+        ws.handshake("stream.binancefuture.com", "/ws/" + instrument + "@trade");
 
         beast::flat_buffer buffer;
         simdjson::ondemand::parser parser;
@@ -467,11 +471,11 @@ public:
             auto doc = parser.iterate(json);
 
             Trade trade;
-            trade.ts = int64_t(doc["T"]);
+            trade.ts = uint64_t(doc["T"]);
             trade.side  = bool(doc["m"]) ? "SELL" : "BUY";
             trade.price = double(doc["p"].get_double_in_string());
             trade.qty   = double(doc["q"].get_double_in_string());
-            trade.latency = clock.compute_feed_latency(clock.now_ms(), trade.ts);
+            trade.latency = clock.compute_feed_latency(trade.ts);
 
             log_event("trade", trade.ts, msg);
 
@@ -488,7 +492,7 @@ public:
         ctx.set_default_verify_paths();
 
         tcp::resolver resolver(ioc);
-        auto results = resolver.resolve(config.hostname, "443");
+        auto results = resolver.resolve("stream.binancefuture.com", "443");
 
         // -------------------------
         // STEP 1: TCP SOCKET
@@ -500,14 +504,14 @@ public:
         // STEP 2: TLS LAYER
         // -------------------------
         ssl_stream ssl_sock(move(socket), ctx);
-        SSL_set_tlsext_host_name(ssl_sock.native_handle(), config.hostname.c_str());
+        SSL_set_tlsext_host_name(ssl_sock.native_handle(), "stream.binancefuture.com");
         ssl_sock.handshake(ssl::stream_base::client);
 
         // -------------------------
         // STEP 3: WEBSOCKET LAYER
         // -------------------------
         ws_stream ws(move(ssl_sock));
-        ws.handshake(config.hostname, "/ws/" + config.instrument + "@depth@100ms");
+        ws.handshake("stream.binancefuture.com", "/ws/" + instrument + "@depth@100ms");
 
         beast::flat_buffer buffer;
         simdjson::ondemand::parser parser;
@@ -527,11 +531,11 @@ public:
             auto doc = parser.iterate(json);
 
             Depth depth;
-            depth.ts = int64_t(doc["E"]);
-            depth.pu = int64_t(doc["pu"]);
-            depth.U = int64_t(doc["U"]);
-            depth.u = int64_t(doc["u"]);
-            depth.latency = clock.compute_feed_latency(clock.now_ms(), depth.ts);
+            depth.ts = uint64_t(doc["E"]);
+            depth.pu = uint64_t(doc["pu"]);
+            depth.U = uint64_t(doc["U"]);
+            depth.u = uint64_t(doc["u"]);
+            depth.latency = clock.compute_feed_latency(depth.ts);
             parse_book(doc.get_object(), depth);
 
             first_depth_received = true;
@@ -572,7 +576,7 @@ public:
             cv.wait_for(lock, 5s, [&]{ return first_depth_received.load(); });
         }
 
-        auto [snapshot_id, snapshot] = state.market_book.initialize_from_binance(config.instrument_upper, 1000);
+        auto [snapshot_id, snapshot] = state.market_book.initialize_from_binance(instrument_upper, 1000);
 
         log_orderbook_snapshot(snapshot);
 
@@ -646,569 +650,6 @@ public:
         cout << "BINANCE FEED STOPPED\n";
     }
 };
-
-
-// class BinanceSpotFeed : public Feed {
-// public:
-//     MarketConfig& config;
-//     State& state;
-//     ExecutionEventQueue& execution_event;
-//     BinanceClock& clock;
-//     std_string instrument;
-//     std_string instrument_upper;
-
-//     function<void(const std_string&, const int64_t&, const std_string&)> log_event;
-//     function<void(const json&)> log_orderbook_snapshot;
-
-//     thread depth_thread;
-//     thread trade_thread;
-
-//     mutex cv_mtx; //condition variable lock
-//     mutex buffer_mtx;
-//     condition_variable cv;
-//     vector<Depth> depth_buffer;
-
-//     atomic<bool> running{false};
-//     atomic<bool> buffering{true};
-//     atomic<bool> first_depth_received{false};
-
-//     deque<int64_t> latency_window;
-//     int64_t latency_sum = 0;
-
-//     BinanceSpotFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event, BinanceClock& clock,
-//                     function<void(const std_string&, const int64_t&, const std_string&)> log_event,
-//                     function<void(const json&)> log_orderbook_snapshot, const json& params):
-//                     config(config), state(state), execution_event(execution_event), clock(clock), log_event(move(log_event)),
-//                     log_orderbook_snapshot(move(log_orderbook_snapshot))
-//                     {
-//                         instrument = params["instrument"].get<std_string>();
-//                         instrument_upper = params["instrument"].get<std_string>();
-//                         transform(instrument_upper.begin(), instrument_upper.end(), instrument_upper.begin(), [](unsigned char c){return toupper(c);});
-//                     }
-
-//     void parse_book(simdjson::ondemand::object obj, Depth& entry){
-
-//         for(auto b: obj["b"]){
-//             auto arr = b.get_array();
-
-//             double p = double(arr.at(0).get_double_in_string());
-//             double q = double(arr.at(1).get_double_in_string());
-
-//             entry.bid_delta.emplace_back(config.to_tick(p), q);
-//         }
-
-//         for(auto a: obj["a"]){
-//             auto arr = a.get_array();
-
-//             double p = double(arr.at(0).get_double_in_string());
-//             double q = double(arr.at(1).get_double_in_string());
-
-//             entry.ask_delta.emplace_back(config.to_tick(p), q);
-//         }
-//     }
-
-//     void trade_loop(){
-//         asio::io_context ioc;
-//         ssl::context ctx(ssl::context::tlsv12_client);
-//         ctx.set_default_verify_paths();
-
-//         tcp::resolver resolver(ioc);
-//         auto results = resolver.resolve("stream.binance.com", "443");
-
-//         // -------------------------
-//         // STEP 1: TCP SOCKET
-//         // -------------------------
-//         tcp::socket socket(ioc);
-//         asio::connect(socket, results);
-
-//         // -------------------------
-//         // STEP 2: TLS LAYER
-//         // -------------------------
-//         ssl_stream ssl_sock(move(socket), ctx);
-//         SSL_set_tlsext_host_name(ssl_sock.native_handle(), "stream.binance.com");
-//         ssl_sock.handshake(ssl::stream_base::client);
-
-//         // -------------------------
-//         // STEP 3: WEBSOCKET LAYER
-//         // -------------------------
-//         ws_stream ws(move(ssl_sock));
-//         ws.handshake("stream.binance.com", "/ws/" + instrument + "@trade");
-
-//         beast::flat_buffer buffer;
-//         simdjson::ondemand::parser parser;
-
-//         while(running){
-//             boost::system::error_code ec;
-//             ws.read(buffer, ec);
-//             if(ec){
-//                 cout << "TRADE WS ERROR: " << ec.message() << endl;
-//                 break;
-//             }
-
-//             std_string msg = beast::buffers_to_string(buffer.data());
-//             buffer.consume(buffer.size());
-
-//             simdjson::padded_string json(msg);
-//             auto doc = parser.iterate(json);
-
-//             Trade trade;
-//             trade.ts = int64_t(doc["T"]);
-//             trade.side  = bool(doc["m"]) ? "SELL" : "BUY";
-//             trade.price = double(doc["p"].get_double_in_string());
-//             trade.qty   = double(doc["q"].get_double_in_string());
-//             trade.latency = clock.compute_feed_latency(clock.now_ms(), trade.ts);
-
-//             log_event("trade", trade.ts, msg);
-
-//             ExecutionEvent ev;
-//             ev.type = ExecutionEventType::TRADE_UPDATE;
-//             ev.trade = trade;
-//             execution_event.push(ev);
-//         }
-//     }
-
-//     void depth_loop(){
-//         asio::io_context ioc;
-//         ssl::context ctx(ssl::context::tlsv12_client);
-//         ctx.set_default_verify_paths();
-
-//         tcp::resolver resolver(ioc);
-//         auto results = resolver.resolve("stream.binance.com", "443");
-
-//         // -------------------------
-//         // STEP 1: TCP SOCKET
-//         // -------------------------
-//         tcp::socket socket(ioc);
-//         asio::connect(socket, results);
-
-//         // -------------------------
-//         // STEP 2: TLS LAYER
-//         // -------------------------
-//         ssl_stream ssl_sock(move(socket), ctx);
-//         SSL_set_tlsext_host_name(ssl_sock.native_handle(), "stream.binance.com");
-//         ssl_sock.handshake(ssl::stream_base::client);
-
-//         // -------------------------
-//         // STEP 3: WEBSOCKET LAYER
-//         // -------------------------
-//         ws_stream ws(move(ssl_sock));
-//         ws.handshake("stream.binance.com", "/ws/" + instrument + "@depth@100ms");
-
-//         beast::flat_buffer buffer;
-//         simdjson::ondemand::parser parser;
-
-//         while(running){
-//             boost::system::error_code ec;
-//             ws.read(buffer, ec);
-//             if(ec){
-//                 cout << "DEPTH WS ERROR: " << ec.message() << endl;
-//                 break;
-//             }
-
-//             std_string msg = beast::buffers_to_string(buffer.data());
-//             buffer.consume(buffer.size());
-
-//             simdjson::padded_string json(msg);
-//             auto doc = parser.iterate(json);
-
-//             Depth depth;
-//             depth.ts = int64_t(doc["E"]);
-//             depth.U = int64_t(doc["U"]);
-//             depth.u = int64_t(doc["u"]);
-//             depth.latency = clock.compute_feed_latency(clock.now_ms(), depth.ts);
-//             parse_book(doc.get_object(), depth);
-
-//             first_depth_received = true;
-//             cv.notify_all();
-
-//             log_event("depth", depth.ts, msg);
-
-//             {
-//                 lock_guard<mutex> lock(buffer_mtx);
-//                 if(buffering){
-//                     depth_buffer.push_back(depth);
-//                     continue;
-//                 }
-//             }
-            
-//             ExecutionEvent ev;
-//             ev.type = ExecutionEventType::DEPTH_UPDATE_SPOT;
-//             ev.depth = depth;
-//             execution_event.push(ev);
-//         }
-//     }
-
-//     void start() override {
-//         running = true;
-//         buffering = true;
-
-//         depth_buffer.clear();
-//         first_depth_received = false;
-
-//         trade_thread = thread(&BinanceSpotFeed::trade_loop, this);
-//         depth_thread = thread(&BinanceSpotFeed::depth_loop, this);
-
-//         cout << "LIVE SPOT SOCKETS STARTED\n";
-
-//         // wait for first message
-//         {
-//             unique_lock<mutex> lock(cv_mtx);
-//             cv.wait_for(lock, 5s, [&]{ return first_depth_received.load(); });
-//         }
-
-//         auto [snapshot_id, snapshot] = state.market_book.initialize_from_binance(instrument_upper, 1000);
-
-//         log_orderbook_snapshot(snapshot);
-
-//         // -------------------------
-//         // WAIT FOR STREAM ALIGNMENT (YOUR GATE FIX)
-//         // -------------------------
-//         bool valid = false;
-
-//         for(int i = 0; i < 500; i++){
-//             {
-//                 lock_guard<mutex> lock(buffer_mtx);
-
-//                 if(!depth_buffer.empty() && depth_buffer.back().u > snapshot_id){
-//                     valid = true;
-//                     break;
-//                 }
-//             }
-//             this_thread::sleep_for(milliseconds(10));
-//         }
-
-//         if(!valid) throw runtime_error("Stream not aligned (no post-snapshot events)");
-        
-//         vector<Depth> buffered;
-//         {
-//             lock_guard lock(buffer_mtx);
-//             buffered = depth_buffer;   // copy, don't swap
-//         }
-        
-//         sort(buffered.begin(), buffered.end(), [](const auto& a, const auto& b) {return a.U < b.U;});
-
-//         auto it = find_if(buffered.begin(), buffered.end(), [&](const Depth& d){
-//             return d.U <= snapshot_id + 1 && snapshot_id + 1 <= d.u;});
-
-//         if(it == buffered.end()) throw runtime_error("Couldn't synchronize order book");
-        
-//         // -------------------------
-//         // APPLY REPLAY
-//         // -------------------------
-//         for(; it != buffered.end(); ++it){
-//             cout << "BUFFER U: " << it->U << " snapshot_id + 1: " << snapshot_id + 1 << " u: " << it->u << "\n";
-
-//             state.market_book.apply_delta(*it);
-//             state.market_book.last_update_id = it->u;
-//             state.update_vol();
-//         }
-
-//         cout << "BOOK SYNCHRONIZED\n";
-        
-//         // -------------------------
-//         // LIVE MODE
-//         // -------------------------
-//         {
-//             lock_guard<mutex> lock(buffer_mtx);
-//             buffering = false;
-//         }
-//         state.initialized = true;
-
-//         cout << "LIVE BOOK RUNNING\n";
-//     }
-
-//     void stop() override {
-//         cout << "STOPPING BINANCE FEED\n";
-
-//         running = false;
-
-//         if(trade_thread.joinable()) trade_thread.join();
-//         if(depth_thread.joinable()) depth_thread.join();
-
-//         cout << "BINANCE FEED STOPPED\n";
-//     }
-// };
-
-// class BinanceFuturesFeed : public Feed {
-// public:
-//     MarketConfig& config;
-//     State& state;
-//     ExecutionEventQueue& execution_event;
-//     BinanceClock& clock;
-//     std_string instrument;
-//     std_string instrument_upper;
-
-//     function<void(const std_string&, const int64_t&, const std_string&)> log_event;
-//     function<void(const json&)> log_orderbook_snapshot;
-
-//     thread depth_thread;
-//     thread trade_thread;
-
-//     mutex cv_mtx; //condition variable lock
-//     mutex buffer_mtx;
-//     condition_variable cv;
-//     vector<Depth> depth_buffer;
-
-//     atomic<bool> running{false};
-//     atomic<bool> buffering{true};
-//     atomic<bool> first_depth_received{false};
-
-//     BinanceFuturesFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event, BinanceClock& clock,
-//                     function<void(const std_string&, const int64_t&, const std_string&)> log_event,
-//                     function<void(const json&)> log_orderbook_snapshot, const json& params):
-//                     config(config), state(state), execution_event(execution_event), clock(clock), log_event(move(log_event)),
-//                     log_orderbook_snapshot(move(log_orderbook_snapshot))
-//                     {
-//                         instrument = params["instrument"].get<std_string>();
-//                         instrument_upper = params["instrument"].get<std_string>();
-//                         transform(instrument_upper.begin(), instrument_upper.end(), instrument_upper.begin(), [](unsigned char c){return toupper(c);});
-//                     }
-
-//     void parse_book(simdjson::ondemand::object obj, Depth& entry){
-
-//         for(auto b: obj["b"]){
-//             auto arr = b.get_array();
-
-//             double p = double(arr.at(0).get_double_in_string());
-//             double q = double(arr.at(1).get_double_in_string());
-
-//             entry.bid_delta.emplace_back(config.to_tick(p), q);
-//         }
-
-//         for(auto a: obj["a"]){
-//             auto arr = a.get_array();
-
-//             double p = double(arr.at(0).get_double_in_string());
-//             double q = double(arr.at(1).get_double_in_string());
-
-//             entry.ask_delta.emplace_back(config.to_tick(p), q);
-//         }
-//     }
-
-//     void trade_loop(){
-//         asio::io_context ioc;
-//         ssl::context ctx(ssl::context::tlsv12_client);
-//         ctx.set_default_verify_paths();
-
-//         tcp::resolver resolver(ioc);
-//         auto results = resolver.resolve("stream.binancefuture.com", "443");
-
-//         // -------------------------
-//         // STEP 1: TCP SOCKET
-//         // -------------------------
-//         tcp::socket socket(ioc);
-//         asio::connect(socket, results);
-
-//         // -------------------------
-//         // STEP 2: TLS LAYER
-//         // -------------------------
-//         ssl_stream ssl_sock(move(socket), ctx);
-//         SSL_set_tlsext_host_name(ssl_sock.native_handle(), "stream.binancefuture.com");
-//         ssl_sock.handshake(ssl::stream_base::client);
-
-//         // -------------------------
-//         // STEP 3: WEBSOCKET LAYER
-//         // -------------------------
-//         ws_stream ws(move(ssl_sock));
-//         ws.handshake("stream.binancefuture.com", "/ws/" + instrument + "@trade");
-
-//         beast::flat_buffer buffer;
-//         simdjson::ondemand::parser parser;
-
-//         while(running){
-//             boost::system::error_code ec;
-//             ws.read(buffer, ec);
-//             if(ec){
-//                 cout << "TRADE WS ERROR: " << ec.message() << endl;
-//                 break;
-//             }
-
-//             std_string msg = beast::buffers_to_string(buffer.data());
-//             buffer.consume(buffer.size());
-
-//             simdjson::padded_string json(msg);
-//             auto doc = parser.iterate(json);
-
-//             Trade trade;
-//             trade.ts = int64_t(doc["T"]);
-//             trade.side  = bool(doc["m"]) ? "SELL" : "BUY";
-//             trade.price = double(doc["p"].get_double_in_string());
-//             trade.qty   = double(doc["q"].get_double_in_string());
-//             trade.latency = clock.compute_feed_latency(clock.now_ms(), trade.ts);
-
-//             log_event("trade", trade.ts, msg);
-
-//             ExecutionEvent ev;
-//             ev.type = ExecutionEventType::TRADE_UPDATE;
-//             ev.trade = trade;
-//             execution_event.push(ev);
-//         }
-//     }
-
-//     void depth_loop(){
-//         asio::io_context ioc;
-//         ssl::context ctx(ssl::context::tlsv12_client);
-//         ctx.set_default_verify_paths();
-
-//         tcp::resolver resolver(ioc);
-//         auto results = resolver.resolve("stream.binancefuture.com", "443");
-
-//         // -------------------------
-//         // STEP 1: TCP SOCKET
-//         // -------------------------
-//         tcp::socket socket(ioc);
-//         asio::connect(socket, results);
-
-//         // -------------------------
-//         // STEP 2: TLS LAYER
-//         // -------------------------
-//         ssl_stream ssl_sock(move(socket), ctx);
-//         SSL_set_tlsext_host_name(ssl_sock.native_handle(), "stream.binancefuture.com");
-//         ssl_sock.handshake(ssl::stream_base::client);
-
-//         // -------------------------
-//         // STEP 3: WEBSOCKET LAYER
-//         // -------------------------
-//         ws_stream ws(move(ssl_sock));
-//         ws.handshake("stream.binancefuture.com", "/ws/" + instrument + "@depth@100ms");
-
-//         beast::flat_buffer buffer;
-//         simdjson::ondemand::parser parser;
-
-//         while(running){
-//             boost::system::error_code ec;
-//             ws.read(buffer, ec);
-//             if(ec){
-//                 cout << "DEPTH WS ERROR: " << ec.message() << endl;
-//                 break;
-//             }
-
-//             std_string msg = beast::buffers_to_string(buffer.data());
-//             buffer.consume(buffer.size());
-
-//             simdjson::padded_string json(msg);
-//             auto doc = parser.iterate(json);
-
-//             Depth depth;
-//             depth.ts = int64_t(doc["E"]);
-//             depth.pu = int64_t(doc["pu"]);
-//             depth.U = int64_t(doc["U"]);
-//             depth.u = int64_t(doc["u"]);
-//             depth.latency = clock.compute_feed_latency(clock.now_ms(), depth.ts);
-//             parse_book(doc.get_object(), depth);
-
-//             first_depth_received = true;
-//             cv.notify_all();
-
-//             log_event("depth", depth.ts, msg);
-
-//             {
-//                 lock_guard<mutex> lock(buffer_mtx);
-//                 if(buffering){
-//                     depth_buffer.push_back(depth);
-//                     continue;
-//                 }
-//             }
-
-//             ExecutionEvent ev;
-//             ev.type = ExecutionEventType::DEPTH_UPDATE_FUTURES;
-//             ev.depth = depth;
-//             execution_event.push(ev);
-//         }
-//     }
-
-//     void start() override {
-//         running = true;
-//         buffering = true;
-
-//         depth_buffer.clear();
-//         first_depth_received = false;
-
-//         trade_thread = thread(&BinanceFuturesFeed::trade_loop, this);
-//         depth_thread = thread(&BinanceFuturesFeed::depth_loop, this);
-
-//         cout << "LIVE FUTURES SOCKETS STARTED\n";
-
-//         // wait for first message
-//         {
-//             unique_lock<mutex> lock(cv_mtx);
-//             cv.wait_for(lock, 5s, [&]{ return first_depth_received.load(); });
-//         }
-
-//         auto [snapshot_id, snapshot] = state.market_book.initialize_from_binance(instrument_upper, 1000);
-
-//         log_orderbook_snapshot(snapshot);
-
-//         // -------------------------
-//         // WAIT FOR STREAM ALIGNMENT (YOUR GATE FIX)
-//         // -------------------------
-//         bool valid = false;
-
-//         for(int i = 0; i < 500; i++){
-//             {
-//                 lock_guard<mutex> lock(buffer_mtx);
-//                 if(!depth_buffer.empty() && depth_buffer.back().u > snapshot_id){
-//                     valid = true;
-//                     break;
-//                 }
-//             }
-//             this_thread::sleep_for(milliseconds(10));
-//         }
-
-//         if(!valid) throw runtime_error("Stream not aligned (no post-snapshot events)");
-
-//         vector<Depth> buffered;
-//         {
-//             lock_guard lock(buffer_mtx);
-//             buffered = depth_buffer;   // copy, don't swap
-//         }
-        
-//         sort(buffered.begin(), buffered.end(), [](const auto& a, const auto& b) {return a.U < b.U;});
-
-//         auto it = find_if(buffered.begin(), buffered.end(), [&](const Depth& d){
-//             return d.U <= snapshot_id && snapshot_id <= d.u;});
-
-//         if(it == buffered.end()) throw runtime_error("Couldn't synchronize order book");
-
-//         // -------------------------
-//         // APPLY REPLAY
-//         // -------------------------
-//         for(; it != buffered.end(); ++it){
-//             cout << "BUFFER pu: " << it->pu << " U: " << it->U << " snapshot_id: "<< snapshot_id << " u: " << it->u << '\n';
-
-//             state.market_book.apply_delta(*it);
-//             state.market_book.last_update_id = it->u;
-//             state.update_vol();
-//         }
-
-//         cout << "BOOK SYNCHRONIZED\n";
-        
-//         // -------------------------
-//         // LIVE MODE
-//         // -------------------------
-//         {
-//             lock_guard<mutex> lock(buffer_mtx);
-//             buffering = false;
-//         }
-//         state.initialized = true;
-
-//         cout << "LIVE BOOK RUNNING\n";
-//     }
-
-//     // =========================
-//     // STOP
-//     // =========================
-//     void stop() override {
-//         cout << "STOPPING BINANCE FEED\n";
-
-//         running = false;
-
-//         if(trade_thread.joinable()) trade_thread.join();
-//         if(depth_thread.joinable()) depth_thread.join();
-
-//         cout << "BINANCE FEED STOPPED\n";
-//     }
-// };
 
 class BinanceSpotReplayFeed : public Feed {
 public:

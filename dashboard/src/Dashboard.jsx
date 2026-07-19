@@ -311,8 +311,8 @@ export default function Dashboard() {
           />
 
           <Row
-            label="Ack Latency"
-            value={sys.ack_latency}
+            label="Exchange Latency"
+            value={sys.exchange_latency}
           />
 
         </tbody>

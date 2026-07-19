@@ -32,6 +32,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast.hpp>
+#include <boost/beast/http.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
@@ -39,7 +40,6 @@
 #include <boost/uuid/uuid_io.hpp>
 #include <boost/uuid/random_generator.hpp>
 
-#include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
@@ -73,10 +73,11 @@ using namespace std::chrono;
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
+namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
 using tcp = asio::ip::tcp;
-using ssl_stream = boost::asio::ssl::stream<tcp::socket>;
+using ssl_stream = asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
 
 class RegimeModel {
@@ -86,7 +87,7 @@ public:
 
     std_string model_name;
     std_string target;
-    uint64_t horizon_ms;
+    int64_t horizon_ms;
 
     Mat means;
     vector<Mat> cov_inv;
@@ -115,7 +116,7 @@ public:
     RegimeModel(const json& artifact){
         model_name = artifact["model_name"].get<std_string>();
         target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<uint64_t>();
+        horizon_ms = artifact["horizon_ms"].get<int64_t>();
 
         means = artifact["means"].get<Mat>();
         cov_inv = artifact["cov_inv"].get<vector<Mat>>();
@@ -218,7 +219,7 @@ class MicroSignalModel {
 public:
     std_string model_name;
     std_string target;
-    uint64_t horizon_ms;
+    int64_t horizon_ms;
 
     double intercept;
     double beta;
@@ -228,7 +229,7 @@ public:
     MicroSignalModel(const json& artifact){
         model_name = artifact["model_name"].get<std_string>();
         target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<uint64_t>();
+        horizon_ms = artifact["horizon_ms"].get<int64_t>();
         intercept = artifact["intercept"].get<double>();
         beta = artifact["beta"].get<double>();
         ic = artifact["ic"].get<double>();
@@ -249,7 +250,7 @@ class ResidualModel {
 public:
     std_string model_name;
     std_string target;
-    uint64_t horizon_ms;
+    int64_t horizon_ms;
 
     BoosterHandle booster;
     vector<std_string> feature_cols;
@@ -266,7 +267,7 @@ public:
 
         model_name = artifact["model_name"].get<std_string>();
         target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<uint64_t>();
+        horizon_ms = artifact["horizon_ms"].get<int64_t>();
         feature_cols = artifact["feature_cols"].get<vector<std_string>>();
         D = artifact["feature_dim"].get<int>();
 
@@ -317,7 +318,7 @@ class ToxicityModel {
 public:
     std_string model_name;
     std_string target;
-    uint64_t horizon_ms;
+    int64_t horizon_ms;
 
     BoosterHandle booster;
     vector<std_string> feature_cols;
@@ -334,7 +335,7 @@ public:
 
         model_name = artifact["model_name"].get<std_string>();
         target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<uint64_t>();
+        horizon_ms = artifact["horizon_ms"].get<int64_t>();
         feature_cols = artifact["feature_cols"].get<vector<std_string>>();
         D = artifact["feature_dim"].get<int>();
         
@@ -385,7 +386,6 @@ class MarketMakingStrategy {
 public:
     MarketConfig& config;
     const json& params;
-    double gamma;
     std_string folder_path;
 
     // Models
@@ -397,7 +397,7 @@ public:
 
     MarketMakingStrategy(MarketConfig& config, const json& params)
         : config(config), params(params){
-        gamma = params["gamma"].get<double>();
+        
         folder_path = params["folder_path"].get<std_string>();
 
         struct_model = params["models"]["struct_model"].get<std_string>();
@@ -500,7 +500,7 @@ public:
 
         double effective_inventory = state.inventory - policy.inventory_target;
         
-        return -effective_inventory * gamma * sigma * mid;
+        return -effective_inventory * config.gamma * sigma * mid;
     }
 
     double compute_signal_quality(const auto& log){
@@ -754,6 +754,7 @@ public:
         signal.ts = state.last_depth_ts;
         signal.trade_latency = state.trade_latency;
         signal.depth_latency = state.depth_latency;
+        signal.exchange_latency = state.exchange_latency;
         signal.mid = features.mid;
         signal.microprice = features.microprice;
         signal.microprice_dev = features.microprice_dev;

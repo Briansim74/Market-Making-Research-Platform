@@ -32,6 +32,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast.hpp>
+#include <boost/beast/http.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
@@ -39,7 +40,6 @@
 #include <boost/uuid/uuid_io.hpp>
 #include <boost/uuid/random_generator.hpp>
 
-#include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
@@ -71,6 +71,7 @@ using namespace std::chrono;
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
+namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
 using tcp = asio::ip::tcp;
@@ -237,7 +238,6 @@ public:
                 row_text("", "")
             });
 
-
             auto signals = vbox({
                 row_title("SIGNALS", ""),
                 row_text("Spread Multiplier", format("{:<15.4f}", snap.signals.spread_multiplier)),
@@ -292,7 +292,7 @@ public:
                 row_text("Last Depth ts", snap.system.last_depth_ts),
                 row_text("Trade Latency", format("{:<10}", snap.system.trade_latency)),
                 row_text("Depth Latency", format("{:<10}", snap.system.depth_latency)),
-                row_text("Ack Latency", format("{:<10}", snap.system.ack_latency)),
+                row_text("Exchange Latency", format("{:<10}", snap.system.exchange_latency)),
                 row_text("", "")
             });
 
@@ -343,7 +343,7 @@ class DashboardServer {
 public:
     SnapshotStore& snapshot_store; 
     std_string host;
-    uint16_t port; 
+    int16_t port; 
 
     boost::asio::io_context ioc; 
     tcp::acceptor acceptor; 
@@ -359,7 +359,7 @@ public:
     : snapshot_store(snapshot_store), acceptor(ioc), guard(boost::asio::make_work_guard(ioc)) 
     { 
         host = params["server_config"]["host"].get<std_string>(); 
-        port = params["server_config"]["port"].get<uint16_t>(); 
+        port = params["server_config"]["port"].get<int16_t>(); 
     }
 
     void start() { 
@@ -492,7 +492,7 @@ public:
                 {"last_depth_ts", snap.system.last_depth_ts},
                 {"trade_latency", snap.system.trade_latency},
                 {"depth_latency", snap.system.depth_latency},
-                {"ack_latency", snap.system.ack_latency},
+                {"exchange_latency", snap.system.exchange_latency},
             }}
         };
     }

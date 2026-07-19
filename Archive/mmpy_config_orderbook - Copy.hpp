@@ -32,7 +32,6 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast.hpp>
-#include <boost/beast/http.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
@@ -40,6 +39,7 @@
 #include <boost/uuid/uuid_io.hpp>
 #include <boost/uuid/random_generator.hpp>
 
+#include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
@@ -71,11 +71,10 @@ using namespace std::chrono;
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
-namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
 using tcp = asio::ip::tcp;
-using ssl_stream = asio::ssl::stream<tcp::socket>;
+using ssl_stream = boost::asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
 
 // =========================
@@ -83,30 +82,17 @@ using ws_stream  = websocket::stream<ssl_stream>;
 // =========================
 class MarketConfig {
 public:
-    std_string exchange;
-    std_string market;
-    std_string mode;
-
-    std_string instrument;
-    std_string instrument_upper;
-
-    int64_t exchange_latency;
-    double gamma;
-    double base_size;
-    double max_inv;
-
     double tick_size = 0.0;
     double step_size = 0.0;
     size_t price_precision = 0;
     size_t qty_precision = 0;
 
-    std_string api_key;
-    std_string api_secret;
     std_string base_url;
     std_string endpoint;
-    std_string hostname;
 
-    MarketConfig(const json& params) {load_filters(params);}
+    MarketConfig(const json& params){
+        load_filters(params);
+    }
 
     int get_precision(double step){
         int precision = 0;
@@ -119,46 +105,38 @@ public:
     }
 
     void load_filters(const json& params){
-        exchange = params["exchange"].get<std_string>();
-        market = params["market"].get<std_string>();
-        mode = params["mode"].get<std_string>();
+        if(params["exchange_new"].get<std_string>() == "binance" && params["market"].get<std_string>() == "spot"){
+            tick_size = params["tick_size"].get<double>();
+            step_size = params["step_size"].get<double>();
+            price_precision = get_precision(tick_size);
+            qty_precision   = get_precision(step_size);
+            cout << "Exchange: " << params["exchange_new"].get<std_string>() + "_" + params["market"].get<std_string>() << "\n";
+            cout << "tick_size: " << tick_size << ", price_precision: " << price_precision << "\n";
+            cout << "step_size: " << step_size << ", qty_precision: " << qty_precision << "\n";
+            return;
+        }
 
-        instrument = params["instrument"].get<std_string>();
-        instrument_upper = instrument;
-        transform(instrument_upper.begin(), instrument_upper.end(), instrument_upper.begin(), [](unsigned char c){return toupper(c);});
+        std_string instrument = params["instrument"].get<std_string>();
+        transform(instrument.begin(), instrument.end(), instrument.begin(), [](unsigned char c){return toupper(c);});
 
-        exchange_latency = params["exchange_latency"].get<int64_t>();
-        gamma = params["gamma"].get<double>();
-        base_size = params["base_size"].get<double>();
-        max_inv = params["max_inv"].get<double>();
-
-        api_key = params["api"]["api_key"].get<std_string>();
-        api_secret = params["api"]["api_secret"].get<std_string>();
-        hostname = params["api"]["hostname_" + market].get<std_string>();
-        base_url = params["api"]["base_url_" + market].get<std_string>();
-        endpoint = params["api"]["endpoint_" + market].get<std_string>();
-        
-        cout << "Exchange: " << exchange + "_" + market << "\n";
-        cout << "market: " << market << " mode: " << mode << " exchange: " << exchange << "\n";
-        cout << "base_url: " << base_url << " hostname: " << hostname << "\n";
-
-        std_string url = "https://" + base_url + endpoint + "/exchangeInfo?symbol=" + instrument_upper;
-
+        std_string url = "https://" + params["api"]["base_url"].get<std_string>() + "/fapi/v1/exchangeInfo?symbol=" + instrument;
         auto r = cpr::Get(cpr::Url{url});
         auto data = json::parse(r.text);
+
+        cout << "Exchange: " << params["exchange_new"].get<std_string>() + "_" + params["market"].get<std_string>() << "\n";
         auto filters = data["symbols"][0]["filters"];
         
         for(auto& f: filters){
             if(f["filterType"] == "PRICE_FILTER"){
                 tick_size = stod(f["tickSize"].get<std_string>());
                 price_precision = get_precision(tick_size);
-                cout << "Tick_size: " << tick_size << ", Price_precision: " << price_precision << "\n";
+                cout << "tick_size: " << tick_size << ", price_precision: " << price_precision << "\n";
             }
 
             if(f["filterType"] == "LOT_SIZE"){
                 step_size = stod(f["stepSize"].get<std_string>());
                 qty_precision   = get_precision(step_size);
-                cout << "Step_size: " << step_size << ", Qty_precision: " << qty_precision << "\n";
+                cout << "step_size: " << step_size << ", qty_precision: " << qty_precision << "\n";
             }
         }
     }
@@ -191,6 +169,28 @@ public:
         return ceil(price / tick_size) * tick_size;
     }
 
+    uint64_t now_ms() const{
+        return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    }
+
+    int64_t now_ms_signed() const{
+        return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    }
+
+    uint64_t to_ms(double ts) const{
+        return static_cast<uint64_t>(ts * 1000.0);
+    }
+
+    std_string format_ms(int64_t ts_ms) const{
+        time_t t = ts_ms / 1000;
+        tm tm = *localtime(&t);
+
+        ostringstream oss;
+        oss << put_time(&tm, "%Y-%m-%d %H:%M:%S");
+
+        return oss.str();
+    }
+
     std_string format_ms_precise(int64_t ts_ms) const{
         time_t t = ts_ms / 1000;
         tm tm = *localtime(&t);
@@ -206,12 +206,10 @@ public:
 
 class OrderBook {
 public:
-    MarketConfig& config;
+    MarketConfig& config; // pointer to avoid copies
     const json& params;
-
     std::map<int64_t, double, greater<>> bids;
     std::map<int64_t, double> asks;
-
     int64_t last_update_id = 0;
     recursive_mutex mtx; //recursive mtx
     
@@ -240,8 +238,19 @@ public:
     }
 
     pair<int64_t, json> initialize_from_binance(const std_string& symbol, int limit){
+        
+        std_string url;
+        if(params["exchange"] == "binance_spot"){
+            url = "https://api.binance.com/api/v3/depth?symbol=" + symbol + "&limit=" + to_string(limit);
+        }
+        else if(params["exchange"] == "binance_futures"){
+            url = "https://testnet.binancefuture.com/fapi/v1/depth?symbol=" + symbol + "&limit=" + to_string(limit);
+        }
 
-        std_string url = "https://" + config.base_url + config.endpoint + "/depth?symbol=" + symbol + "&limit=" + to_string(limit);
+        // {
+        //     url = "https://" + params["api"]["base_url"].get<std_string>() + "/fapi/v1/exchangeInfo?symbol=" + instrument;
+
+        // }
 
         auto r = cpr::Get(cpr::Url{url});
         auto snapshot = json::parse(r.text);
@@ -251,6 +260,8 @@ public:
         for(auto& entry: snapshot["bids"]){
             double p = stod(entry[0].get_ref<const std_string&>());
             double q = stod(entry[1].get_ref<const std_string&>());
+            
+            //cout << "p: " << p << " q: " << q << "\n";
 
             bids[config.to_tick(p)] = q;
         }
@@ -258,6 +269,8 @@ public:
         for(auto& entry: snapshot["asks"]){
             double p = stod(entry[0].get_ref<const std_string&>());
             double q = stod(entry[1].get_ref<const std_string&>());
+
+            //cout << "p: " << p << " q: " << q << "\n";
 
             asks[config.to_tick(p)] = q;
         }

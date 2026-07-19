@@ -32,7 +32,6 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast.hpp>
-#include <boost/beast/http.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 
@@ -40,6 +39,7 @@
 #include <boost/uuid/uuid_io.hpp>
 #include <boost/uuid/random_generator.hpp>
 
+// #include <curl/curl.h>
 #include <cpr/cpr.h>
 #include "simdjson.h"
 #include <nlohmann/json.hpp>
@@ -58,6 +58,8 @@
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 
+#include <boost/beast/http.hpp>
+
 using std::cout;
 using json = nlohmann::json;
 using std_string = std::string;
@@ -69,15 +71,16 @@ using namespace std::chrono;
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
-namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
 using tcp = asio::ip::tcp;
-using ssl_stream = asio::ssl::stream<tcp::socket>;
+using ssl_stream = boost::asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
 
+namespace http = boost::beast::http;
+
 struct Trade {
-    int64_t ts;
+    uint64_t ts;
     std_string side;
     double price;
     double qty;
@@ -85,10 +88,10 @@ struct Trade {
 };
 
 struct Depth {
-    int64_t ts;
-    int64_t U;
-    int64_t u;
-    int64_t pu;
+    uint64_t ts;
+    uint64_t U;
+    uint64_t u;
+    uint64_t pu;
     int64_t latency;
     vector<pair<int64_t, double>> bid_delta;
     vector<pair<int64_t, double>> ask_delta;
@@ -104,8 +107,7 @@ struct Stream {
     double qty;
     double fill_price;
     double fill_qty;
-    double fees_paid;
-    int64_t exchange_ts;
+    uint64_t exchange_ts;
 };
 
 struct EventNotifier {
@@ -223,10 +225,9 @@ struct Toxicity {
 };
 
 struct Signal {
-    int64_t ts;
-    int64_t trade_latency;
-    int64_t depth_latency;
-    int64_t exchange_latency;
+    uint64_t ts;
+    uint64_t trade_latency;
+    uint64_t depth_latency;
     double mid;
     double microprice;
     double microprice_dev;
@@ -283,8 +284,10 @@ struct Order {
     std_string status;
     bool pending_cancel = false;
     int64_t ts;
-    int64_t live_ts = 0;
+    uint64_t exchange_ts = 0;
+    uint64_t ack_latency = 0;
     int64_t exchange_latency = 0;
+    int64_t live_ts = 0;
     std_string owner;
     Signal signal;
     double queue_ahead_at_join;
@@ -304,16 +307,16 @@ struct Compare {
 };
 
 struct ResidualPred {
-    int64_t ts;
-    int64_t horizon_ms;
+    uint64_t ts;
+    uint64_t horizon_ms;
     double pred;
     double reservation;
     double realized;
 };
 
 struct ToxicityPred {
-    int64_t ts;
-    int64_t horizon_ms;
+    uint64_t ts;
+    uint64_t horizon_ms;
     double pred;
     double fill_price;
     int fill_sign;
@@ -341,7 +344,7 @@ struct MarketFeatureState {
 
 struct EventsRow {
     std_string type;
-    int64_t ts;
+    uint64_t ts;
     std_string msg;   // raw JSON string (same as Python)
 };
 
@@ -424,7 +427,7 @@ struct Snapshot {
 };
 
 struct SnapshotRow {
-    int64_t ts;
+    uint64_t ts;
     int64_t trade_latency;
     int64_t depth_latency;
     int64_t exchange_latency;
@@ -491,7 +494,7 @@ struct SnapshotRow {
 };
 
 struct TradeRow {
-    int64_t ts;
+    uint64_t ts;
     std_string symbol;
 
     double price;
@@ -527,8 +530,9 @@ struct TradeRow {
 };
 
 struct QuoteRow {
-    int64_t ts;
-    int64_t exchange_latency;
+    uint64_t ts;
+    uint64_t exchange_ts;
+    uint64_t ack_latency;
     std_string symbol;
     std_string client_oid;
     std_string side;
@@ -581,15 +585,15 @@ struct QuoteRow {
 };
 
 struct FillRow {
-    int64_t ts;
-    int64_t exchange_latency;
-    int64_t time_to_fill;
+    uint64_t ts;
+    uint64_t exchange_ts;
+    uint64_t ack_latency;
+    uint64_t time_to_fill;
     std_string symbol;
     std_string side;
     double price;
     int64_t price_tick;
     double qty;
-    double cum_qty;
 
     bool is_maker;
     int fill_sign;
@@ -662,4 +666,79 @@ struct PerformanceMetrics {
     double annualized_sharpe = NAN;
     double sortino = NAN;
     double annualized_sortino = NAN;
+};
+
+class HttpClient {
+public:
+    asio::io_context ioc;
+    ssl::context ctx;
+    ssl_stream ssl_sock;
+
+    std_string host;
+    mutex mtx;
+
+    HttpClient() : ctx(ssl::context::tlsv12_client), ssl_sock(ioc, ctx) {}
+
+    void initialize(const std_string& base_url){
+        host = base_url;
+
+        ctx.set_default_verify_paths();
+        
+        tcp::resolver resolver(ioc);
+        auto results = resolver.resolve(host, "443");
+
+        asio::connect(ssl_sock.next_layer(), results);
+
+        SSL_set_tlsext_host_name(ssl_sock.native_handle(), host.c_str());
+        // SSL_set_tlsext_host_name(ssl_sock.native_handle(), host); string doesnt explicitly convert to const char
+        ssl_sock.handshake(ssl::stream_base::client);
+
+        cout << "[HTTP] broker connected: " << host << "\n";
+    }
+
+    string request(http::verb method, const string& target,
+        const vector<string>& headers = {}, const string& body = ""){
+
+        lock_guard<mutex> lock(mtx);
+
+        http::request<http::string_body> req{method, target, 11};
+
+        req.set(http::field::host, host);
+        req.set(http::field::user_agent, "mm-engine");
+
+        for(const auto& h: headers){
+            auto pos = h.find(":");
+
+            if(pos != string::npos){
+                std_string key = h.substr(0, pos);
+                std_string value = h.substr(pos + 1);
+
+                while(!value.empty() && value[0] == ' ')
+                    value.erase(value.begin());
+
+                req.set(key,value);
+            }
+        }
+
+        if(!body.empty()){
+            req.body() = body;
+            req.prepare_payload();
+        }
+
+        beast::flat_buffer buffer;
+
+        http::write(ssl_sock, req);
+        http::response<http::string_body> res;
+        http::read(ssl_sock, buffer, res);
+
+        if(res.result_int() >= 400){
+            cout << "ERROR: status >= 400: HTTP "
+                + to_string(res.result_int()) + ": " + res.body();
+        }
+
+        cout << "\n===== HTTP RESPONSE =====\n";
+        cout << res << endl;
+
+        return res.body();
+    }
 };
