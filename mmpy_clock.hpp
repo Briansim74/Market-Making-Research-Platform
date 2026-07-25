@@ -90,18 +90,10 @@ public:
 
     thread clock_thread;
 
-    // std_string base_url;
-    // std_string endpoint;
-
     mutex connection_mtx;
     condition_variable connection_cv;
 
-    BinanceClock(MarketConfig& config, const json& params): config(config) 
-    {
-        // std_string mode = params["mode"].get<std_string>();
-        // base_url = (mode == "live") ? params["api"]["futures"].get<std_string>() : params["api"]["spot"].get<std_string>();
-        // endpoint = (mode == "live") ? "/fapi/v1/time" : "/api/v3/time";
-    }
+    BinanceClock(MarketConfig& config): config(config) {}
 
     int64_t now_ms() const{
         return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
@@ -145,7 +137,6 @@ public:
         ctx.set_default_verify_paths();
 
         tcp::resolver resolver(ioc);
-        // auto results = resolver.resolve(base_url, "443");
         auto results = resolver.resolve(config.base_url, "443");
 
         // -------------------------
@@ -158,7 +149,6 @@ public:
         // STEP 2: TLS LAYER
         // -------------------------
         ssl_stream ssl_sock(move(socket), ctx);
-        // SSL_set_tlsext_host_name(ssl_sock.native_handle(), base_url.c_str());
         SSL_set_tlsext_host_name(ssl_sock.native_handle(), config.base_url.c_str());
         ssl_sock.handshake(ssl::stream_base::client);
 
@@ -168,11 +158,9 @@ public:
         int64_t best_rtt = INT64_MAX;
 
         for(int i = 0; i < 5; i++){
-            // http::request<http::empty_body> req{http::verb::get, endpoint, 11};
             http::request<http::empty_body> req{http::verb::get, config.endpoint + "/time", 11};
 
             req.keep_alive(true);
-            // req.set(http::field::host, base_url);
             req.set(http::field::host, config.base_url);
             req.set(http::field::user_agent, "mm-engine");
 
@@ -194,7 +182,7 @@ public:
             auto doc = parser.iterate(json);
 
             int64_t server_ms = int64_t(doc["serverTime"]);
-            int64_t rtt = chrono::duration_cast<milliseconds>(t1 - t0).count();
+            int64_t rtt = duration_cast<milliseconds>(t1 - t0).count();
 
             // Midpoint of the wall clock
             int64_t midpoint_wall = (t0_wall + t1_wall) / 2;
@@ -211,11 +199,8 @@ public:
         offset_ms.store(best_offset);
         rtt_ms.store(best_rtt);
 
-        // cout << "base_url: " << base_url << " endpoint: " << endpoint << " [CLOCK]" << " best_offset: "
-        // << best_offset << " ms" << " best_rtt: " << best_rtt << " ms\n";
-
-        cout << "base_url: " << config.base_url << " endpoint: " << config.endpoint  + "/time" << " [CLOCK]" << " best_offset: "
-        << best_offset << " ms" << " best_rtt: " << best_rtt << " ms\n";
+        cout << "base_url: " << config.base_url << " endpoint: " << config.endpoint  + "/time" << " [CLOCK]"
+        << " best_offset: " << best_offset << " ms" << " best_rtt: " << best_rtt << " ms\n";
 
         {
             lock_guard<mutex> lock(connection_mtx);

@@ -94,6 +94,7 @@ public:
     virtual double get_current_ask_size() = 0;
     virtual void place_quotes_latency(const Signal&) = 0; //paper
     virtual bool process_latency_queue() = 0; //paper
+    virtual void update_queue_from_depth(const Depth&) = 0;
     virtual void process_trade(const Trade&) = 0;
     virtual Order* get_open_order(const std_string&) = 0;
     virtual void cancel_all_orders() = 0;
@@ -106,7 +107,6 @@ public:
 class PaperExecution : public Execution {
 public:
     MarketConfig& config;
-    const json& params;
     State& state;
     DatasetRecorder& recorder;
     BinanceClock& clock;
@@ -124,8 +124,8 @@ public:
 
     priority_queue<LatencyEvent, vector<LatencyEvent>, Compare> latency_queue;
 
-    PaperExecution(MarketConfig& config, State& state, DatasetRecorder& recorder, BinanceClock& clock, const json& params)
-        : config(config), state(state), recorder(recorder), clock(clock), params(params)
+    PaperExecution(MarketConfig& config, State& state, DatasetRecorder& recorder, BinanceClock& clock)
+        : config(config), state(state), recorder(recorder), clock(clock)
     {
         state.exchange_latency = config.exchange_latency;
         
@@ -180,28 +180,77 @@ public:
 
     Order* get_fill_candidate_order(const std_string& side, const int64_t& price_tick){
         for(auto& [client_oid, order]: open_orders){
-            if(order.side == side && order.price_tick == price_tick && order.status == "LIVE") return &order;
+            if(order.side == side && order.price_tick == price_tick &&
+            (order.status == "LIVE" || order.status == "PARTIALLY_FILLED")) return &order;
         }
         return nullptr;
     }
 
-    void process_trade(const Trade& trade) override {
+    void update_queue_from_depth(const Depth& entry) override {
 
-        update_trade_flow_buckets(trade);
-        update_trade_flow(trade);
-        match_side(trade);
+        // Since trade handler already captures executions, depth handler is mostly for cancellations.
+        double beta = 0.9; // double beta = 0.2 - 0.4; lower beta to prevent double counting, this simulates poisson process now
+        // can move hawkes process here now
+
+        for(auto& [price_tick, new_qty]: entry.bid_delta){
+            
+            auto it = state.market_book.bids.find(price_tick);
+            double old_qty = (it != state.market_book.bids.end()) ? it->second : 0.0;
+
+            if(old_qty > 0.0){
+                double depletion = max(0.0, old_qty - new_qty);
+                if(depletion <= 0.0) continue; //for small rounding errors, do <= 0.0
+
+                // state.hawkes.update(depletion, entry.ts); // hawkes process
+
+                // compensate for hidden churn, since there might be many cancellations/additions
+                if(depletion < 0.05) beta = 15.0;
+                else if (depletion < 0.5) beta = 7.0;
+                // large depletion is probably real
+                else beta = 0.6;
+
+                // beta = beta + 2.0 * state.hawkes.excitation;
+
+                Order* order = get_fill_candidate_order("BUY", price_tick);
+                if(!order) continue;
+
+                order->queue_ahead = max(0.0, order->queue_ahead - beta * depletion);
+                cout << "buy order queue_ahead: " << order->queue_ahead << ", beta * depletion: " << beta * depletion << "\n";
+            }
+        }
+
+        for(auto& [price_tick, new_qty]: entry.ask_delta){
+            
+            auto it = state.market_book.asks.find(price_tick);
+            double old_qty = (it != state.market_book.asks.end()) ? it->second : 0.0;
+
+            if(old_qty > 0.0){
+                double depletion = max(0.0, old_qty - new_qty);
+                if(depletion <= 0.0) continue;
+
+                // state.hawkes.update(depletion, entry.ts); // hawkes process
+
+                // compensate for hidden churn, since there might be many cancellations/additions
+                if(depletion < 0.05) beta = 15.0;
+                else if (depletion < 0.5) beta = 7.0;
+                // large depletion is probably real
+                else beta = 0.6;
+
+                // beta = beta + 2.0 * state.hawkes.excitation;
+
+                Order* order = get_fill_candidate_order("SELL", price_tick);
+                if(!order) continue;
+
+                order->queue_ahead = max(0.0, order->queue_ahead - beta * depletion);
+                cout << "sell order queue_ahead: " << order->queue_ahead << ", beta * depletion: " << beta * depletion << "\n";
+            }
+        }
     }
 
-    void update_trade_flow_buckets(const Trade& trade){
+    void process_trade(const Trade& trade) override {
 
-        int64_t price_tick = config.to_tick(trade.price);
-
-        auto& bucket = state.trade_buckets[trade.side][price_tick];
-        bucket.push_back(trade);
-
-        while(!bucket.empty() && trade.ts - bucket.front().ts > state.trade_flow_window_ms){
-            bucket.pop_front();
-        }
+        update_trade_flow(trade);
+        match_side(trade);
     }
 
     void update_trade_flow(const Trade& trade){
@@ -250,10 +299,7 @@ public:
         bid_size = config.normalize_qty(bid_size);
         ask_size = config.normalize_qty(ask_size);
 
-        return {
-            bid_size,
-            ask_size
-        };
+        return {bid_size, ask_size};
     }
 
     Order* get_open_order(const std_string& side) override {     
@@ -289,6 +335,7 @@ public:
         order.owner = "self";
         order.signal = signal;
         order.queue_ahead_at_join = state.set_queue_position(side, price_tick);
+        order.queue_ahead = order.queue_ahead_at_join;
 
         open_orders[client_oid] = order;   // <-- insert into map
 
@@ -322,6 +369,7 @@ public:
         order.owner = "self";
         order.signal = *state.last_signal;
         order.queue_ahead_at_join = 0.0;
+        order.queue_ahead = 0.0;
 
         open_orders[client_oid] = order;   // <-- insert into map
 
@@ -335,7 +383,6 @@ public:
         order->exchange_latency = state.exchange_latency;
 
         state.last_order_update = *order;
-        state.reset_queue_ahead(order->side, order->price_tick);
 
         recorder.log_quote(*order, (order->side == "BUY") ? "BID" : "ASK", "CANCELED");
 
@@ -410,105 +457,66 @@ public:
         }
     }
 
-    double get_trade_rate(const Trade& trade){
-
-        int64_t price_tick = config.to_tick(trade.price);
-
-        auto& bucket = state.trade_buckets[trade.side][price_tick]; //guaranteed to be pruned at update_trade_flow_buckets
-        double volume = 0.0;
-
-        for(auto& t: bucket) volume += t.qty;
-
-        return volume / (state.trade_flow_window_ms / 1000.0); // per second (1000ms)
-    }
-
     void match_side(const Trade& trade){
 
         std_string side = (trade.side == "BUY") ? "SELL" : "BUY";
         int64_t price_tick = config.to_tick(trade.price);
-        double qty = trade.qty;
 
-        // -------------------------
-        // GET dt (time interval between trades) -> amount of time you allow those events to happen
-        // -------------------------
-        if(state.last_fill_match_ts != 0){
-            state.dt = (trade.ts - state.last_fill_match_ts) / 1000.0; // dt (s) represents interval between last_fill_model_ts and trade ts
-        }
-        state.last_fill_match_ts = trade.ts;
+        // state.hawkes.update(depletion, trade.ts); // hawkes process
 
-        // -------------------------
-        // FILL CANDIDATE
-        // -------------------------
-        Order* order = get_fill_candidate_order(side, price_tick);
+        Order* order = get_fill_candidate_order(side, price_tick); //do this first, then get dt
 
         if(!order) return;
 
         state.last_fill_candidate = *order;
 
-        // -------------------------
-        // QUEUE + FLOW MODEL
-        // -------------------------
-        double queue_ahead = state.compute_queue_ahead(side, price_tick);
-        double trade_rate = get_trade_rate(trade);
+        double fill_qty = 0.0;
 
-        double lambda_fill = trade_rate / (queue_ahead + 1e-9); // expected fill events per second
-        double p_fill = 1.0 - exp(-lambda_fill * state.dt); // probability that at least one fill event happens during that time
-        // double p_fill = 1.0 - exp(-lambda_fill * 0.1); // dt = 100ms
+        cout << "match side order queue ahead before: " << order->queue_ahead << "\n";
 
-        // -------------------------
-        // How to increase p_fill
-        // -------------------------
-        // 1. Higher trade_rate
-        // More aggressive market taking liquidity
-        // More volume consumes the queue ahead of you
-        // Increases lambda_fill
+        if(order->queue_ahead > 0.0){
+            double removed_qty = min(order->queue_ahead, trade.qty);
 
-        // 2. Lower queue_ahead
-        // Less volume in front of your order
-        // Easier for trades to reach you
-        // Increases lambda_fill
+            //remove matched trade qty from queue_ahead
+            order->queue_ahead = max(0.0, order->queue_ahead - removed_qty);
 
-        // 3. Longer dt
-        // More time for the process to act
-        // Increases the chance that the queue gets consumed
+            //get the remaining trade qty after using it for updating queue_ahead
+            double remaining_trade_qty = trade.qty - removed_qty;
 
-        // stochastic acceptance
-        if(p_fill < dist(rng)) return;
-
-        // if(toxicity_model){
-        //     ToxicityPrediction p;
-                // p.ts = stream.exchange_ts;
-            // //p.ts = state.last_depth_ts;   // or ts, but be consistent with your system clock
-        //     p.horizon_ms = toxicity_model->horizon_ms;
-
-        //     p.pred = order.last_signal.cached_toxicity_pred;  // IMPORTANT: computed at quote time
-        //     p.fill_price = fill_price;
-
-        //     p.side = (side == "BUY") ? +1 : -1;
-
-        //     state.market_feature_state.toxicity_predictions.push_back(move(p));
-        // }
-
-        // -------------------------
-        // APPLY FILL
-        // -------------------------
-        double fill_qty = min(order->remaining, qty);
-        order->remaining -= fill_qty;
-
-        state.on_fill(trade.price, fill_qty, order->side, true);
-
-        order->status = "PARTIALLY_FILLED";
-
-        if(order->remaining == 0){
-            order->status = "FILLED";
-            state.reset_queue_ahead(side, order->price_tick);
+            //--------------------------------------------------
+            // Trade reaches us
+            //--------------------------------------------------
+            if(remaining_trade_qty > 0.0){ //if there is still excess trade_qty after using it for updating queue_ahead
+                fill_qty = min(order->remaining, remaining_trade_qty); // update fills
+            }
         }
+        
+        //--------------------------------------------------
+        // Already at front
+        //--------------------------------------------------
+        else{
+            fill_qty = min(order->remaining, trade.qty); // update fills
+        }
+
+        cout << "fill_qty: " << fill_qty << "\n";
+
+        if(fill_qty > 0.0){
+            order->remaining = max(0.0, order->remaining - fill_qty);
+
+            state.on_fill(trade.price, fill_qty, order->side, true);
+            cout << "order->side: " << " side: " << side << "\n";
+
+            if(order->remaining > 0.0) order->status = "PARTIALLY_FILLED";
+            else order->status = "FILLED";
+
+            recorder.log_fill(*order, fill_qty, trade.ts + clock.offset_ms.load(), true);
+        }
+
+        cout << "match side order queue ahead after: " << order->queue_ahead << "\n";
 
         state.last_order_update = *order;
 
-        recorder.log_fill(*order, fill_qty, trade.ts + clock.offset_ms.load(), true);
-
-        if(order->remaining == 0) open_orders.erase(order->client_oid);
+        if(order->status == "FILLED") open_orders.erase(order->client_oid);
     }
 
     void orderMarketToString(Order* order, const double& fill_qty){
@@ -526,11 +534,11 @@ public:
                 order->price_tick = it->first; //set to current market order price
 
                 double fill_qty = min(order->remaining, it->second);
-                order->remaining -= fill_qty;
-                it->second -= fill_qty;
+                order->remaining = max(0.0, order->remaining - fill_qty);
+                it->second = max(0.0, it->second - fill_qty);
 
-                if(order->remaining == 0) order->status = "FILLED";
-                else order->status = "PARTIALLY_FILLED";
+                if(order->remaining > 0.0) order->status = "PARTIALLY_FILLED";
+                else order->status = "FILLED";
 
                 state.on_fill(config.from_tick(it->first), fill_qty, "BUY", false);
 
@@ -540,7 +548,7 @@ public:
 
                 recorder.log_fill(*order, fill_qty, clock.now_ms(), false);
 
-                if(it->second <= 0) it = book.asks.erase(it);   // erase returns the next iterator
+                if(it->second <= 0.0) it = book.asks.erase(it);   // erase returns the next iterator
                 else ++it;
             }
         }
@@ -550,11 +558,11 @@ public:
                 order->price_tick = it->first;
                 
                 double fill_qty = min(order->remaining, it->second);
-                order->remaining -= fill_qty;
-                it->second -= fill_qty;
+                order->remaining = max(0.0, order->remaining - fill_qty);
+                it->second = max(0.0, it->second - fill_qty);
                 
-                if(order->remaining == 0) order->status = "FILLED";
-                else order->status = "PARTIALLY_FILLED";
+                if(order->remaining > 0.0) order->status = "PARTIALLY_FILLED";
+                else order->status = "FILLED";
 
                 state.on_fill(config.from_tick(it->first), fill_qty, "SELL", false);
 
@@ -564,7 +572,7 @@ public:
 
                 recorder.log_fill(*order, fill_qty, clock.now_ms(), false);
 
-                if(it->second <= 0) it = book.bids.erase(it);   // erase returns the next iterator
+                if(it->second <= 0.0) it = book.bids.erase(it);   // erase returns the next iterator
                 else ++it;
             }
         }
@@ -656,7 +664,7 @@ public:
     atomic<bool> keepalive_running{false};
     thread keepalive_thread;
 
-    BinanceBroker(MarketConfig& config, BinanceClock& clock, const json& params)
+    BinanceBroker(MarketConfig& config, BinanceClock& clock)
         : config(config), clock(clock), http(config) {http.initialize();}
 
     // -------------------------
@@ -809,7 +817,6 @@ public:
 class LiveExecution : public Execution {
 public:
     MarketConfig& config;
-    const json& params;
     State& state;
     DatasetRecorder& recorder;
     BinanceBroker& broker;
@@ -824,8 +831,8 @@ public:
     double last_ask = 0.0;
 
     LiveExecution(MarketConfig& config, State& state, DatasetRecorder& recorder, 
-                BinanceBroker& broker, BinanceClock& clock, const json& params)
-        : config(config), state(state), recorder(recorder), broker(broker), clock(clock), params(params) {}
+                BinanceBroker& broker, BinanceClock& clock)
+        : config(config), state(state), recorder(recorder), broker(broker), clock(clock) {}
 
     double get_last_bid() override {
         return last_bid;
@@ -851,14 +858,77 @@ public:
 
     Order* get_fill_candidate_order(const std_string& side, const int64_t& price_tick){
         for(auto& [client_oid, order]: open_orders){
-            if(order.side == side && order.price_tick == price_tick && order.status == "LIVE") return &order;
+            if(order.side == side && order.price_tick == price_tick &&
+            (order.status == "LIVE" || order.status == "PARTIALLY_FILLED")) return &order;
         }
         return nullptr;
     }
 
+    void update_queue_from_depth(const Depth& entry) override {
+
+        // Since trade handler already captures executions, depth handler is mostly for cancellations.
+        double beta = 0.2; // double beta = 0.2 - 0.4; lower beta to prevent double counting
+
+        for(auto& [price_tick, new_qty]: entry.bid_delta){
+            
+            auto it = state.market_book.bids.find(price_tick);
+            double old_qty = (it != state.market_book.bids.end()) ? it->second : 0.0;
+
+            if(old_qty > 0.0){
+                double depletion = max(0.0, old_qty - new_qty);
+                if(depletion <= 0.0) continue; //for small rounding errors, do <= 0.0
+
+                // state.hawkes.update(depletion, entry.ts); // hawkes process
+
+                // compensate for hidden churn, since there might be many cancellations/additions
+                if(depletion < 0.05) beta = 15.0;
+                else if (depletion < 0.5) beta = 7.0;
+                // large depletion is probably real
+                else beta = 0.6;
+
+                // beta = beta + 2.0 * state.hawkes.excitation;
+
+                Order* order = get_fill_candidate_order("BUY", price_tick);
+                if(!order) continue;
+
+                order->queue_ahead = max(0.0, order->queue_ahead - beta * depletion);
+                cout << "buy order queue_ahead: " << order->queue_ahead << "\n";
+            }
+        }
+
+        for(auto& [price_tick, new_qty]: entry.ask_delta){
+            
+            auto it = state.market_book.asks.find(price_tick);
+            double old_qty = (it != state.market_book.asks.end()) ? it->second : 0.0;
+
+            if(old_qty > 0.0){
+                double depletion = max(0.0, old_qty - new_qty);
+                if(depletion <= 0.0) continue;
+
+                // state.hawkes.update(depletion, entry.ts); // hawkes process
+
+                // compensate for hidden churn, since there might be many cancellations/additions
+                if(depletion < 0.05) beta = 15.0;
+                else if (depletion < 0.5) beta = 7.0;
+                // large depletion is probably real
+                else beta = 0.6;
+
+                // beta = beta + 2.0 * state.hawkes.excitation;
+
+                Order* order = get_fill_candidate_order("SELL", price_tick);
+                if(!order) continue;
+
+                order->queue_ahead = max(0.0, order->queue_ahead - beta * depletion);
+                cout << "sell order queue_ahead: " << order->queue_ahead << "\n";
+            }
+        }
+    }
+
     void process_trade(const Trade& trade) override {
-        update_trade_flow_buckets(trade);
+        
         update_trade_flow(trade);
+
+        // state.hawkes.update(depletion, entry.ts); // hawkes process
 
         std_string side = (trade.side == "BUY") ? "SELL" : "BUY";
         int64_t price_tick = config.to_tick(trade.price);
@@ -868,18 +938,6 @@ public:
         if(!order) return;
 
         state.last_fill_candidate = *order;
-    }
-
-    void update_trade_flow_buckets(const Trade& trade){
-
-        int64_t price_tick = config.to_tick(trade.price);
-
-        auto& bucket = state.trade_buckets[trade.side][price_tick];
-        bucket.push_back(trade);
-
-        while(!bucket.empty() && trade.ts - bucket.front().ts > state.trade_flow_window_ms){
-            bucket.pop_front();
-        }
     }
 
     void update_trade_flow(const Trade& trade){
@@ -928,10 +986,7 @@ public:
         bid_size = config.normalize_qty(bid_size);
         ask_size = config.normalize_qty(ask_size);
 
-        return {
-            bid_size,
-            ask_size
-        };
+        return {bid_size, ask_size};
     }
 
     Order* get_open_order(const std_string& side) override {     
@@ -1020,6 +1075,7 @@ public:
         order.owner = "self";
         order.signal = *state.last_signal;
         order.queue_ahead_at_join = 0.0;
+        order.queue_ahead = 0.0;
 
         json resp = broker.place_market(order);
         order.resp = resp;
@@ -1124,10 +1180,6 @@ public:
         // EXCHANGE LATENCY
         // -------------------------
         order->exchange_latency = clock.compute_exchange_latency(stream.exchange_ts, order->ts);
-
-        // order->exchange_latency = stream.exchange_ts - (order->send_ts + binance_clock_offset_ms.load()); // Exchange latency:
-        // How long it took from your order leaving your machine until Binance generated the order update event, for quote placements / fills
-
         state.exchange_latency = order->exchange_latency;
  
         // -------------------------
@@ -1138,7 +1190,8 @@ public:
             order->live_ts = stream.exchange_ts;
             order->status = "LIVE";
             order->queue_ahead_at_join = state.set_queue_position(stream.side, order->price_tick);
-            
+            order->queue_ahead = order->queue_ahead_at_join;
+
             (stream.side == "BUY") ? last_bid = stream.price : last_ask = stream.price;
             state.last_order_update = *order;
 
@@ -1154,7 +1207,6 @@ public:
         else if(stream.exec_type == "CANCELED"){
             
             order->status = "CANCELED";
-            state.reset_queue_ahead(stream.side, order->price_tick);
             state.last_order_update = *order;
 
             cout << "- CANCEL LIMIT ORDER - client_oid: " << order->client_oid << 
@@ -1187,7 +1239,6 @@ public:
         else if(stream.exec_type == "EXPIRED"){
             
             order->status = "EXPIRED";
-            state.reset_queue_ahead(stream.side, order->price_tick);
             state.last_order_update = *order;
 
             cout << "- EXPIRED LIMIT ORDER - client_oid: " << order->client_oid << 
@@ -1202,7 +1253,9 @@ public:
         // TRADE
         // -------------------------
         else if(stream.exec_type == "TRADE"){
-            cout << "stream fees paid: " << stream.fees_paid << "\n";
+            // cout << "stream fill_price: " << stream.fill_price << ", stream fill_qty: " << stream.fill_qty << "\n";
+            // cout << "stream fees paid: " << stream.fees_paid << "\n"; // maker_fees = 0.0002, same as params
+
             // if(toxicity_model){
             //     ToxicityPrediction p;
                     // p.ts = stream.exchange_ts;
@@ -1222,27 +1275,28 @@ public:
             if(stream.status == "PARTIALLY_FILLED"){
                 order->status = "PARTIALLY_FILLED";
                 order->remaining -= stream.fill_qty;
+                order->queue_ahead = max(0.0, order->queue_ahead - stream.fill_qty);
 
                 cout << "- PARTIALLY FILLED LIMIT ORDER - client_oid: " << order->client_oid << 
-            ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
+                ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
             }
 
             else if(stream.status == "FILLED"){
                 order->status = "FILLED";
                 order->remaining = 0.0;
-                state.reset_queue_ahead(stream.side, order->price_tick);
+                order->queue_ahead = 0.0;
 
                 cout << "- FILLED LIMIT ORDER - client_oid: " << order->client_oid << 
-            ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
+                ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
             }
-     
-            state.last_order_update = *order;
 
             if(stream.order_type == "MARKET"){
                 orderMarketToString(order, stream);
                 recorder.log_fill(*order, stream.fill_qty, stream.exchange_ts, false);
             }
             else recorder.log_fill(*order, stream.fill_qty, stream.exchange_ts, true);
+
+            state.last_order_update = *order;
        
             if(stream.status == "FILLED") open_orders.erase(order->client_oid);
         }
@@ -1256,11 +1310,9 @@ public:
 class BinanceUserStream {
 public:
     MarketConfig& config;
-    State& state;
-    LiveExecution& execution;
     BinanceBroker& broker;
     ExecutionEventQueue& execution_event;
-    DatasetRecorder& recorder;
+    BinanceClock& clock;
     
     atomic<bool> running{false};
     atomic<bool> connected{false};
@@ -1271,9 +1323,8 @@ public:
     mutex connection_mtx;
     condition_variable connection_cv;
 
-    BinanceUserStream(MarketConfig& config, State& state, LiveExecution& execution, 
-                    BinanceBroker& broker, ExecutionEventQueue& execution_event, DatasetRecorder& recorder)
-        : config(config), state(state), execution(execution), broker(broker), execution_event(execution_event), recorder(recorder) {}
+    BinanceUserStream(MarketConfig& config, BinanceBroker& broker, ExecutionEventQueue& execution_event, BinanceClock& clock)
+        : config(config), broker(broker), execution_event(execution_event), clock(clock) {}
 
     void start(){
         running = true;
@@ -1360,6 +1411,7 @@ public:
         stream.fill_qty = double(o["l"].get_double_in_string());
         stream.fees_paid = double(o["n"].get_double_in_string());
         stream.exchange_ts = int64_t(o["T"]);
+        stream.local_ts = clock.now_ms();
 
         ExecutionEvent ev;
         ev.type = ExecutionEventType::STREAM_UPDATE;
@@ -1371,7 +1423,6 @@ public:
 class Engine {
 public:
     MarketConfig& config;
-    const json& params;
     State& state;
     MarketMakingStrategy& strategy;
     Execution& execution;
@@ -1386,9 +1437,9 @@ public:
     atomic<bool> running{false};
     
     Engine(MarketConfig& config, State& state, MarketMakingStrategy& strategy, Execution& execution, BinanceClock& clock,
-        ExecutionEventQueue& execution_event, EventNotifier& dashboard_event, SnapshotStore& snapshot_store, DatasetRecorder& recorder, const json& params)
+        ExecutionEventQueue& execution_event, EventNotifier& dashboard_event, SnapshotStore& snapshot_store, DatasetRecorder& recorder)
         : config(config), state(state), strategy(strategy), execution(execution), clock(clock), execution_event(execution_event),
-        dashboard_event(dashboard_event), snapshot_store(snapshot_store), recorder(recorder), params(params) {build_header();}
+        dashboard_event(dashboard_event), snapshot_store(snapshot_store), recorder(recorder) {build_header();}
 
     void process_event(const ExecutionEvent& ev){
         switch(ev.type){
@@ -1406,6 +1457,10 @@ public:
 
             case ExecutionEventType::STREAM_UPDATE:
                 on_stream_event(ev.stream);
+                break;
+
+            case ExecutionEventType::MARK_PRICE_UPDATE:
+                on_mark_price_event(ev.stream);
                 break;
         }
 
@@ -1436,6 +1491,7 @@ public:
     }
 
     void on_trade_event(const Trade& trade){
+        state.time = trade.local_ts;
         state.last_trade = trade;
         state.last_trade_ts = trade.ts;
         state.trade_latency = trade.latency;
@@ -1448,6 +1504,7 @@ public:
         // -------------------------
         // LIVE PROCESSING
         // -------------------------
+        state.time = depth.local_ts;
         state.last_depth_ts = depth.ts;
         state.depth_latency = depth.latency;
         
@@ -1468,17 +1525,14 @@ public:
         }
 
         // -----------------------------
-        // APPLY DELTA (FAST LOCK ONLY)
+        // APPLY DELTA - REMOVE LOCK FOR SINGLE THREADED QUEUE
         // -----------------------------
-        {
-            lock_guard<recursive_mutex> lock(book.mtx);
-            state.update_queue_from_depth(depth);
-            book.apply_delta(depth);
-            book.last_update_id = depth.u;
-        }
+        execution.update_queue_from_depth(depth);
+        book.apply_delta(depth);
+        book.last_update_id = depth.u;
 
         // -----------------------------
-        // HEAVY FEATURES OUTSIDE LOCK (IMPORTANT)
+        // HEAVY FEATURES
         // -----------------------------
         state.update_vol();
         state.compute_order_imbalance();
@@ -1492,7 +1546,10 @@ public:
         // -----------------------------
         if(!state.initialized) return;
 
-        Signal signal = strategy.generate_quotes(state);
+        Order* bid_order = execution.get_open_order("BUY"); // to be changed later on
+        Order* ask_order = execution.get_open_order("SELL");
+
+        Signal signal = strategy.generate_quotes(state, bid_order, ask_order);
         recorder.log_snapshot(signal);
         state.last_signal = signal;
         execution.place_quotes(signal);
@@ -1502,6 +1559,7 @@ public:
         // -------------------------
         // LIVE PROCESSING
         // -------------------------
+        state.time = depth.local_ts;
         state.last_depth_ts = depth.ts;
         state.depth_latency = depth.latency;
         
@@ -1522,17 +1580,14 @@ public:
         }
 
         // -----------------------------
-        // APPLY DELTA (FAST LOCK ONLY)
+        // APPLY DELTA
         // -----------------------------
-        {
-            lock_guard<recursive_mutex> lock(book.mtx);
-            state.update_queue_from_depth(depth);
-            book.apply_delta(depth);
-            book.last_update_id = depth.u;
-        }
+        execution.update_queue_from_depth(depth);
+        book.apply_delta(depth);
+        book.last_update_id = depth.u;
 
         // -----------------------------
-        // HEAVY FEATURES OUTSIDE LOCK (IMPORTANT)
+        // HEAVY FEATURES
         // -----------------------------
         state.update_vol();
         state.compute_order_imbalance();
@@ -1546,7 +1601,10 @@ public:
         // -----------------------------
         if(!state.initialized) return;
 
-        Signal signal = strategy.generate_quotes(state);
+        Order* bid_order = execution.get_open_order("BUY"); // to be changed later on
+        Order* ask_order = execution.get_open_order("SELL");
+
+        Signal signal = strategy.generate_quotes(state, bid_order, ask_order);
         recorder.log_snapshot(signal);
         state.last_signal = signal;
         execution.place_quotes(signal);
@@ -1556,6 +1614,7 @@ public:
         // -------------------------
         // LIVE PROCESSING
         // -------------------------
+        state.time = depth.local_ts;
         state.last_depth_ts = depth.ts;
         state.depth_latency = depth.latency;
         
@@ -1576,17 +1635,14 @@ public:
         }
 
         // -----------------------------
-        // APPLY DELTA (FAST LOCK ONLY)
+        // APPLY DELTA
         // -----------------------------
-        {
-            lock_guard<recursive_mutex> lock(book.mtx);
-            state.update_queue_from_depth(depth);
-            book.apply_delta(depth);
-            book.last_update_id = depth.u;
-        }
+        execution.update_queue_from_depth(depth);
+        book.apply_delta(depth);
+        book.last_update_id = depth.u;
 
         // -----------------------------
-        // HEAVY FEATURES OUTSIDE LOCK (IMPORTANT)
+        // HEAVY FEATURES
         // -----------------------------
         state.update_vol();
         state.compute_order_imbalance();
@@ -1600,7 +1656,10 @@ public:
         // -----------------------------
         if(!state.initialized) return;
 
-        Signal signal = strategy.generate_quotes(state);
+        Order* bid_order = execution.get_open_order("BUY"); // to be changed later on
+        Order* ask_order = execution.get_open_order("SELL");
+
+        Signal signal = strategy.generate_quotes(state, bid_order, ask_order);
         recorder.log_snapshot(signal);
         state.last_signal = signal;
         execution.place_quotes_latency(signal);
@@ -1610,6 +1669,7 @@ public:
         // -------------------------
         // LIVE PROCESSING
         // -------------------------
+        state.time = depth.local_ts;
         state.last_depth_ts = depth.ts;
         state.depth_latency = depth.latency;
         
@@ -1630,17 +1690,14 @@ public:
         }
 
         // -----------------------------
-        // APPLY DELTA (FAST LOCK ONLY)
+        // APPLY DELTA
         // -----------------------------
-        {
-            lock_guard<recursive_mutex> lock(book.mtx);
-            state.update_queue_from_depth(depth);
-            book.apply_delta(depth);
-            book.last_update_id = depth.u;
-        }
+        execution.update_queue_from_depth(depth);
+        book.apply_delta(depth);
+        book.last_update_id = depth.u;
 
         // -----------------------------
-        // HEAVY FEATURES OUTSIDE LOCK (IMPORTANT)
+        // HEAVY FEATURES
         // -----------------------------
         state.update_vol();
         state.compute_order_imbalance();
@@ -1654,15 +1711,24 @@ public:
         // -----------------------------
         if(!state.initialized) return;
 
-        Signal signal = strategy.generate_quotes(state);
+        Order* bid_order = execution.get_open_order("BUY"); // to be changed later on
+        Order* ask_order = execution.get_open_order("SELL");
+
+        Signal signal = strategy.generate_quotes(state, bid_order, ask_order);
         recorder.log_snapshot(signal);
         state.last_signal = signal;
         execution.place_quotes_latency(signal);
     }
 
     void on_stream_event(const Stream& stream){
+        state.time = stream.local_ts;
         execution.apply_stream_update(stream);
         execution.place_quotes(*state.last_signal);
+    }
+
+    void on_mark_price_event(const Stream& stream){
+        state.time = stream.local_ts;
+        state.mark_price = stream.price;
     }
 
     std_string tradeToString(const optional<Trade>& trade){
@@ -1694,12 +1760,15 @@ public:
         double spread = best_ask - best_bid;
         double microprice = (best_ask * bid_size + best_bid * ask_size) /(bid_size + ask_size + 1e-9);
 
-        double bid_queue = state.compute_queue_ahead("bids", config.to_tick(best_bid));
-        double ask_queue = state.compute_queue_ahead("asks", config.to_tick(best_ask));
+        Order* bid_order = execution.get_open_order("BUY");
+        Order* ask_order = execution.get_open_order("SELL");
+
+        double bid_queue = state.compute_queue_ahead(bid_order);
+        double ask_queue = state.compute_queue_ahead(ask_order);
 
         snap.title.header = header;
         snap.title.regime = state.last_signal ? state.last_signal->regime : "";
-        snap.title.pnl_pct = state.get_pnl(mid) / state.initial_cash * 100;
+        snap.title.pnl_pct = state.get_pnl(mid) / config.initial_cash * 100;
 
         snap.market.mid = mid;
         snap.market.microprice = microprice;
@@ -1740,8 +1809,8 @@ public:
         snap.execution.bid_pressure = bid_queue / (bid_size + 1e-9);
         snap.execution.ask_pressure = ask_queue / (ask_size + 1e-9);
 
-        snap.execution.buy_order = orderPointerToString(execution.get_open_order("BUY"));
-        snap.execution.sell_order = orderPointerToString(execution.get_open_order("SELL"));
+        snap.execution.buy_order = orderPointerToString(bid_order);
+        snap.execution.sell_order = orderPointerToString(ask_order);
         snap.execution.last_fill_candidate = orderOptionalToString(state.last_fill_candidate);
         snap.execution.last_order_update = orderOptionalToString(state.last_order_update);
         
@@ -1751,7 +1820,7 @@ public:
         snap.risk.fees_paid = state.fees_paid;
         snap.risk.total_pnl = state.get_pnl(mid);
 
-        snap.system.time = config.format_ms_precise(clock.now_ms());
+        snap.system.time = config.format_ms_precise(state.time);
         snap.system.last_trade_ts = config.format_ms_precise(state.last_trade_ts);
         snap.system.last_depth_ts = config.format_ms_precise(state.last_depth_ts);
         snap.system.trade_latency = state.trade_latency;
@@ -1770,11 +1839,11 @@ public:
             parts += s;
         };
 
-        add(params["models"]["struct_model"].get<std_string>());
-        add(params["models"]["regime_model"].get<std_string>());
-        add(params["models"]["micro_signal_model"].get<std_string>());
-        add(params["models"]["residual_model"].get<std_string>());
-        add(params["models"]["toxicity_model"].get<std_string>());
+        add(config.struct_model);
+        add(config.regime_model);
+        add(config.micro_signal_model);
+        add(config.residual_model);
+        add(config.toxicity_model);
         add(config.mode);
         add(config.exchange + "_" + config.market);
         add(config.instrument);
@@ -1809,41 +1878,41 @@ public:
 
     vector<thread> threads;
 
-    TradingSystem(const json& params) : 
-        params(params), config(params), state(config, params), strategy(config, params), recorder(config, state, params),
-        clock(config, params), dashboard_terminal(snapshot_store), dashboard_server(snapshot_store, params) {initialize();}
+    TradingSystem(const json& params) :
+        params(params), config(params), state(config), strategy(config), recorder(config, state, params),
+        clock(config), dashboard_terminal(snapshot_store), dashboard_server(config, snapshot_store) {initialize();}
 
     void initialize(){
         if(config.mode == "live"){
-            broker = make_unique<BinanceBroker>(config, clock, params);
-            execution = make_unique<LiveExecution>(config, state, recorder, *broker, clock, params);
-            user_stream = make_unique<BinanceUserStream>(config, state, *dynamic_cast<LiveExecution*>(execution.get()),
-                                                            *broker, execution_event, recorder);
+            broker = make_unique<BinanceBroker>(config, clock);
+            execution = make_unique<LiveExecution>(config, state, recorder, *broker, clock);
+            user_stream = make_unique<BinanceUserStream>(config, *broker, execution_event, clock);
         }
         
         else if(config.mode != "live"){
-            execution = make_unique<PaperExecution>(config, state, recorder, clock, params);
+            execution = make_unique<PaperExecution>(config, state, recorder, clock);
         }
 
-        engine = make_unique<Engine>(config, state, strategy, *execution, clock, execution_event, dashboard_event, snapshot_store, recorder, params);
+        engine = make_unique<Engine>(config, state, strategy, *execution, clock, execution_event, dashboard_event, snapshot_store, recorder);
 
-        auto log_event = [this](const std_string& type, const int64_t& ts, const std_string& msg) {recorder.log_event(type, ts, msg);};
-        auto log_orderbook_snapshot = [this](const json& snapshot) {recorder.log_orderbook_snapshot(snapshot);};
-        
+        auto log_event = [this](const std_string& type, const int64_t& ts, const int64_t& local_ts, 
+            const int64_t& latency, const std_string& msg) {recorder.log_event(type, ts, local_ts, latency, msg);};
+        auto export_orderbook_snapshot = [this](const json& snapshot) {recorder.export_orderbook_snapshot(snapshot);};
+
         if(config.exchange == "binance" && config.market == "spot" && config.mode != "replay"){
-            feed = make_unique<BinanceSpotFeed>(config, state, execution_event, clock, log_event, log_orderbook_snapshot, params);
+            feed = make_unique<BinanceSpotFeed>(config, state, execution_event, clock, log_event, export_orderbook_snapshot);
         }
 
-        if(config.exchange == "binance" && config.market == "futures" && config.mode != "replay"){
-            feed = make_unique<BinanceFuturesFeed>(config, state, execution_event, clock, log_event, log_orderbook_snapshot, params);
+        else if(config.exchange == "binance" && config.market == "futures" && config.mode != "replay"){
+            feed = make_unique<BinanceFuturesFeed>(config, state, execution_event, clock, log_event, export_orderbook_snapshot);
         }
 
         else if(config.exchange == "binance" && config.market == "spot" && config.mode == "replay"){
-            feed = make_unique<BinanceSpotReplayFeed>(config, state, execution_event, clock, log_event, log_orderbook_snapshot, params);
+            feed = make_unique<BinanceSpotReplayFeed>(config, state, execution_event, clock, log_event, export_orderbook_snapshot);
         }
 
         else if(config.exchange == "binance" && config.market == "futures" && config.mode == "replay"){
-            feed = make_unique<BinanceFuturesReplayFeed>(config, state, execution_event, clock, log_event, log_orderbook_snapshot, params);
+            feed = make_unique<BinanceFuturesReplayFeed>(config, state, execution_event, clock, log_event, export_orderbook_snapshot);
         }
     }
 
@@ -1870,12 +1939,6 @@ public:
             cout << "Starting execution latency loop\n";
             start_execution_latency_loop();
         }
-
-        // Wait 5 seconds
-        this_thread::sleep_for(seconds(5)); //FOR TESTING
-        
-        recorder.export_orderbook_snapshot();
-        recorder.export_event_parquet();
     }
 
     void start_dashboard_loop(){
@@ -1988,8 +2051,8 @@ public:
 };
 
 int main(){
-    // std_string path = "D:\\OneDrive\\Trading\\manifest_live.json";
-    std_string path = "D:\\OneDrive\\Trading\\manifest_replay.json";
+    std_string path = "D:\\OneDrive\\Trading\\manifest.json";
+    // std_string path;
     
     // cout << "Enter manifest path: ";
     // getline(cin, path);

@@ -60,6 +60,7 @@
 
 #include "mmpy_structs.hpp" //structs
 #include "mmpy_config_orderbook.hpp" //market config & orderbook
+#include "mmpy_markprice.hpp" //mark price
 
 using std::cout;
 using json = nlohmann::json;
@@ -82,7 +83,6 @@ using ws_stream  = websocket::stream<ssl_stream>;
 class State {
 public:
     MarketConfig& config;
-    const json& params;
     OrderBook market_book;
     MarketFeatureState mfs;
     optional<Signal> last_signal;
@@ -92,32 +92,24 @@ public:
     double trade_imbalance = 0.0;
     double ewma_var = 0.0;
 
-    double inventory = 0.0;
     double cash;
-    double initial_cash;
+    double inventory = 0.0;
     double realized_pnl = 0.0;
     double avg_entry_price = 0.0;
+    double mark_price = 0.0;
 
     deque<double> equity_history;
     deque<double> return_history;
     double last_equity = 0.0;
-
-    double maker_fee_rate;
-    double taker_fee_rate;
     double fees_paid = 0.0;
 
-    unordered_map<std_string, unordered_map<int64_t, double>> queue_flow;
-    unordered_map<std_string, unordered_map<int64_t, double>> my_queue_position;
-    unordered_map<std_string, unordered_map<int64_t, deque<Trade>>> trade_buckets;
-    int64_t trade_flow_window_ms = 1000; // for trade flow buckets
-
-    double dt = 0.0;
-    int64_t last_fill_match_ts = 0;
+    HawkesState hawkes;
 
     optional<Trade> last_trade;
     optional<Order> last_fill_candidate;
     optional<Order> last_order_update;
 
+    int64_t time = 0;
     int64_t last_trade_ts = 0;
     int64_t last_depth_ts = 0;
     int64_t trade_latency = 0;
@@ -126,13 +118,10 @@ public:
 
     bool initialized = false;
 
-    State(MarketConfig& config, const json& params)
-        : config(config), params(params), market_book(config, params){
-            cash = params["cash"].get<double>();
-            initial_cash = params["initial_cash"].get<double>();
-            maker_fee_rate = params["fees"]["maker_fee_rate"].get<double>();
-            taker_fee_rate = params["fees"]["taker_fee_rate"].get<double>();
-        }
+    State(MarketConfig& config) : config(config), market_book(config)
+    {
+        cash = config.initial_cash;
+    }
 
     double get_vol(){
         return sqrt(ewma_var);
@@ -156,6 +145,147 @@ public:
         order_imbalance = (bid_size - ask_size) / (bid_size + ask_size + 1e-9);
     }
 
+    template <typename T> void push_limited(deque<T>& dq, const T& value, size_t maxlen = 10){
+        dq.push_back(value);
+        if(dq.size() > maxlen) dq.pop_front();
+    }
+
+    void update_market_feature_state(){
+        auto& book = market_book;
+
+        auto [bid_tick, bid_size] = book.best_bid();
+        auto [ask_tick, ask_size] = book.best_ask();
+
+        double best_bid = config.from_tick(bid_tick);
+        double best_ask = config.from_tick(ask_tick);
+
+        double mid = (best_bid + best_ask) / 2.0;
+        double spread = best_ask - best_bid;
+        double microprice = (best_ask * bid_size + best_bid * ask_size) /(bid_size + ask_size + 1e-9);
+
+        double mid_return = (last_mid != 0.0) ? (mid - last_mid) / last_mid : 0.0;
+        last_mid = mid;
+
+        double quote_churn = 0.0;
+        if(mfs.prev_best_bid != 0.0 && mfs.prev_best_ask != 0.0){
+            double bid_delta = abs(best_bid - mfs.prev_best_bid);
+            double ask_delta = abs(best_ask - mfs.prev_best_ask);
+            quote_churn = bid_delta + ask_delta;
+        }
+
+        mfs.prev_best_bid = best_bid;
+        mfs.prev_best_ask = best_ask;
+
+        push_limited(mfs.mid_returns, mid_return);
+        push_limited(mfs.spread, spread);
+        push_limited(mfs.order_imbalance, order_imbalance);
+        push_limited(mfs.trade_imbalance, trade_imbalance);
+        push_limited(mfs.quote_churn, quote_churn);
+        push_limited(mfs.inventory, inventory);
+        push_limited(mfs.microprice_error, mid - microprice);
+    }
+
+    void update_residual_realization(){
+
+        while(!mfs.residual_predictions.empty() && 
+        last_depth_ts - mfs.residual_predictions.front().ts >= mfs.residual_predictions.front().horizon_ms){
+            
+            auto& entry = mfs.residual_predictions.front();
+            mfs.residual_predictions.pop_front();
+            
+            entry.realized = log(last_mid / entry.reservation);
+            push_limited(mfs.residual_signal_log, entry, 2000); //2000 in queue, 200s window
+        }
+    }
+
+    // void update_toxicity_realization(){
+    //     int64_t now = max(last_depth_ts, last_trade_ts);
+
+    //     while(!mfs.toxicity_predictions.empty() && 
+    //     now - mfs.toxicity_predictions.front().ts >= mfs.toxicity_predictions.front().horizon_ms){
+            
+    //         auto& entry = mfs.toxicity_predictions.front();
+    //         mfs.toxicity_predictions.pop_front();           
+            
+    //         entry.realized = p.fill_sign * (last_mid - entry.fill_price);
+    //         push_limited(mfs.toxicity_signal_log, entry, 2000); //2000 in queue, 200s window
+    //     }
+    // }
+
+    void update_performance(){
+        auto [bid_tick, bid_size] = market_book.best_bid();
+        auto [ask_tick, ask_size] = market_book.best_ask();
+
+        if(bid_size <= 0 || ask_size <= 0) return;
+
+        double bid = config.from_tick(bid_tick);
+        double ask = config.from_tick(ask_tick);
+
+        double mid = (bid + ask) / 2.0;
+        double equity = cash + inventory * mid;
+
+        if(last_equity > 0.0 && equity > 0.0){
+            double r = log(equity / last_equity);
+
+            if(isfinite(r)) return_history.push_back(r);
+        }
+
+        last_equity = equity;
+        equity_history.push_back(equity);
+    }
+
+    Regime get_regime(){
+
+        auto mean = [](const deque<double>& q){
+            if(q.empty()) return 0.0;
+            double s = 0;
+            for(auto x: q) s += x;
+            return s / q.size();
+        };
+
+        auto stddev = [](const deque<double>& q){
+            if(q.size() < 2) return 0.0;
+            double m = 0;
+            for(auto x: q) m += x;
+            m /= q.size();
+
+            double var = 0;
+            for(auto x: q) var += (x - m) * (x - m);
+            return sqrt(var / q.size());
+        };
+
+        Regime regime;
+        regime.volatility = stddev(mfs.mid_returns);
+        regime.spread = mean(mfs.spread);
+        regime.order_imbalance = mean(mfs.order_imbalance);
+        regime.trade_imbalance = mean(mfs.trade_imbalance);
+        regime.quote_churn = mean(mfs.quote_churn);
+        regime.inventory = mean(mfs.inventory);
+        regime.inventory_vol = stddev(mfs.inventory);
+        regime.microprice_error = mean(mfs.microprice_error);
+
+        return regime;
+    }
+
+    double compute_queue_ahead(Order* order){
+        return order ? order->queue_ahead : 0.0;
+    }
+
+    double set_queue_position(const std_string& side, const int64_t& price_tick) {
+
+        double book_size = 0.0;
+        if(side == "BUY"){
+            auto it = market_book.bids.find(price_tick);
+            if(it != market_book.bids.end()) book_size = it->second;
+        }
+        else{
+            auto it = market_book.asks.find(price_tick);
+            if(it != market_book.asks.end()) book_size = it->second;
+        }
+
+        return book_size;
+    }
+
     void on_fill(const double& price, double fill_qty, const std_string& side, const bool& is_maker){
 
         // if (toxicity_model) {
@@ -176,7 +306,7 @@ public:
         double old_avg = avg_entry_price;
 
         double fill_value = price * fill_qty;
-        double fee_rate = is_maker ? maker_fee_rate : taker_fee_rate;
+        double fee_rate = is_maker ? config.maker_fee_rate : config.taker_fee_rate;
         double fee = fill_value * fee_rate;
         fees_paid += fee;
 
@@ -232,202 +362,13 @@ public:
     }
 
     double get_unrealized_pnl(double mid){
+        // return inventory * (mark_price - avg_entry_price); to align with binance stream unrealized_pnl
+
         return inventory * (mid - avg_entry_price);
     }
 
     double get_pnl(double mid){
         return realized_pnl + get_unrealized_pnl(mid) - fees_paid;
-    }
-
-    double get_value(auto& m, const std_string& side, const int64_t& price_tick){
-        auto it1 = m.find(side);
-        if(it1 == m.end()) return 0.0;
-
-        auto it2 = it1->second.find(price_tick);
-        if(it2 == it1->second.end()) return 0.0;
-
-        return it2->second;
-    }
-
-    double compute_queue_ahead(const std_string& side, const int64_t& price_tick){
-
-        std_string book_side = (side == "BUY") ? "bids" : "asks";
-        double my_queue_pos = get_value(my_queue_position, book_side, price_tick);
-        double flow   = get_value(queue_flow, book_side, price_tick);
-
-        double ahead = my_queue_pos - flow;
-        return max(0.0, ahead);
-    }
-
-    void reset_queue_ahead(const std_string& side, const int64_t& price_tick){
-        
-        std_string book_side = (side == "BUY") ? "bids" : "asks";
-        my_queue_position[book_side].erase(price_tick);
-        queue_flow[book_side].erase(price_tick);
-    }
-
-    double set_queue_position(const std_string& side, const int64_t& price_tick) {
-
-        double book_size = 0.0;
-        if(side == "BUY"){
-            auto it = market_book.bids.find(price_tick);
-            if(it != market_book.bids.end()) book_size = it->second;
-        }
-        else{
-            auto it = market_book.asks.find(price_tick);
-            if(it != market_book.asks.end()) book_size = it->second;
-        }
-
-        my_queue_position[(side == "BUY") ? "bids" : "asks"][price_tick] = book_size;
-        return book_size;
-    }
-
-    void update_queue_from_depth(const Depth& entry){
-
-        for(auto& [price_tick, q]: entry.bid_delta){
-            
-            auto it = market_book.bids.find(price_tick);
-            double old_qty = (it != market_book.bids.end()) ? it->second : 0.0;
-            double new_qty = q;
-
-            if(old_qty > 0.0){
-                double depletion = max(0.0, old_qty - new_qty);
-                queue_flow["bids"][price_tick] += depletion;
-            }
-        }
-
-        for(auto& [price_tick, q]: entry.ask_delta){
-            
-            auto it = market_book.asks.find(price_tick);
-            double old_qty = (it != market_book.asks.end()) ? it->second : 0.0;
-            double new_qty = static_cast<double>(q);
-
-            if(old_qty > 0.0){
-                double depletion = max(0.0, old_qty - new_qty);
-                queue_flow["asks"][price_tick] += depletion;
-            }
-        }
-    }
-
-    template <typename T> void push_limited(deque<T>& dq, const T& value, size_t maxlen = 10){
-        dq.push_back(value);
-        if(dq.size() > maxlen) dq.pop_front();
-    }
-
-    void update_market_feature_state(){
-        auto& book = market_book;
-
-        auto [bid_tick, bid_size] = book.best_bid();
-        auto [ask_tick, ask_size] = book.best_ask();
-
-        double best_bid = config.from_tick(bid_tick);
-        double best_ask = config.from_tick(ask_tick);
-
-        double mid = (best_bid + best_ask) / 2.0;
-        double spread = best_ask - best_bid;
-        double microprice = (best_ask * bid_size + best_bid * ask_size) /(bid_size + ask_size + 1e-9);
-
-        double mid_return = (last_mid != 0.0) ? (mid - last_mid) / last_mid : 0.0;
-        last_mid = mid;
-
-        double quote_churn = 0.0;
-        if(mfs.prev_best_bid != 0.0 && mfs.prev_best_ask != 0.0){
-            double bid_delta = abs(best_bid - mfs.prev_best_bid);
-            double ask_delta = abs(best_ask - mfs.prev_best_ask);
-            quote_churn = bid_delta + ask_delta;
-        }
-
-        mfs.prev_best_bid = best_bid;
-        mfs.prev_best_ask = best_ask;
-
-        push_limited(mfs.mid_returns, mid_return);
-        push_limited(mfs.spread, spread);
-        push_limited(mfs.order_imbalance, order_imbalance);
-        push_limited(mfs.trade_imbalance, trade_imbalance);
-        push_limited(mfs.quote_churn, quote_churn);
-        push_limited(mfs.inventory, inventory);
-        push_limited(mfs.microprice_error, mid - microprice);
-    }
-
-    Regime get_regime(){
-
-        auto mean = [](const deque<double>& q){
-            if(q.empty()) return 0.0;
-            double s = 0;
-            for(auto x: q) s += x;
-            return s / q.size();
-        };
-
-        auto stddev = [](const deque<double>& q){
-            if(q.size() < 2) return 0.0;
-            double m = 0;
-            for(auto x: q) m += x;
-            m /= q.size();
-
-            double var = 0;
-            for(auto x: q) var += (x - m) * (x - m);
-            return sqrt(var / q.size());
-        };
-
-        Regime regime;
-        regime.volatility = stddev(mfs.mid_returns);
-        regime.spread = mean(mfs.spread);
-        regime.order_imbalance = mean(mfs.order_imbalance);
-        regime.trade_imbalance = mean(mfs.trade_imbalance);
-        regime.quote_churn = mean(mfs.quote_churn);
-        regime.inventory = mean(mfs.inventory);
-        regime.inventory_vol = stddev(mfs.inventory);
-        regime.microprice_error = mean(mfs.microprice_error);
-
-        return regime;
-    }
-
-    void update_residual_realization(){
-
-        while(!mfs.residual_predictions.empty() && 
-        last_depth_ts - mfs.residual_predictions.front().ts >= mfs.residual_predictions.front().horizon_ms){
-            
-            auto& entry = mfs.residual_predictions.front();
-            mfs.residual_predictions.pop_front();
-            
-            entry.realized = log(last_mid / entry.reservation);
-            push_limited(mfs.residual_signal_log, entry, 2000); //2000 in queue, 200s window
-        }
-    }
-
-    // void update_toxicity_realization(){
-    //     int64_t now = std::max(last_depth_ts, last_trade_ts);
-    //     while(!mfs.toxicity_predictions.empty() && 
-    //     now - mfs.toxicity_predictions.front().ts >= mfs.toxicity_predictions.front().horizon_ms){
-            
-    //         auto& entry = mfs.toxicity_predictions.front();
-    //         mfs.toxicity_predictions.pop_front();           
-            
-    //         entry.realized = p.fill_sign * (last_mid - entry.fill_price);
-    //         push_limited(mfs.toxicity_signal_log, entry, 2000); //2000 in queue, 200s window
-    //     }
-    // }
-
-    void update_performance(){
-        auto [bid_tick, bid_size] = market_book.best_bid();
-        auto [ask_tick, ask_size] = market_book.best_ask();
-
-        if(bid_size <= 0 || ask_size <= 0) return;
-
-        double bid = config.from_tick(bid_tick);
-        double ask = config.from_tick(ask_tick);
-
-        double mid = (bid + ask) / 2.0;
-        double equity = cash + inventory * mid;
-
-        if(last_equity > 0.0 && equity > 0.0){
-            double r = log(equity / last_equity);
-
-            if(isfinite(r)) return_history.push_back(r);
-        }
-
-        last_equity = equity;
-        equity_history.push_back(equity);
     }
 
     PerformanceMetrics compute_performance(){

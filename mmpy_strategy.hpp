@@ -251,11 +251,10 @@ public:
     std_string model_name;
     std_string target;
     int64_t horizon_ms;
-
-    BoosterHandle booster;
     vector<std_string> feature_cols;
     int D;
-    
+
+    BoosterHandle booster;
     vector<float> x_input;
     DMatrixHandle dmat = nullptr;
 
@@ -319,11 +318,10 @@ public:
     std_string model_name;
     std_string target;
     int64_t horizon_ms;
-
-    BoosterHandle booster;
     vector<std_string> feature_cols;
     int D;
 
+    BoosterHandle booster;
     vector<float> x_input;
     DMatrixHandle dmat = nullptr;
 
@@ -385,8 +383,6 @@ public:
 class MarketMakingStrategy {
 public:
     MarketConfig& config;
-    const json& params;
-    std_string folder_path;
 
     // Models
     std_string struct_model;
@@ -395,22 +391,19 @@ public:
     unique_ptr<ResidualModel> residual_model;
     unique_ptr<ToxicityModel> toxicity_model;
 
-    MarketMakingStrategy(MarketConfig& config, const json& params)
-        : config(config), params(params){
-        
-        folder_path = params["folder_path"].get<std_string>();
-
-        struct_model = params["models"]["struct_model"].get<std_string>();
-        regime_model       = load_model<RegimeModel>("regime_model");
-        micro_signal_model = load_model<MicroSignalModel>("micro_signal_model");
-        residual_model     = load_model<ResidualModel>("residual_model");
-        toxicity_model     = load_model<ToxicityModel>("toxicity_model");
+    MarketMakingStrategy(MarketConfig& config) : config(config)
+    {
+        struct_model       = config.struct_model;
+        regime_model       = load_model<RegimeModel>(config.regime_model);
+        micro_signal_model = load_model<MicroSignalModel>(config.micro_signal_model);
+        residual_model     = load_model<ResidualModel>(config.residual_model);
+        toxicity_model     = load_model<ToxicityModel>(config.toxicity_model);
     }
 
     template<typename T> unique_ptr<T> load_model(const std_string& model){
-        if(params["models"][model].get<std_string>().empty()) return nullptr;
+        if(model.empty()) return nullptr;
 
-        std_string file = folder_path + "/" + params["models"][model].get<std_string>() + ".json";
+        std_string file = "data/" + model + ".json";
         ifstream f(file);
         json artifact;
         f >> artifact;
@@ -627,7 +620,9 @@ public:
 
     double compute_struct_delta(const Features& features, const Policy& policy){
         
-        if(struct_model != "blended_AS") return 0.0;
+        if(struct_model != "blended_AS"){
+            return 0.0;
+        }
 
         // Move my current mid price toward the structural fair so value by some fraction.
         double reservation = features.fair + features.skew;
@@ -685,7 +680,7 @@ public:
     // -------------------------
     // FINAL QUOTE GENERATION
     // -------------------------
-    Signal generate_quotes(State& state){
+    Signal generate_quotes(State& state, Order* bid_order, Order* ask_order){ // put execution here in the mean time
 
         auto& book = state.market_book;
 
@@ -714,8 +709,8 @@ public:
         features.trade_imbalance = state.trade_imbalance;
         features.inventory = state.inventory;
         features.volatility = state.get_vol();
-        features.queue_ahead_bid = state.compute_queue_ahead("bids", config.to_tick(best_bid));
-        features.queue_ahead_ask = state.compute_queue_ahead("asks", config.to_tick(best_ask));
+        features.queue_ahead_bid = state.compute_queue_ahead(bid_order);
+        features.queue_ahead_ask = state.compute_queue_ahead(ask_order);
 
         // -------------------------
         // ALPHA STACK

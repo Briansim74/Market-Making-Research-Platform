@@ -84,8 +84,14 @@ using ws_stream  = websocket::stream<ssl_stream>;
 class MarketConfig {
 public:
     std_string exchange;
-    std_string market;
     std_string mode;
+    std_string market;
+
+    std_string struct_model;
+    std_string regime_model;
+    std_string micro_signal_model;
+    std_string residual_model;
+    std_string toxicity_model;
 
     std_string instrument;
     std_string instrument_upper;
@@ -95,10 +101,18 @@ public:
     double base_size;
     double max_inv;
 
+    double initial_cash;
+    double maker_fee_rate;
+    double taker_fee_rate;
+
     double tick_size = 0.0;
     double step_size = 0.0;
     size_t price_precision = 0;
     size_t qty_precision = 0;
+
+    std_string folder_path;
+    std_string host;
+    int16_t port;
 
     std_string api_key;
     std_string api_secret;
@@ -106,7 +120,7 @@ public:
     std_string endpoint;
     std_string hostname;
 
-    MarketConfig(const json& params) {load_filters(params);}
+    MarketConfig(const json& params) {initialize(params);}
 
     int get_precision(double step){
         int precision = 0;
@@ -118,10 +132,16 @@ public:
         return precision;
     }
 
-    void load_filters(const json& params){
+    void initialize(const json& params){
         exchange = params["exchange"].get<std_string>();
-        market = params["market"].get<std_string>();
         mode = params["mode"].get<std_string>();
+        market = params["market"].get<std_string>();
+
+        struct_model = params["models"]["struct_model"].get<std_string>();
+        regime_model = params["models"]["regime_model"].get<std_string>();
+        micro_signal_model = params["models"]["micro_signal_model"].get<std_string>();
+        residual_model = params["models"]["residual_model"].get<std_string>();
+        toxicity_model = params["models"]["toxicity_model"].get<std_string>();
 
         instrument = params["instrument"].get<std_string>();
         instrument_upper = instrument;
@@ -132,15 +152,25 @@ public:
         base_size = params["base_size"].get<double>();
         max_inv = params["max_inv"].get<double>();
 
+        initial_cash = params["initial_cash"].get<double>();
+        maker_fee_rate = params["fees"]["maker_fee_rate"].get<double>();
+        taker_fee_rate = params["fees"]["taker_fee_rate"].get<double>();
+
+        folder_path = params["folder_path"].get<std_string>();
+        host = params["server_config"]["host"].get<std_string>();
+        port = params["server_config"]["port"].get<int16_t>();
+
         api_key = params["api"]["api_key"].get<std_string>();
         api_secret = params["api"]["api_secret"].get<std_string>();
         hostname = params["api"]["hostname_" + market].get<std_string>();
         base_url = params["api"]["base_url_" + market].get<std_string>();
         endpoint = params["api"]["endpoint_" + market].get<std_string>();
         
-        cout << "Exchange: " << exchange + "_" + market << "\n";
-        cout << "market: " << market << " mode: " << mode << " exchange: " << exchange << "\n";
-        cout << "base_url: " << base_url << " hostname: " << hostname << "\n";
+        cout << "exchange: " << exchange + "_" + market << ", mode: " << mode << ", instrument: " << instrument << ", instrument_upper: " << instrument_upper << "\n";
+        cout << "exchange_latency: " << exchange_latency << ", gamma: " << gamma << ", base_size: " << base_size << ", max_inv: " << max_inv << "\n";
+        cout << "initial_cash: " << initial_cash << ", maker_fee_rate: " << maker_fee_rate << ", taker_fee_rate: " << taker_fee_rate << "\n";
+        cout << "folder_path: " << folder_path << ", host: " << host << ", port: " << port << "\n";
+        cout << "hostname: " << hostname << ", base_url: " << base_url << ", endpoint: " << endpoint << "\n";
 
         std_string url = "https://" + base_url + endpoint + "/exchangeInfo?symbol=" + instrument_upper;
 
@@ -152,13 +182,13 @@ public:
             if(f["filterType"] == "PRICE_FILTER"){
                 tick_size = stod(f["tickSize"].get<std_string>());
                 price_precision = get_precision(tick_size);
-                cout << "Tick_size: " << tick_size << ", Price_precision: " << price_precision << "\n";
+                cout << "tick_size: " << tick_size << ", price_precision: " << price_precision << "\n";
             }
 
             if(f["filterType"] == "LOT_SIZE"){
                 step_size = stod(f["stepSize"].get<std_string>());
                 qty_precision   = get_precision(step_size);
-                cout << "Step_size: " << step_size << ", Qty_precision: " << qty_precision << "\n";
+                cout << "step_size: " << step_size << ", qty_precision: " << qty_precision << "\n";
             }
         }
     }
@@ -169,10 +199,6 @@ public:
 
     double from_tick(int64_t tick) const{
         return tick * tick_size;
-    }
-
-    double round_price(double price) const{
-        return llround(price / tick_size) * tick_size;
     }
 
     double normalize_qty(double qty) const {
@@ -207,15 +233,13 @@ public:
 class OrderBook {
 public:
     MarketConfig& config;
-    const json& params;
+
+    int64_t last_update_id = 0;
 
     std::map<int64_t, double, greater<>> bids;
     std::map<int64_t, double> asks;
-
-    int64_t last_update_id = 0;
-    recursive_mutex mtx; //recursive mtx
     
-    OrderBook(MarketConfig& config, const json& params): config(config), params(params) {}
+    OrderBook(MarketConfig& config): config(config) {}
 
     pair<int64_t, double> best_bid(){
         if(bids.empty()) return {0, 0.0};
@@ -228,10 +252,7 @@ public:
     }
 
     double mid(){
-        lock_guard<recursive_mutex> lock(mtx);
-
-        if(bids.empty() || asks.empty())
-            return 0.0;
+        if(bids.empty() || asks.empty()) return 0.0;
 
         auto [bid_tick, bid_size] = best_bid();
         auto [ask_tick, ask_size] = best_ask();
@@ -239,10 +260,10 @@ public:
         return config.from_tick((bid_tick + ask_tick) / 2);
     }
 
-    pair<int64_t, json> initialize_from_binance(const std_string& symbol, int limit){
+    pair<int64_t, json> initialize_from_binance(int limit = 1000){
 
-        std_string url = "https://" + config.base_url + config.endpoint + "/depth?symbol=" + symbol + "&limit=" + to_string(limit);
-
+        std_string url = "https://" + config.base_url + config.endpoint + "/depth?symbol=" + config.instrument_upper + "&limit=" + to_string(limit);
+        cout << "initialize_from_binance url: " << url << "\n";
         auto r = cpr::Get(cpr::Url{url});
         auto snapshot = json::parse(r.text);
 
@@ -293,7 +314,6 @@ public:
     }
 
     void apply_delta(const Depth& entry){
-        lock_guard<recursive_mutex> lock(mtx);
 
         for(auto& [price_tick, q]: entry.bid_delta){
             if(q == 0.0) bids.erase(price_tick);

@@ -85,31 +85,29 @@ public:
     MarketConfig& config;
     State& state;
     const json& params;
-    std_string instrument_upper;
 
+    vector<EventRow> events;
     vector<SnapshotRow> snapshots;
     vector<TradeRow> trades;
     vector<QuoteRow> quotes;
     vector<FillRow> fills;
-    
-    vector<EventsRow> events;
-    json orderbook_snapshot;
 
     std_string run_id;
     std_string folder_path;
-    std_string events_path;
     std_string orderbook_snapshot_path;
-
+    std_string events_path;
     std_string snapshots_path;
     std_string trades_path;
     std_string quotes_path;
     std_string fills_path;
 
-    static constexpr size_t SNAPSHOT_CHUNK = 5000;
+    static constexpr size_t EVENTS_CHUNK = 10000;
+    static constexpr size_t SNAPSHOT_CHUNK = 10000;
     static constexpr size_t TRADE_CHUNK = 10000;
-    static constexpr size_t QUOTE_CHUNK = 5000;
-    static constexpr size_t FILL_CHUNK  = 3000;   // usually smaller
+    static constexpr size_t QUOTE_CHUNK = 10000;
+    static constexpr size_t FILL_CHUNK  = 5000; // usually smaller
 
+    int events_id = 0;
     int snapshots_id = 0;
     int trades_id = 0;
     int quotes_id = 0;
@@ -127,12 +125,6 @@ public:
     }
 
     void initialize(){
-        instrument_upper = params["instrument"].get<std_string>();
-        ranges::transform(instrument_upper, instrument_upper.begin(), [](unsigned char c){ return toupper(c);});
-        cout << "instrument_upper: " << instrument_upper << "\n";
-
-        std_string current_run_path = params["folder_path"].get<std_string>();
-
         auto now = system_clock::now();
         time_t now_t = system_clock::to_time_t(now);
 
@@ -143,28 +135,40 @@ public:
         ss << put_time(&tm, "%Y%m%d_%H%M%S");
 
         run_id = ss.str();
-        folder_path = current_run_path + "/runs/run_" + run_id;
+        folder_path = "data/runs/run_" + run_id;
         filesystem::create_directories(folder_path);
 
-        events_path = folder_path + "/" + params["files"]["replay_events"]["events"].get<std_string>();
-        orderbook_snapshot_path = folder_path + "/" + params["files"]["replay_events"]["orderbook_snapshot"].get<std_string>();
+        orderbook_snapshot_path = folder_path + "/orderbook_snapshot.json";
+        events_path = build_file_path("events", events_id++);
         snapshots_path = build_file_path("snapshots", snapshots_id++);
         trades_path = build_file_path("trades", trades_id++);
         quotes_path = build_file_path("quotes", quotes_id++);
         fills_path = build_file_path("fills", fills_id++);
     }
 
-    void log_event(const std_string& type, const int64_t& ts, const std_string& msg){
-        events.push_back(EventsRow{type, ts, msg});
+    void export_orderbook_snapshot(const json& snapshot){
+        ofstream(orderbook_snapshot_path) << snapshot.dump(4);
     }
 
-    void log_orderbook_snapshot(const json& snapshot){
-        orderbook_snapshot = snapshot;
+    void log_event(const std_string& type, const int64_t& ts, const int64_t& local_ts, const int64_t& latency, const std_string& msg){
+
+        EventRow row;
+        row.type = type;
+        row.ts = ts;
+        row.local_ts = local_ts;
+        row.latency = latency;
+        row.msg = msg;
+
+        events.push_back(move(row));
+
+        if(events.size() >= EVENTS_CHUNK){
+            events_path = build_file_path("events", events_id++);
+            export_event_parquet(events);
+            events.clear();
+        }
     }
 
-    void export_event_parquet(){
-        std_string filename = folder_path + "/" + params["files"]["replay_events"]["events"].get<std_string>();
-        cout << "Exported events: " << filename << "\n";
+    void export_event_parquet(const vector<EventRow>& events){
         MemoryPool* pool = default_memory_pool();
 
         // -------------------------
@@ -172,6 +176,8 @@ public:
         // -------------------------
         StringBuilder type_b(pool);
         Int64Builder ts_b(pool);
+        Int64Builder local_ts_b(pool);
+        Int64Builder latency_b(pool);
         StringBuilder msg_b(pool);
 
         // -------------------------
@@ -180,16 +186,20 @@ public:
         for(const auto& e: events){
             type_b.Append(e.type);
             ts_b.Append(e.ts);
+            local_ts_b.Append(e.local_ts);
+            latency_b.Append(e.latency);
             msg_b.Append(e.msg);
         }
 
         // -------------------------
         // FINISH ARRAYS
         // -------------------------
-        shared_ptr<Array> type_arr, ts_arr, msg_arr;
+        shared_ptr<Array> type_arr, ts_arr, local_ts_arr, latency_arr, msg_arr;
 
         type_b.Finish(&type_arr);
         ts_b.Finish(&ts_arr);
+        local_ts_b.Finish(&local_ts_arr);
+        latency_b.Finish(&latency_arr);
         msg_b.Finish(&msg_arr);
         
         // -------------------------
@@ -198,28 +208,32 @@ public:
         auto schema = arrow::schema({
             field("type", utf8()),
             field("ts", int64()),
+            field("local_ts", int64()),
+            field("latency", int64()),
             field("msg", utf8())
         });
 
         // -------------------------
         // TABLE
         // -------------------------
-        auto table = arrow::Table::Make(schema, {type_arr, ts_arr, msg_arr});
+        auto table = arrow::Table::Make(schema, {type_arr, ts_arr, local_ts_arr, latency_arr, msg_arr});
 
         // -------------------------
         // WRITE PARQUET
         // -------------------------
         shared_ptr<arrow::io::FileOutputStream> out;
-        arrow::io::FileOutputStream::Open(filename).Value(&out);
-        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 1024);
-    }
-
-    void export_orderbook_snapshot(){
-        ofstream(orderbook_snapshot_path) << orderbook_snapshot.dump(4);
+        arrow::io::FileOutputStream::Open(events_path).Value(&out);
+        parquet::arrow::WriteTable(*table, pool, out, 1024);
     }
 
     void shutdown(){
         state.update_performance();
+
+        // flush events
+        if(!events.empty()){
+            events_path = build_file_path("events", events_id++);
+            export_event_parquet(events);
+        }
 
         // flush snapshots
         if(!snapshots.empty()){
@@ -244,10 +258,6 @@ public:
             fills_path = build_file_path("fills", fills_id++);
             export_fill_parquet(fills);
         }
-
-        // export events and orderbook snapshot
-        export_event_parquet();
-        export_orderbook_snapshot();
 
         // manifest
         json manifest = params;
@@ -279,7 +289,7 @@ public:
         row.trade_latency = signal.trade_latency;
         row.depth_latency = signal.depth_latency;
         row.exchange_latency = signal.exchange_latency;
-        row.symbol = instrument_upper;
+        row.symbol = config.instrument_upper;
 
         row.mid = signal.mid;
         row.mid_tick = config.to_tick(signal.mid);
@@ -690,7 +700,7 @@ public:
         double notional = trade.price * trade.qty;
 
         row.ts = trade.ts;
-        row.symbol = instrument_upper;
+        row.symbol = config.instrument_upper;
 
         row.price = trade.price;
         row.price_tick = config.to_tick(trade.price);
@@ -932,7 +942,7 @@ public:
 
         row.ts = order.ts;
         row.exchange_latency = order.exchange_latency;
-        row.symbol = instrument_upper;
+        row.symbol = config.instrument_upper;
         row.client_oid = order.client_oid;
         row.side = side;
         row.event_type = event_type;
@@ -1287,7 +1297,7 @@ public:
         row.ts = state.last_trade_ts;
         row.exchange_latency = order.exchange_latency;
         row.time_to_fill = fill_ts - order.live_ts;
-        row.symbol = instrument_upper;
+        row.symbol = config.instrument_upper;
         row.side = order.side;
         row.price = config.from_tick(order.price_tick);
         row.price_tick = order.price_tick;

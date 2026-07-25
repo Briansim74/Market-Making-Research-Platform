@@ -78,6 +78,7 @@ using ws_stream  = websocket::stream<ssl_stream>;
 
 struct Trade {
     int64_t ts;
+    int64_t local_ts;
     std_string side;
     double price;
     double qty;
@@ -86,6 +87,7 @@ struct Trade {
 
 struct Depth {
     int64_t ts;
+    int64_t local_ts;
     int64_t U;
     int64_t u;
     int64_t pu;
@@ -106,6 +108,7 @@ struct Stream {
     double fill_qty;
     double fees_paid;
     int64_t exchange_ts;
+    int64_t local_ts;
 };
 
 struct EventNotifier {
@@ -118,7 +121,8 @@ enum class ExecutionEventType{
     TRADE_UPDATE,
     DEPTH_UPDATE_SPOT,
     DEPTH_UPDATE_FUTURES,
-    STREAM_UPDATE
+    STREAM_UPDATE,
+    MARK_PRICE_UPDATE
 };
 
 struct ExecutionEvent{
@@ -288,6 +292,7 @@ struct Order {
     std_string owner;
     Signal signal;
     double queue_ahead_at_join;
+    double queue_ahead;
     json resp;
 };
 
@@ -339,9 +344,11 @@ struct MarketFeatureState {
     double prev_best_ask = 0.0;
 };
 
-struct EventsRow {
+struct EventRow {
     std_string type;
     int64_t ts;
+    int64_t local_ts;
+    int64_t latency;
     std_string msg;   // raw JSON string (same as Python)
 };
 
@@ -662,4 +669,22 @@ struct PerformanceMetrics {
     double annualized_sharpe = NAN;
     double sortino = NAN;
     double annualized_sortino = NAN;
+};
+
+struct HawkesState {
+    double excitation = 0.0;
+    int64_t last_ts = 0;
+
+    void update(const double& qty, const int64_t& ts){
+        if(last_ts != 0){
+            double beta = 3.0; // decay rate
+            double dt = (ts - last_ts) / 1000.0;   // seconds
+
+            // Ht ​= H_t−1 ​* e^(−βΔt) + qt​
+            excitation *= exp(-beta * dt);
+        }
+
+        excitation += qty;
+        last_ts = ts;
+    }
 };

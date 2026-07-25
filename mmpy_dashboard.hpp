@@ -116,9 +116,7 @@ public:
     void stop(){
         screen.ExitLoopClosure()();
 
-        if(terminal_thread.joinable()){
-            terminal_thread.join();
-        }
+        if(terminal_thread.joinable()) terminal_thread.join();
     }
 
     Element color_pnl(const double& value){
@@ -310,14 +308,14 @@ public:
     boost::beast::flat_buffer buffer; 
     mutex write_mtx;
     
-    explicit WsSession(tcp::socket socket) : ws(move(socket)) {} 
+    explicit WsSession(tcp::socket socket) : ws(move(socket)) {}
         
     void run(){
         auto self = shared_from_this();
         ws.set_option(websocket::stream_base::timeout::suggested(boost::beast::role_type::server));
 
         ws.async_accept([self](boost::system::error_code ec){
-            if(ec)return;
+            if(ec) return;
 
             self->ws.text(true);
             cout << "DASHBOARD CLIENT CONNECTED\n";
@@ -341,55 +339,50 @@ public:
 
 class DashboardServer {
 public:
+    MarketConfig& config;
     SnapshotStore& snapshot_store; 
-    std_string host;
-    int16_t port; 
 
     boost::asio::io_context ioc; 
     tcp::acceptor acceptor; 
 
-    set<shared_ptr<WsSession>> clients; 
-    mutex dash_mtx; 
+    set<shared_ptr<WsSession>> clients;
+    mutex dash_mtx;
     thread server_thread;
 
     atomic<bool> running{false}; // keeps io_context alive 
     boost::asio::executor_work_guard<boost::asio::io_context::executor_type> guard; 
     
-    DashboardServer(SnapshotStore& snapshot_store, const json& params) 
-    : snapshot_store(snapshot_store), acceptor(ioc), guard(boost::asio::make_work_guard(ioc)) 
-    { 
-        host = params["server_config"]["host"].get<std_string>(); 
-        port = params["server_config"]["port"].get<int16_t>(); 
-    }
+    DashboardServer(MarketConfig& config, SnapshotStore& snapshot_store) 
+        : config(config), snapshot_store(snapshot_store), acceptor(ioc), guard(boost::asio::make_work_guard(ioc)) {}
 
     void start() { 
-        running = true; 
-        tcp::endpoint endpoint(boost::asio::ip::make_address(host), port); 
+        running = true;
+        tcp::endpoint endpoint(boost::asio::ip::make_address(config.host), config.port); 
         
-        acceptor.open(endpoint.protocol()); 
-        acceptor.set_option(tcp::acceptor::reuse_address(true)); 
-        acceptor.bind(endpoint); 
-        acceptor.listen(); 
+        acceptor.open(endpoint.protocol());
+        acceptor.set_option(tcp::acceptor::reuse_address(true));
+        acceptor.bind(endpoint);
+        acceptor.listen();
         
-        server_thread = thread([this](){ 
-            cout << "WS RUNNING ON http://localhost:" << port << "\n";
+        server_thread = thread([this](){
+            cout << "WS RUNNING ON http://localhost:" << config.port << "\n";
             do_accept();
-            ioc.run(); 
-        }); 
+            ioc.run();
+        });
     }
 
     void do_accept(){ 
-        acceptor.async_accept([this](boost::system::error_code ec, tcp::socket socket){ 
-            if(!ec){ 
-                auto session = make_shared<WsSession>(move(socket)); 
+        acceptor.async_accept([this](boost::system::error_code ec, tcp::socket socket){
+            if(!ec){
+                auto session = make_shared<WsSession>(move(socket));
                 {
-                    lock_guard<mutex> lock(dash_mtx); 
+                    lock_guard<mutex> lock(dash_mtx);
                     clients.insert(session);
-                } // IMPORTANT: must run in same strand context 
-                session->run(); 
-            } 
-            else cout << "ACCEPT ERROR: " << ec.message() << "\n"; 
-            if (running) do_accept(); 
+                } // IMPORTANT: must run in same strand context
+                session->run();
+            }
+            else cout << "ACCEPT ERROR: " << ec.message() << "\n";
+            if (running) do_accept();
         });
     }
 
