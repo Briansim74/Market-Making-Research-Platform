@@ -124,14 +124,19 @@ Results:
 
 ## Execution Model
 ### 1. Fill Model
-Passive fill modeled as stochastic Poisson queue depletion:
+Deterministic fill model driven by:
+- trade-driven depletion
+- cancellation-driven depletion (explicitly modeled)
+- hawkes excitation
+
+```
+Q_t (Queue_ahead) = Q_t-1 - trade-driven depletion - (β_raw * multiplier * excitation) * (depth-driven depletion)
+```
+
+Passive fill modeled as stochastic Poisson queue depletion: (Old)
 ```
 P(fill) = 1 − exp(−(λ_t / Q_t) ⋅ Δ_t)
 ```
-
-Includes:
-- trade-driven depletion
-- cancellation-driven depletion (explicitly modeled)
 
 Key correction:
 - queue reduction is not equivalent to executed volume
@@ -254,9 +259,9 @@ In live conditions, execution dynamics dominate alpha, and the primary optimizat
 - selective participation under microstructure and latency constraints, not prediction.
 
 ## Future Directions
-- Exchange-specific latency and acknowledgement modeling.
-- Hawkes-process based order-flow forecasting.
-- C++ execution engine for low-latency simulation.
+- Exchange-specific latency and acknowledgement modeling. (in-progress)
+- Hawkes-process based order-flow forecasting. (completed)
+- C++ execution engine for low-latency simulation. (in-progress)
 - Live paper-trading and liquidity-provision deployment. (completed)
 - Live validation for:
   - fill probability estimates
