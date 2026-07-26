@@ -193,15 +193,15 @@ public:
         }
     }
 
-    int64_t to_tick(double price) const{
+    int64_t to_tick(const double& price) const {
         return static_cast<int64_t>(llround(price / tick_size));
     }
 
-    double from_tick(int64_t tick) const{
+    double from_tick(const int64_t& tick) const {
         return tick * tick_size;
     }
 
-    double normalize_qty(double qty) const {
+    double normalize_qty(const double& qty) const {
         double rounded = floor(qty / step_size) * step_size;
 
         if(rounded < step_size) return 0.0;
@@ -209,19 +209,19 @@ public:
         return rounded;
     }
 
-    double normalize_bid(double price) const {
+    double normalize_bid(const double& price) const {
         return floor(price / tick_size) * tick_size;
     }
 
-    double normalize_ask(double price) const {
+    double normalize_ask(const double& price) const {
         return ceil(price / tick_size) * tick_size;
     }
 
-    std_string format_ms_precise(int64_t ts_ms) const{
-        time_t t = ts_ms / 1000;
+    std_string format_ms_precise(const int64_t& ts) const{
+        time_t t = ts / 1000;
         tm tm = *localtime(&t);
 
-        int ms = ts_ms % 1000;
+        int ms = ts % 1000;
 
         ostringstream oss;
         oss << put_time(&tm, "%Y-%m-%d %H:%M:%S") << "." << setw(3) << setfill('0') << ms;

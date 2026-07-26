@@ -116,7 +116,7 @@ public:
     DatasetRecorder(MarketConfig& config, State& state, const json& params)
         : config(config), state(state), params(params) {initialize();}
 
-    std_string build_file_path(const std_string& file, int file_id){
+    std_string build_file_path(const std_string& file, const int& file_id){
         ostringstream ss;
         ss << folder_path << '/' << file << '_' << setw(6) << setfill('0') << file_id << ".parquet";
         

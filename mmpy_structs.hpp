@@ -111,6 +111,34 @@ struct Stream {
     int64_t local_ts;
 };
 
+struct Hawkes {
+    int64_t last_ts = 0;
+    double excitation = 0.0;
+    double lambda = 3.0; // decay rate
+    double multiplier = 0.0; // 2.0; // inactive hawkes
+    double beta_raw = 0.6;
+    double beta = 0.0;
+
+    void update(const double& depletion, const int64_t& ts){
+        if(last_ts != 0){
+            double dt = (ts - last_ts) / 1000.0; // seconds
+
+            // Ht ​= H_t−1 ​* e^(−λΔt) + qt​
+            excitation *= exp(-lambda * dt);
+        }
+
+        excitation += depletion;
+        last_ts = ts;
+
+        // compensate for hidden churn, since there might be many cancellations/additions
+        if(depletion < 0.05) beta_raw = 15.0;
+        else if(depletion < 0.5) beta_raw = 7.0;
+        else beta_raw = 0.6; // large depletion is probably real
+
+        beta = beta_raw + multiplier * excitation;
+    }
+};
+
 struct EventNotifier {
     mutex signal_mtx;
     condition_variable signal_cv;
@@ -292,7 +320,6 @@ struct Order {
     std_string owner;
     Signal signal;
     double queue_ahead_at_join;
-    double queue_ahead;
     json resp;
 };
 
@@ -669,22 +696,4 @@ struct PerformanceMetrics {
     double annualized_sharpe = NAN;
     double sortino = NAN;
     double annualized_sortino = NAN;
-};
-
-struct HawkesState {
-    double excitation = 0.0;
-    int64_t last_ts = 0;
-
-    void update(const double& qty, const int64_t& ts){
-        if(last_ts != 0){
-            double beta = 3.0; // decay rate
-            double dt = (ts - last_ts) / 1000.0;   // seconds
-
-            // Ht ​= H_t−1 ​* e^(−βΔt) + qt​
-            excitation *= exp(-beta * dt);
-        }
-
-        excitation += qty;
-        last_ts = ts;
-    }
 };

@@ -125,7 +125,7 @@ public:
         else return text(format("{:.4f}", value));
     }
 
-    Element color_risk(const double& inventory, const double limit = 10.0) {
+    Element color_risk(const double& inventory, const double& limit = 10.0) {
         double intensity = min(abs(inventory) / limit, 1.0);
         auto value = text(format("{:.4f}", inventory));
 
@@ -134,7 +134,7 @@ public:
         else return hbox({text("▲ "), value}) | color(Color::Red);
     }
 
-    Element centered_inventory_bar(double inv, double max_inv = 10.0, int width = 21){
+    Element centered_inventory_bar(const double& inv, const double& max_inv = 10.0, const int& width = 21){
         int half = width / 2;
         int scaled = static_cast<int>((inv / max_inv) * half);
         scaled = clamp(scaled, -half, half);
@@ -352,10 +352,10 @@ public:
     atomic<bool> running{false}; // keeps io_context alive 
     boost::asio::executor_work_guard<boost::asio::io_context::executor_type> guard; 
     
-    DashboardServer(MarketConfig& config, SnapshotStore& snapshot_store) 
+    DashboardServer(MarketConfig& config, SnapshotStore& snapshot_store)
         : config(config), snapshot_store(snapshot_store), acceptor(ioc), guard(boost::asio::make_work_guard(ioc)) {}
 
-    void start() { 
+    void start(){
         running = true;
         tcp::endpoint endpoint(boost::asio::ip::make_address(config.host), config.port); 
         

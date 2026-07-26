@@ -103,7 +103,9 @@ public:
     double last_equity = 0.0;
     double fees_paid = 0.0;
 
-    HawkesState hawkes;
+    Hawkes hawkes;
+    pair<int64_t, double> bid_queue_ahead = {-1, 0.0}; // 1 price_tick per side only, init with -1 price_tick
+    pair<int64_t, double> ask_queue_ahead = {-1, 0.0}; // 1 price_tick per side only
 
     optional<Trade> last_trade;
     optional<Order> last_fill_candidate;
@@ -125,6 +127,52 @@ public:
 
     double get_vol(){
         return sqrt(ewma_var);
+    }
+
+    void update_queue_from_depth(const Depth& entry){
+
+        // Since trade handler already captures executions, depth handler is mostly for cancellations.
+        double beta = 0.9; // double beta = 0.2 - 0.4; lower beta to prevent double counting, this simulates poisson process now
+
+        for(auto& [price_tick, new_qty]: entry.bid_delta){ //find price tick from bid_queue_ahead
+            
+            if(price_tick == bid_queue_ahead.first){
+                auto it = market_book.bids.find(price_tick);
+                double old_qty = (it != market_book.bids.end()) ? it->second : 0.0;
+
+                if(old_qty > 0.0){
+                    double depletion = max(0.0, old_qty - new_qty);
+                    
+                    if(depletion > 0.0){
+                        hawkes.update(depletion, entry.ts); // hawkes process
+
+                        bid_queue_ahead.second = max(0.0, bid_queue_ahead.second - hawkes.beta * depletion);
+                        cout << "bid order queue_ahead @ " << price_tick << ": " << bid_queue_ahead.second << ", hawkes.beta * depletion: " << hawkes.beta * depletion << "\n";
+                    }
+                }
+                break; // no need to continue scanning
+            }
+        }
+
+        for(auto& [price_tick, new_qty]: entry.ask_delta){
+
+            if(price_tick == ask_queue_ahead.first){
+                auto it = market_book.asks.find(price_tick);
+                double old_qty = (it != market_book.asks.end()) ? it->second : 0.0;
+
+                if(old_qty > 0.0){
+                    double depletion = max(0.0, old_qty - new_qty);
+
+                    if(depletion > 0.0){
+                        hawkes.update(depletion, entry.ts); // hawkes process
+
+                        ask_queue_ahead.second = max(0.0, ask_queue_ahead.second - hawkes.beta * depletion);
+                        cout << "ask order queue_ahead @ " << price_tick << ": " << ask_queue_ahead.second << ", hawkes.beta * depletion: " << hawkes.beta * depletion << "\n";
+                    }
+                }
+                break; // no need to continue scanning
+            }
+        }
     }
 
     void update_vol(){
@@ -234,6 +282,32 @@ public:
         equity_history.push_back(equity);
     }
 
+    double set_queue_position(const std_string& side, const int64_t& price_tick){
+
+        double book_size = 0.0;
+
+        if(side == "BUY"){
+            auto it = market_book.bids.find(price_tick);
+            if(it != market_book.bids.end()) book_size = it->second;
+            
+            bid_queue_ahead = {price_tick, book_size};
+        }
+        else{
+            auto it = market_book.asks.find(price_tick);
+            if(it != market_book.asks.end()) book_size = it->second;
+
+            ask_queue_ahead = {price_tick, book_size};
+        }
+
+        return book_size;
+    }
+
+    void reset_queue_position(const std_string& side){
+
+        if(side == "BUY") bid_queue_ahead = {-1, 0.0};
+        else ask_queue_ahead = {-1, 0.0};
+    }
+
     Regime get_regime(){
 
         auto mean = [](const deque<double>& q){
@@ -265,25 +339,6 @@ public:
         regime.microprice_error = mean(mfs.microprice_error);
 
         return regime;
-    }
-
-    double compute_queue_ahead(Order* order){
-        return order ? order->queue_ahead : 0.0;
-    }
-
-    double set_queue_position(const std_string& side, const int64_t& price_tick) {
-
-        double book_size = 0.0;
-        if(side == "BUY"){
-            auto it = market_book.bids.find(price_tick);
-            if(it != market_book.bids.end()) book_size = it->second;
-        }
-        else{
-            auto it = market_book.asks.find(price_tick);
-            if(it != market_book.asks.end()) book_size = it->second;
-        }
-
-        return book_size;
     }
 
     void on_fill(const double& price, double fill_qty, const std_string& side, const bool& is_maker){

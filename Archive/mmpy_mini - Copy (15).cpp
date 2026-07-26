@@ -94,6 +94,7 @@ public:
     virtual double get_current_ask_size() = 0;
     virtual void place_quotes_latency(const Signal&) = 0; //paper
     virtual bool process_latency_queue() = 0; //paper
+    virtual void update_queue_from_depth(const Depth&) = 0;
     virtual void process_trade(const Trade&) = 0;
     virtual Order* get_open_order(const std_string&) = 0;
     virtual void cancel_all_orders() = 0;
@@ -185,6 +186,67 @@ public:
         return nullptr;
     }
 
+    void update_queue_from_depth(const Depth& entry) override {
+
+        // Since trade handler already captures executions, depth handler is mostly for cancellations.
+        double beta = 0.9; // double beta = 0.2 - 0.4; lower beta to prevent double counting, this simulates poisson process now
+        // can move hawkes process here now
+
+        for(auto& [price_tick, new_qty]: entry.bid_delta){
+            
+            auto it = state.market_book.bids.find(price_tick);
+            double old_qty = (it != state.market_book.bids.end()) ? it->second : 0.0;
+
+            if(old_qty > 0.0){
+                double depletion = max(0.0, old_qty - new_qty);
+                if(depletion <= 0.0) continue; //for small rounding errors, do <= 0.0
+
+                // state.hawkes.update(depletion, entry.ts); // hawkes process
+
+                // compensate for hidden churn, since there might be many cancellations/additions
+                if(depletion < 0.05) beta = 15.0;
+                else if (depletion < 0.5) beta = 7.0;
+                // large depletion is probably real
+                else beta = 0.6;
+
+                // beta = beta + 2.0 * state.hawkes.excitation;
+
+                Order* order = get_fill_candidate_order("BUY", price_tick);
+                if(!order) continue;
+
+                order->queue_ahead = max(0.0, order->queue_ahead - beta * depletion);
+                cout << "buy order queue_ahead: " << order->queue_ahead << ", beta * depletion: " << beta * depletion << "\n";
+            }
+        }
+
+        for(auto& [price_tick, new_qty]: entry.ask_delta){
+            
+            auto it = state.market_book.asks.find(price_tick);
+            double old_qty = (it != state.market_book.asks.end()) ? it->second : 0.0;
+
+            if(old_qty > 0.0){
+                double depletion = max(0.0, old_qty - new_qty);
+                if(depletion <= 0.0) continue;
+
+                // state.hawkes.update(depletion, entry.ts); // hawkes process
+
+                // compensate for hidden churn, since there might be many cancellations/additions
+                if(depletion < 0.05) beta = 15.0;
+                else if (depletion < 0.5) beta = 7.0;
+                // large depletion is probably real
+                else beta = 0.6;
+
+                // beta = beta + 2.0 * state.hawkes.excitation;
+
+                Order* order = get_fill_candidate_order("SELL", price_tick);
+                if(!order) continue;
+
+                order->queue_ahead = max(0.0, order->queue_ahead - beta * depletion);
+                cout << "sell order queue_ahead: " << order->queue_ahead << ", beta * depletion: " << beta * depletion << "\n";
+            }
+        }
+    }
+
     void process_trade(const Trade& trade) override {
 
         update_trade_flow(trade);
@@ -273,7 +335,7 @@ public:
         order.owner = "self";
         order.signal = signal;
         order.queue_ahead_at_join = state.set_queue_position(side, price_tick);
-        // order.queue_ahead = order.queue_ahead_at_join;
+        order.queue_ahead = order.queue_ahead_at_join;
 
         open_orders[client_oid] = order;   // <-- insert into map
 
@@ -307,7 +369,7 @@ public:
         order.owner = "self";
         order.signal = *state.last_signal;
         order.queue_ahead_at_join = 0.0;
-        // order.queue_ahead = 0.0;
+        order.queue_ahead = 0.0;
 
         open_orders[client_oid] = order;   // <-- insert into map
 
@@ -319,8 +381,6 @@ public:
         order->ts = clock.now_ms();
         order->status = "CANCELED";
         order->exchange_latency = state.exchange_latency;
-
-        state.reset_queue_position(order->side);
 
         state.last_order_update = *order;
 
@@ -404,7 +464,7 @@ public:
 
         // state.hawkes.update(depletion, trade.ts); // hawkes process
 
-        Order* order = get_fill_candidate_order(side, price_tick);
+        Order* order = get_fill_candidate_order(side, price_tick); //do this first, then get dt
 
         if(!order) return;
 
@@ -412,15 +472,13 @@ public:
 
         double fill_qty = 0.0;
 
-        auto& queue_ahead = (side == "BUY") ? state.bid_queue_ahead : state.ask_queue_ahead;
+        cout << "match side order queue ahead before: " << order->queue_ahead << "\n";
 
-        cout << "match side order queue ahead before: " << queue_ahead.second << "\n";
-
-        if(queue_ahead.second > 0.0){
-            double removed_qty = min(queue_ahead.second, trade.qty);
+        if(order->queue_ahead > 0.0){
+            double removed_qty = min(order->queue_ahead, trade.qty);
 
             //remove matched trade qty from queue_ahead
-            queue_ahead.second = max(0.0, queue_ahead.second - removed_qty);
+            order->queue_ahead = max(0.0, order->queue_ahead - removed_qty);
 
             //get the remaining trade qty after using it for updating queue_ahead
             double remaining_trade_qty = trade.qty - removed_qty;
@@ -454,14 +512,11 @@ public:
             recorder.log_fill(*order, fill_qty, trade.ts + clock.offset_ms.load(), true);
         }
 
-        cout << "match side order queue ahead after: " << queue_ahead.second << "\n";
+        cout << "match side order queue ahead after: " << order->queue_ahead << "\n";
 
         state.last_order_update = *order;
 
-        if(order->status == "FILLED"){
-            state.reset_queue_position(side); // reset queue position
-            open_orders.erase(order->client_oid);
-        }
+        if(order->status == "FILLED") open_orders.erase(order->client_oid);
     }
 
     void orderMarketToString(Order* order, const double& fill_qty){
@@ -809,6 +864,66 @@ public:
         return nullptr;
     }
 
+    void update_queue_from_depth(const Depth& entry) override {
+
+        // Since trade handler already captures executions, depth handler is mostly for cancellations.
+        double beta = 0.2; // double beta = 0.2 - 0.4; lower beta to prevent double counting
+
+        for(auto& [price_tick, new_qty]: entry.bid_delta){
+            
+            auto it = state.market_book.bids.find(price_tick);
+            double old_qty = (it != state.market_book.bids.end()) ? it->second : 0.0;
+
+            if(old_qty > 0.0){
+                double depletion = max(0.0, old_qty - new_qty);
+                if(depletion <= 0.0) continue; //for small rounding errors, do <= 0.0
+
+                // state.hawkes.update(depletion, entry.ts); // hawkes process
+
+                // compensate for hidden churn, since there might be many cancellations/additions
+                if(depletion < 0.05) beta = 15.0;
+                else if (depletion < 0.5) beta = 7.0;
+                // large depletion is probably real
+                else beta = 0.6;
+
+                // beta = beta + 2.0 * state.hawkes.excitation;
+
+                Order* order = get_fill_candidate_order("BUY", price_tick);
+                if(!order) continue;
+
+                order->queue_ahead = max(0.0, order->queue_ahead - beta * depletion);
+                cout << "buy order queue_ahead: " << order->queue_ahead << "\n";
+            }
+        }
+
+        for(auto& [price_tick, new_qty]: entry.ask_delta){
+            
+            auto it = state.market_book.asks.find(price_tick);
+            double old_qty = (it != state.market_book.asks.end()) ? it->second : 0.0;
+
+            if(old_qty > 0.0){
+                double depletion = max(0.0, old_qty - new_qty);
+                if(depletion <= 0.0) continue;
+
+                // state.hawkes.update(depletion, entry.ts); // hawkes process
+
+                // compensate for hidden churn, since there might be many cancellations/additions
+                if(depletion < 0.05) beta = 15.0;
+                else if (depletion < 0.5) beta = 7.0;
+                // large depletion is probably real
+                else beta = 0.6;
+
+                // beta = beta + 2.0 * state.hawkes.excitation;
+
+                Order* order = get_fill_candidate_order("SELL", price_tick);
+                if(!order) continue;
+
+                order->queue_ahead = max(0.0, order->queue_ahead - beta * depletion);
+                cout << "sell order queue_ahead: " << order->queue_ahead << "\n";
+            }
+        }
+    }
+
     void process_trade(const Trade& trade) override {
         
         update_trade_flow(trade);
@@ -960,6 +1075,7 @@ public:
         order.owner = "self";
         order.signal = *state.last_signal;
         order.queue_ahead_at_join = 0.0;
+        order.queue_ahead = 0.0;
 
         json resp = broker.place_market(order);
         order.resp = resp;
@@ -1074,6 +1190,7 @@ public:
             order->live_ts = stream.exchange_ts;
             order->status = "LIVE";
             order->queue_ahead_at_join = state.set_queue_position(stream.side, order->price_tick);
+            order->queue_ahead = order->queue_ahead_at_join;
 
             (stream.side == "BUY") ? last_bid = stream.price : last_ask = stream.price;
             state.last_order_update = *order;
@@ -1090,9 +1207,6 @@ public:
         else if(stream.exec_type == "CANCELED"){
             
             order->status = "CANCELED";
-
-            state.reset_queue_position(stream.side);
-
             state.last_order_update = *order;
 
             cout << "- CANCEL LIMIT ORDER - client_oid: " << order->client_oid << 
@@ -1125,9 +1239,6 @@ public:
         else if(stream.exec_type == "EXPIRED"){
             
             order->status = "EXPIRED";
-
-            state.reset_queue_position(stream.side);
-
             state.last_order_update = *order;
 
             cout << "- EXPIRED LIMIT ORDER - client_oid: " << order->client_oid << 
@@ -1163,9 +1274,8 @@ public:
             
             if(stream.status == "PARTIALLY_FILLED"){
                 order->status = "PARTIALLY_FILLED";
-                order->remaining = max(0.0, order->remaining - stream.fill_qty);
-
-                (stream.side == "BUY") ? state.bid_queue_ahead.second = 0.0 : state.ask_queue_ahead.second = 0.0;
+                order->remaining -= stream.fill_qty;
+                order->queue_ahead = max(0.0, order->queue_ahead - stream.fill_qty);
 
                 cout << "- PARTIALLY FILLED LIMIT ORDER - client_oid: " << order->client_oid << 
                 ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
@@ -1174,8 +1284,7 @@ public:
             else if(stream.status == "FILLED"){
                 order->status = "FILLED";
                 order->remaining = 0.0;
-                
-                state.reset_queue_position(stream.side);
+                order->queue_ahead = 0.0;
 
                 cout << "- FILLED LIMIT ORDER - client_oid: " << order->client_oid << 
                 ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
@@ -1418,7 +1527,7 @@ public:
         // -----------------------------
         // APPLY DELTA - REMOVE LOCK FOR SINGLE THREADED QUEUE
         // -----------------------------
-        state.update_queue_from_depth(depth);
+        execution.update_queue_from_depth(depth);
         book.apply_delta(depth);
         book.last_update_id = depth.u;
 
@@ -1437,7 +1546,10 @@ public:
         // -----------------------------
         if(!state.initialized) return;
 
-        Signal signal = strategy.generate_quotes(state);
+        Order* bid_order = execution.get_open_order("BUY"); // to be changed later on
+        Order* ask_order = execution.get_open_order("SELL");
+
+        Signal signal = strategy.generate_quotes(state, bid_order, ask_order);
         recorder.log_snapshot(signal);
         state.last_signal = signal;
         execution.place_quotes(signal);
@@ -1470,7 +1582,7 @@ public:
         // -----------------------------
         // APPLY DELTA
         // -----------------------------
-        state.update_queue_from_depth(depth);
+        execution.update_queue_from_depth(depth);
         book.apply_delta(depth);
         book.last_update_id = depth.u;
 
@@ -1489,7 +1601,10 @@ public:
         // -----------------------------
         if(!state.initialized) return;
 
-        Signal signal = strategy.generate_quotes(state);
+        Order* bid_order = execution.get_open_order("BUY"); // to be changed later on
+        Order* ask_order = execution.get_open_order("SELL");
+
+        Signal signal = strategy.generate_quotes(state, bid_order, ask_order);
         recorder.log_snapshot(signal);
         state.last_signal = signal;
         execution.place_quotes(signal);
@@ -1522,7 +1637,7 @@ public:
         // -----------------------------
         // APPLY DELTA
         // -----------------------------
-        state.update_queue_from_depth(depth);
+        execution.update_queue_from_depth(depth);
         book.apply_delta(depth);
         book.last_update_id = depth.u;
 
@@ -1541,7 +1656,10 @@ public:
         // -----------------------------
         if(!state.initialized) return;
 
-        Signal signal = strategy.generate_quotes(state);
+        Order* bid_order = execution.get_open_order("BUY"); // to be changed later on
+        Order* ask_order = execution.get_open_order("SELL");
+
+        Signal signal = strategy.generate_quotes(state, bid_order, ask_order);
         recorder.log_snapshot(signal);
         state.last_signal = signal;
         execution.place_quotes_latency(signal);
@@ -1574,7 +1692,7 @@ public:
         // -----------------------------
         // APPLY DELTA
         // -----------------------------
-        state.update_queue_from_depth(depth);
+        execution.update_queue_from_depth(depth);
         book.apply_delta(depth);
         book.last_update_id = depth.u;
 
@@ -1593,7 +1711,10 @@ public:
         // -----------------------------
         if(!state.initialized) return;
 
-        Signal signal = strategy.generate_quotes(state);
+        Order* bid_order = execution.get_open_order("BUY"); // to be changed later on
+        Order* ask_order = execution.get_open_order("SELL");
+
+        Signal signal = strategy.generate_quotes(state, bid_order, ask_order);
         recorder.log_snapshot(signal);
         state.last_signal = signal;
         execution.place_quotes_latency(signal);
@@ -1639,8 +1760,11 @@ public:
         double spread = best_ask - best_bid;
         double microprice = (best_ask * bid_size + best_bid * ask_size) /(bid_size + ask_size + 1e-9);
 
-        double bid_queue = (state.bid_queue_ahead.first == bid_tick) ? state.bid_queue_ahead.second : 0.0;
-        double ask_queue = (state.ask_queue_ahead.first == ask_tick) ? state.ask_queue_ahead.second : 0.0;
+        Order* bid_order = execution.get_open_order("BUY");
+        Order* ask_order = execution.get_open_order("SELL");
+
+        double bid_queue = state.compute_queue_ahead(bid_order);
+        double ask_queue = state.compute_queue_ahead(ask_order);
 
         snap.title.header = header;
         snap.title.regime = state.last_signal ? state.last_signal->regime : "";
@@ -1685,8 +1809,8 @@ public:
         snap.execution.bid_pressure = bid_queue / (bid_size + 1e-9);
         snap.execution.ask_pressure = ask_queue / (ask_size + 1e-9);
 
-        snap.execution.buy_order = orderPointerToString(execution.get_open_order("BUY"));
-        snap.execution.sell_order = orderPointerToString(execution.get_open_order("SELL"));
+        snap.execution.buy_order = orderPointerToString(bid_order);
+        snap.execution.sell_order = orderPointerToString(ask_order);
         snap.execution.last_fill_candidate = orderOptionalToString(state.last_fill_candidate);
         snap.execution.last_order_update = orderOptionalToString(state.last_order_update);
         

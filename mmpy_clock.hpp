@@ -95,15 +95,15 @@ public:
 
     BinanceClock(MarketConfig& config): config(config) {}
 
-    int64_t now_ms() const{
+    int64_t now_ms() const {
         return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
     }
 
-    int64_t compute_feed_latency(int64_t local_ts, int64_t feed_ts) const {
+    int64_t compute_feed_latency(const int64_t& local_ts, const int64_t& feed_ts) const {
         return (local_ts - offset_ms.load()) - feed_ts;
     }
 
-    int64_t compute_exchange_latency(int64_t stream_ts, int64_t local_ts) const {
+    int64_t compute_exchange_latency(const int64_t& stream_ts, const int64_t& local_ts) const {
         return stream_ts - (local_ts - offset_ms.load());
     }
 

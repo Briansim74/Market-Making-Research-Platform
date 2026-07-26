@@ -616,6 +616,16 @@ public:
         double signal_quality = stability_penalty * tanh(3.0 * raw);
 
         return 0.3 + 1.4 * ((signal_quality + 1.0) / 2.0);
+
+        // This converts:
+        // signal_quality ∈ [-1, +1]
+
+        // into: 
+        // output ∈ [0.3, 1.7]
+
+        // 0.3  = very bad signal
+        // 1.0  = neutral / no adjustment
+        // 1.7  = very strong signal
     }
 
     double compute_struct_delta(const Features& features, const Policy& policy){
@@ -638,7 +648,7 @@ public:
         return micro_signal_model->predict(features);
     }
 
-    pair<double, double> compute_residual_delta(State& state, double struct_delta, double micro_signal_delta, 
+    pair<double, double> compute_residual_delta(State& state, const double& struct_delta, const double& micro_signal_delta, 
                                                 const Features& features, const Policy& policy){
         
         if(residual_model == nullptr) return {0.0, 0.0};
@@ -680,7 +690,7 @@ public:
     // -------------------------
     // FINAL QUOTE GENERATION
     // -------------------------
-    Signal generate_quotes(State& state, Order* bid_order, Order* ask_order){ // put execution here in the mean time
+    Signal generate_quotes(State& state){ // put execution here in the mean time
 
         auto& book = state.market_book;
 
@@ -709,8 +719,8 @@ public:
         features.trade_imbalance = state.trade_imbalance;
         features.inventory = state.inventory;
         features.volatility = state.get_vol();
-        features.queue_ahead_bid = state.compute_queue_ahead(bid_order);
-        features.queue_ahead_ask = state.compute_queue_ahead(ask_order);
+        features.queue_ahead_bid = state.bid_queue_ahead.second;
+        features.queue_ahead_ask = state.ask_queue_ahead.second;
 
         // -------------------------
         // ALPHA STACK
