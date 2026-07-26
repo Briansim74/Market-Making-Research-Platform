@@ -125,8 +125,8 @@ Results:
 ## Execution Model
 ### 1. Fill Model
 Deterministic fill model driven by:
-- trade-driven depletion
-- cancellation-driven depletion (explicitly modeled)
+- trade-driven depletion (explicitly modeled)
+- depth-driven depletion (cancellations, additions, quote churn estimation, hawkes)
 - hawkes excitation
 
 ```
