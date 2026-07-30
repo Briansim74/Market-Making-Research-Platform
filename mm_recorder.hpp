@@ -16,6 +16,7 @@
 #include <cctype>
 #include <memory>
 #include <chrono>
+#include <csignal>
 #include <iomanip>
 #include <sstream>
 #include <fstream>
@@ -58,9 +59,9 @@
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 
-#include "mmpy_structs.hpp" //structs
-#include "mmpy_config_orderbook.hpp" //market config & orderbook
-#include "mmpy_state.hpp" //state & market_feature_state
+#include "mm_structs.hpp" //structs
+#include "mm_config_orderbook.hpp" //market config & orderbook
+#include "mm_state.hpp" //state & market_feature_state
 
 using std::cout;
 using json = nlohmann::json;
@@ -226,7 +227,7 @@ public:
         parquet::arrow::WriteTable(*table, pool, out, 1024);
     }
 
-    void shutdown(){
+    void stop(){
         state.update_performance();
 
         // flush events

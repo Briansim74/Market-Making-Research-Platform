@@ -58,7 +58,7 @@
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 
-#include "mmpy_structs.hpp" //structs
+#include "mm_structs.hpp" //structs
 
 using std::cout;
 using json = nlohmann::json;

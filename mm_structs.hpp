@@ -16,6 +16,7 @@
 #include <cctype>
 #include <memory>
 #include <chrono>
+#include <csignal>
 #include <iomanip>
 #include <sstream>
 #include <fstream>
@@ -199,6 +200,10 @@ struct ExecutionEventQueue {
         queue.pop();
 
         return true;
+    }
+
+    void wake(){
+        cv.notify_all();
     }
 };
 

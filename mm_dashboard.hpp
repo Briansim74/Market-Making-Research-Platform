@@ -16,6 +16,7 @@
 #include <cctype>
 #include <memory>
 #include <chrono>
+#include <csignal>
 #include <iomanip>
 #include <sstream>
 #include <fstream>
@@ -58,7 +59,7 @@
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 
-#include "mmpy_structs.hpp" //structs
+#include "mm_structs.hpp" //structs
 
 using std::cout;
 using json = nlohmann::json;
@@ -381,8 +382,11 @@ public:
                 } // IMPORTANT: must run in same strand context
                 session->run();
             }
-            else cout << "ACCEPT ERROR: " << ec.message() << "\n";
-            if (running) do_accept();
+            else if(running){
+                // only print errors when server is actually running
+                cout << "ACCEPT ERROR: " << ec.message() << "\n";
+            }
+            if(running) do_accept();
         });
     }
 
@@ -413,7 +417,8 @@ public:
     void stop(){ 
         running = false; 
         boost::system::error_code ec; 
-        acceptor.close(ec); ioc.stop(); 
+        acceptor.close(ec);
+        ioc.stop();
         if(server_thread.joinable()) server_thread.join();
     }
 

@@ -16,6 +16,7 @@
 #include <cctype>
 #include <memory>
 #include <chrono>
+#include <csignal>
 #include <iomanip>
 #include <sstream>
 #include <fstream>
@@ -58,7 +59,7 @@
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 
-#include "mmpy_config_orderbook.hpp" //market config & orderbook
+#include "mm_config_orderbook.hpp" //market config & orderbook
 
 using std::cout;
 using json = nlohmann::json;
@@ -88,10 +89,12 @@ public:
     atomic<bool> running{false};
     atomic<bool> connected{false};
 
-    thread clock_thread;
-
     mutex connection_mtx;
+    mutex clock_mtx;
     condition_variable connection_cv;
+    condition_variable clock_cv;
+
+    thread clock_thread;
 
     BinanceClock(MarketConfig& config): config(config) {}
 
@@ -127,7 +130,8 @@ public:
                 cout << "CLOCK ERROR: " << e.what() << "\n";
             }
 
-            this_thread::sleep_for(seconds(5));
+            unique_lock<mutex> lock(clock_mtx);
+            clock_cv.wait_for(lock, seconds(5), [this]{return !running.load();});
         }
     }
 
@@ -214,6 +218,7 @@ public:
 
     void stop(){
         running = false;
+        clock_cv.notify_one();
 
         if(clock_thread.joinable()) clock_thread.join();
     }

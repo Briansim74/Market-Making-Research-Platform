@@ -16,6 +16,7 @@
 #include <cctype>
 #include <memory>
 #include <chrono>
+#include <csignal>
 #include <iomanip>
 #include <sstream>
 #include <fstream>
@@ -76,8 +77,8 @@ using tcp = asio::ip::tcp;
 using ssl_stream = asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
 
-#include "mmpy_structs.hpp" //structs
-#include "mmpy_config_orderbook.hpp" //market config & orderbook
+#include "mm_structs.hpp" //structs
+#include "mm_config_orderbook.hpp" //market config & orderbook
 
 class BinanceMarkPriceStream {
 public:
