@@ -270,7 +270,6 @@ public:
         order.owner = "self";
         order.signal = signal;
         order.queue_ahead_at_join = state.set_queue_position(side, price_tick);
-        // order.queue_ahead = order.queue_ahead_at_join;
 
         open_orders[client_oid] = order;   // <-- insert into map
 
@@ -304,7 +303,6 @@ public:
         order.owner = "self";
         order.signal = *state.last_signal;
         order.queue_ahead_at_join = 0.0;
-        // order.queue_ahead = 0.0;
 
         open_orders[client_oid] = order;   // <-- insert into map
 
@@ -461,11 +459,6 @@ public:
         }
     }
 
-    void orderMarketToString(Order* order, const double& fill_qty){
-        cout << format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
-            order->side, config.from_tick(order->price_tick), fill_qty, order->status) << "\n";
-    }
-
     void execute_market(Order* order){
 
         auto& book = state.market_book;
@@ -486,7 +479,6 @@ public:
 
                 state.last_fill_candidate = *order;
                 state.last_order_update = *order;
-                orderMarketToString(order, fill_qty);
 
                 recorder.log_fill(*order, fill_qty, clock.now_ms(), false);
 
@@ -510,7 +502,6 @@ public:
 
                 state.last_fill_candidate = *order;
                 state.last_order_update = *order;
-                orderMarketToString(order, fill_qty);
 
                 recorder.log_fill(*order, fill_qty, clock.now_ms(), false);
 
@@ -518,6 +509,8 @@ public:
                 else ++it;
             }
         }
+
+        open_orders.erase(order->client_oid);
     }
 
     void apply_stream_update(const Stream& stream) override {}
@@ -531,7 +524,7 @@ public:
     ssl::context ctx;
     ssl_stream ssl_sock;
 
-    mutex mtx;
+    mutex mtx; // execution and broker keepalive mtx
 
     HttpClient(MarketConfig& config) : config(config), ctx(ssl::context::tlsv12_client), ssl_sock(ioc, ctx) {}
 
@@ -585,12 +578,11 @@ public:
         http::read(ssl_sock, buffer, res);
 
         if(res.result_int() >= 400){
-            cout << "ERROR: status >= 400: HTTP "
-                + to_string(res.result_int()) + ": " + res.body();
+            cout << "ERROR: status >= 400: HTTP " + to_string(res.result_int()) + ": " + res.body();
         }
 
         cout << "\n===== HTTP RESPONSE =====\n";
-        cout << res << endl;
+        if(method != http::verb::get) cout << res << endl;
 
         return res.body();
     }
@@ -604,6 +596,10 @@ public:
 
     std_string listen_key;
     atomic<bool> keepalive_running{false};
+
+    mutex keepalive_mtx;
+    condition_variable keepalive_cv;
+
     thread keepalive_thread;
 
     BinanceBroker(MarketConfig& config, BinanceClock& clock)
@@ -632,12 +628,37 @@ public:
         http.request(http::verb::put, url, headers);
     }
 
+    // void start_keepalive_loop(){
+    //     keepalive_running = true;
+
+    //     keepalive_thread = thread([this](){
+    //         unique_lock<mutex> lock(keepalive_mtx);
+
+    //         while(keepalive_running){
+    //             if(keepalive_cv.wait_for(lock, minutes(20),
+    //             [this]{return !keepalive_running.load();})) break;
+
+    //             try{
+    //                 keepalive_listen_key();
+    //                 cout << "[keepalive sent]\n";
+    //             }
+    //             catch(...){
+    //                 cout << "[keepalive error]\n";
+    //             }
+    //         }
+    //     });
+    // }
+
     void start_keepalive_loop(){
         keepalive_running = true;
 
         keepalive_thread = thread([this](){
-            while(keepalive_running){
-                this_thread::sleep_for(minutes(20));
+            unique_lock<mutex> lock(keepalive_mtx);
+
+            while(true){
+                if(keepalive_cv.wait_for(lock, minutes(20),
+                    [this]{return !keepalive_running;})) break;
+
                 try{
                     keepalive_listen_key();
                     cout << "[keepalive sent]\n";
@@ -649,8 +670,9 @@ public:
         });
     }
 
-    void stop_keepalive(){
+    void stop(){
         keepalive_running = false;
+        keepalive_cv.notify_one();
 
         if(keepalive_thread.joinable()) keepalive_thread.join();
     }
@@ -772,8 +794,7 @@ public:
     double last_bid = 0.0;
     double last_ask = 0.0;
 
-    LiveExecution(MarketConfig& config, State& state, DatasetRecorder& recorder, 
-                BinanceBroker& broker, BinanceClock& clock)
+    LiveExecution(MarketConfig& config, State& state, DatasetRecorder& recorder, BinanceBroker& broker, BinanceClock& clock)
         : config(config), state(state), recorder(recorder), broker(broker), clock(clock) {}
 
     double get_last_bid() override {
@@ -907,7 +928,7 @@ public:
         json resp = broker.place_limit(order, price, size);
         order.resp = resp;
 
-        if(resp.contains("code")){ // TO BE DELETED
+        if(resp.contains("code")){
             int code = resp["code"];
 
             if(code == -4003){
@@ -958,8 +979,33 @@ public:
         order.signal = *state.last_signal;
         order.queue_ahead_at_join = 0.0;
 
+        cout << "- PLACE MARKET ORDER - client_oid: " << order.client_oid << 
+        ", status: " << order.status << ", timestamp: " << order.ts << "\n";
+
         json resp = broker.place_market(order);
         order.resp = resp;
+
+        if(resp.contains("code")){
+            int code = resp["code"];
+
+            if(code == -4003){
+                cout << "Market order rejected: Quantity less than or equal to zero.\n";
+            }
+
+            else if(code == -4164){
+                cout << "Order's notional must be no smaller than 50 (unless you choose reduce only).\n";
+            }
+            // other exchange errors
+            else cout << "Market order failed: " << resp.dump() << "\n";
+
+            order.ts = clock.now_ms();
+            order.status = "REJECTED";
+            order.exchange_latency = state.exchange_latency;
+
+            open_orders.erase(order.client_oid);
+
+            return;
+        }
     }
 
     void cancel_order(Order* order){
@@ -1043,9 +1089,10 @@ public:
         return nullptr;
     }
 
-    void orderMarketToString(Order* order, const Stream& stream){
-        cout << format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
-            order->side, stream.fill_price, stream.fill_qty, order->status) << "\n";
+    void orderToString(const Order* order, const Stream& stream, const std_string& order_type){
+        cout << "- " << order_type << ((stream.order_type != "MARKET") ? " LIMIT ORDER" : " MARKET ORDER")
+        << " - client_oid: " << order->client_oid <<
+        ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
     }
 
     // -------------------------
@@ -1075,9 +1122,7 @@ public:
             (stream.side == "BUY") ? last_bid = stream.price : last_ask = stream.price;
             state.last_order_update = *order;
 
-            cout << "- PLACE LIMIT ORDER - client_oid: " << order->client_oid << 
-            ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
-            
+            orderToString(order, stream, "PLACE");
             recorder.log_quote(*order, (stream.side == "BUY") ? "BID" : "ASK", "NEW");
         }
 
@@ -1092,26 +1137,8 @@ public:
 
             state.last_order_update = *order;
 
-            cout << "- CANCEL LIMIT ORDER - client_oid: " << order->client_oid << 
-            ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
-
+            orderToString(order, stream, "CANCEL");
             recorder.log_quote(*order, (stream.side == "BUY") ? "BID" : "ASK", "CANCELED");
-
-            open_orders.erase(order->client_oid);
-        }
-
-        // -------------------------
-        // REJECTED - PENDING NEW ORDER REJECTED
-        // -------------------------
-        else if(stream.exec_type == "REJECTED"){
-            
-            order->status = "REJECTED";
-            state.last_order_update = *order;
-
-            cout << "- REJECTED LIMIT ORDER - client_oid: " << order->client_oid << 
-            ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
-            
-            recorder.log_quote(*order, (stream.side == "BUY") ? "BID" : "ASK", "REJECTED");
 
             open_orders.erase(order->client_oid);
         }
@@ -1127,9 +1154,7 @@ public:
 
             state.last_order_update = *order;
 
-            cout << "- EXPIRED LIMIT ORDER - client_oid: " << order->client_oid << 
-            ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
-
+            orderToString(order, stream, "EXPIRED");
             recorder.log_quote(*order, (stream.side == "BUY") ? "BID" : "ASK", "EXPIRED");
 
             open_orders.erase(order->client_oid);
@@ -1164,8 +1189,7 @@ public:
 
                 (stream.side == "BUY") ? state.bid_queue_ahead.second = 0.0 : state.ask_queue_ahead.second = 0.0;
 
-                cout << "- PARTIALLY FILLED LIMIT ORDER - client_oid: " << order->client_oid << 
-                ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
+                orderToString(order, stream, "PARTIALLY_FILLED");
             }
 
             else if(stream.status == "FILLED"){
@@ -1174,15 +1198,12 @@ public:
                 
                 state.reset_queue_position(stream.side);
 
-                cout << "- FILLED LIMIT ORDER - client_oid: " << order->client_oid << 
-                ", status: " << order->status << ", timestamp: " << stream.exchange_ts << "\n";
+                orderToString(order, stream, "FILLED");
             }
 
-            if(stream.order_type == "MARKET"){
-                orderMarketToString(order, stream);
-                recorder.log_fill(*order, stream.fill_qty, stream.exchange_ts, false);
-            }
-            else recorder.log_fill(*order, stream.fill_qty, stream.exchange_ts, true);
+            // if(stream.order_type == "MARKET") orderMarketToString(order, stream);
+
+            recorder.log_fill(*order, stream.fill_qty, stream.exchange_ts, (stream.order_type != "MARKET"));
 
             state.last_order_update = *order;
        
@@ -1207,6 +1228,8 @@ public:
     
     thread stream_thread;
     simdjson::ondemand::parser parser;
+
+    unique_ptr<ws_stream> ws;
 
     mutex connection_mtx;
     condition_variable connection_cv;
@@ -1251,8 +1274,8 @@ public:
         // -------------------------
         // STEP 3: WEBSOCKET LAYER
         // -------------------------
-        ws_stream ws(move(ssl_sock));
-        ws.handshake(config.hostname, "/ws/" + broker.listen_key);
+        ws = make_unique<ws_stream>(move(ssl_sock));
+        ws->handshake(config.hostname, "/ws/" + broker.listen_key);
 
         {
             lock_guard<mutex> lock(connection_mtx);
@@ -1263,7 +1286,9 @@ public:
         beast::flat_buffer buffer;
 
         while(running){
-            ws.read(buffer);
+            boost::system::error_code ec;
+            ws->read(buffer, ec);
+            if(ec) break;
 
             std_string msg = beast::buffers_to_string(buffer.data());
             buffer.consume(buffer.size());
@@ -1273,9 +1298,15 @@ public:
     }
 
     void stop(){
+        cout << "STOPPING USER STREAM\n";
         running = false;
 
+        boost::system::error_code ec;
+        beast::get_lowest_layer(*ws).cancel(ec);
+
         if(stream_thread.joinable()) stream_thread.join();
+
+        cout << "USER STREAM STOPPED\n";
     }
 
     void on_message(const std_string& msg){

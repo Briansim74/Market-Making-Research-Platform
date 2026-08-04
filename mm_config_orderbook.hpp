@@ -111,6 +111,7 @@ public:
     size_t qty_precision = 0;
 
     std_string folder_path;
+    double speed_multiplier;
     std_string host;
     int16_t port;
 
@@ -157,6 +158,7 @@ public:
         taker_fee_rate = params["fees"]["taker_fee_rate"].get<double>();
 
         folder_path = params["folder_path"].get<std_string>();
+        speed_multiplier = params["speed_multiplier"].get<double>();
         host = params["server_config"]["host"].get<std_string>();
         port = params["server_config"]["port"].get<int16_t>();
 

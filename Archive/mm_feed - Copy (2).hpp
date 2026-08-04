@@ -25,7 +25,6 @@
 #include <optional>
 #include <iostream>
 #include <algorithm>
-#include <filesystem>
 #include <functional>
 #include <filesystem>
 #include <unordered_map>
@@ -60,10 +59,11 @@
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 
+#include <filesystem>
+
 #include "mm_structs.hpp" //structs
 #include "mm_config_orderbook.hpp" //market config & orderbook
 #include "mm_state.hpp" //state & market_feature_state
-#include "mm_recorder.hpp" //dataset recorder
 #include "mm_clock.hpp" // clock
 
 using std::cout;
@@ -97,27 +97,28 @@ public:
     MarketConfig& config;
     State& state;
     ExecutionEventQueue& execution_event;
-    DatasetRecorder& recorder;
     BinanceClock& clock;
 
-    unique_ptr<ws_stream> trade_ws;
-    unique_ptr<ws_stream> depth_ws;
+    function<void(const std_string&, const int64_t&, const int64_t&, const int64_t&, const std_string&)> log_event;
+    function<void(const json&)> export_orderbook_snapshot;
+
+    thread depth_thread;
+    thread trade_thread;
+
+    mutex cv_mtx; //condition variable lock
+    mutex buffer_mtx;
+    condition_variable cv;
+    vector<Depth> depth_buffer;
 
     atomic<bool> running{false};
     atomic<bool> buffering{true};
     atomic<bool> first_depth_received{false};
 
-    vector<Depth> depth_buffer;
-    mutex cv_mtx; //condition variable lock
-    mutex buffer_mtx;
-    condition_variable cv;
-
-    thread depth_thread;
-    thread trade_thread;
-
-    BinanceSpotFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event, 
-                    DatasetRecorder& recorder, BinanceClock& clock):
-        config(config), state(state), recorder(recorder), execution_event(execution_event), clock(clock) {}
+    BinanceSpotFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event, BinanceClock& clock,
+                    function<void(const std_string&, const int64_t&, const int64_t&, const int64_t&, const std_string&)> log_event,
+                    function<void(const json&)> export_orderbook_snapshot):
+                    config(config), state(state), execution_event(execution_event), clock(clock), log_event(move(log_event)),
+                    export_orderbook_snapshot(move(export_orderbook_snapshot)) {}
 
     void parse_book(simdjson::ondemand::object obj, Depth& entry){
 
@@ -164,16 +165,19 @@ public:
         // -------------------------
         // STEP 3: WEBSOCKET LAYER
         // -------------------------
-        trade_ws = make_unique<ws_stream>(move(ssl_sock));
-        trade_ws->handshake(config.hostname, "/ws/" + config.instrument + "@trade");
+        ws_stream ws(move(ssl_sock));
+        ws.handshake(config.hostname, "/ws/" + config.instrument + "@trade");
 
         beast::flat_buffer buffer;
         simdjson::ondemand::parser parser;
 
         while(running){
             boost::system::error_code ec;
-            trade_ws->read(buffer, ec);
-            if(ec) break;
+            ws.read(buffer, ec);
+            if(ec){
+                cout << "TRADE WS ERROR: " << ec.message() << endl;
+                break;
+            }
 
             std_string msg = beast::buffers_to_string(buffer.data());
             buffer.consume(buffer.size());
@@ -189,7 +193,7 @@ public:
             trade.qty   = double(doc["q"].get_double_in_string());
             trade.latency = clock.compute_feed_latency(trade.local_ts, trade.ts);
 
-            recorder.log_event("trade", trade.ts, trade.local_ts, trade.latency, msg);
+            log_event("trade", trade.ts, trade.local_ts, trade.latency, msg);
 
             ExecutionEvent ev;
             ev.type = ExecutionEventType::TRADE_UPDATE;
@@ -222,16 +226,19 @@ public:
         // -------------------------
         // STEP 3: WEBSOCKET LAYER
         // -------------------------
-        depth_ws = make_unique<ws_stream>(move(ssl_sock));
-        depth_ws->handshake(config.hostname, "/ws/" + config.instrument + "@depth@100ms");
+        ws_stream ws(move(ssl_sock));
+        ws.handshake(config.hostname, "/ws/" + config.instrument + "@depth@100ms");
 
         beast::flat_buffer buffer;
         simdjson::ondemand::parser parser;
 
         while(running){
             boost::system::error_code ec;
-            depth_ws->read(buffer, ec);
-            if(ec) break;
+            ws.read(buffer, ec);
+            if(ec){
+                cout << "DEPTH WS ERROR: " << ec.message() << endl;
+                break;
+            }
 
             std_string msg = beast::buffers_to_string(buffer.data());
             buffer.consume(buffer.size());
@@ -250,7 +257,7 @@ public:
             first_depth_received = true;
             cv.notify_all();
 
-            recorder.log_event("depth", depth.ts, depth.local_ts, depth.latency, msg);
+            log_event("depth", depth.ts, depth.local_ts, depth.latency, msg);
 
             {
                 lock_guard<mutex> lock(buffer_mtx);
@@ -287,7 +294,7 @@ public:
 
         auto [snapshot_id, snapshot] = state.market_book.initialize_from_binance();
 
-        recorder.export_orderbook_snapshot(snapshot);
+        export_orderbook_snapshot(snapshot);
 
         // -------------------------
         // WAIT FOR STREAM ALIGNMENT (YOUR GATE FIX)
@@ -351,10 +358,6 @@ public:
 
         running = false;
 
-        boost::system::error_code ec;
-        beast::get_lowest_layer(*trade_ws).cancel(ec);
-        beast::get_lowest_layer(*depth_ws).cancel(ec);
-
         if(trade_thread.joinable()) trade_thread.join();
         if(depth_thread.joinable()) depth_thread.join();
 
@@ -367,27 +370,28 @@ public:
     MarketConfig& config;
     State& state;
     ExecutionEventQueue& execution_event;
-    DatasetRecorder& recorder;
     BinanceClock& clock;
 
-    unique_ptr<ws_stream> trade_ws;
-    unique_ptr<ws_stream> depth_ws;
-
-    atomic<bool> running{false};
-    atomic<bool> buffering{true};
-    atomic<bool> first_depth_received{false};
-    
-    vector<Depth> depth_buffer;
-    mutex cv_mtx; //condition variable lock
-    mutex buffer_mtx;
-    condition_variable cv;
+    function<void(const std_string&, const int64_t&, const int64_t&, const int64_t&, const std_string&)> log_event;
+    function<void(const json&)> export_orderbook_snapshot;
 
     thread depth_thread;
     thread trade_thread;
 
-    BinanceFuturesFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event,
-                       DatasetRecorder& recorder, BinanceClock& clock):
-        config(config), state(state), execution_event(execution_event), recorder(recorder), clock(clock) {}
+    mutex cv_mtx; //condition variable lock
+    mutex buffer_mtx;
+    condition_variable cv;
+    vector<Depth> depth_buffer;
+
+    atomic<bool> running{false};
+    atomic<bool> buffering{true};
+    atomic<bool> first_depth_received{false};
+
+    BinanceFuturesFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event, BinanceClock& clock,
+                    function<void(const std_string&, const int64_t&, const int64_t&, const int64_t&, const std_string&)> log_event,
+                    function<void(const json&)> export_orderbook_snapshot):
+                    config(config), state(state), execution_event(execution_event), clock(clock), log_event(move(log_event)),
+                    export_orderbook_snapshot(move(export_orderbook_snapshot)) {}
 
     void parse_book(simdjson::ondemand::object obj, Depth& entry){
 
@@ -434,16 +438,19 @@ public:
         // -------------------------
         // STEP 3: WEBSOCKET LAYER
         // -------------------------
-        trade_ws = make_unique<ws_stream>(move(ssl_sock));
-        trade_ws->handshake(config.hostname, "/ws/" + config.instrument + "@trade");
+        ws_stream ws(move(ssl_sock));
+        ws.handshake(config.hostname, "/ws/" + config.instrument + "@trade");
 
         beast::flat_buffer buffer;
         simdjson::ondemand::parser parser;
 
         while(running){
             boost::system::error_code ec;
-            trade_ws->read(buffer, ec);
-            if(ec) break;
+            ws.read(buffer, ec);
+            if(ec){
+                cout << "TRADE WS ERROR: " << ec.message() << endl;
+                break;
+            }
 
             std_string msg = beast::buffers_to_string(buffer.data());
             buffer.consume(buffer.size());
@@ -459,7 +466,7 @@ public:
             trade.qty   = double(doc["q"].get_double_in_string());
             trade.latency = clock.compute_feed_latency(trade.local_ts, trade.ts);
 
-            recorder.log_event("trade", trade.ts, clock.now_ms(), trade.latency, msg);
+            log_event("trade", trade.ts, clock.now_ms(), trade.latency, msg);
 
             ExecutionEvent ev;
             ev.type = ExecutionEventType::TRADE_UPDATE;
@@ -492,16 +499,19 @@ public:
         // -------------------------
         // STEP 3: WEBSOCKET LAYER
         // -------------------------
-        depth_ws = make_unique<ws_stream>(move(ssl_sock));
-        depth_ws->handshake(config.hostname, "/ws/" + config.instrument + "@depth@100ms");
+        ws_stream ws(move(ssl_sock));
+        ws.handshake(config.hostname, "/ws/" + config.instrument + "@depth@100ms");
 
         beast::flat_buffer buffer;
         simdjson::ondemand::parser parser;
 
         while(running){
             boost::system::error_code ec;
-            depth_ws->read(buffer, ec);
-            if(ec) break;
+            ws.read(buffer, ec);
+            if(ec){
+                cout << "DEPTH WS ERROR: " << ec.message() << endl;
+                break;
+            }
 
             std_string msg = beast::buffers_to_string(buffer.data());
             buffer.consume(buffer.size());
@@ -521,7 +531,7 @@ public:
             first_depth_received = true;
             cv.notify_all();
 
-            recorder.log_event("depth", depth.ts, clock.now_ms(), depth.latency, msg);
+            log_event("depth", depth.ts, clock.now_ms(), depth.latency, msg);
 
             {
                 lock_guard<mutex> lock(buffer_mtx);
@@ -558,7 +568,7 @@ public:
 
         auto [snapshot_id, snapshot] = state.market_book.initialize_from_binance();
 
-        recorder.export_orderbook_snapshot(snapshot);
+        export_orderbook_snapshot(snapshot);
 
         // -------------------------
         // WAIT FOR STREAM ALIGNMENT (YOUR GATE FIX)
@@ -624,10 +634,6 @@ public:
 
         running = false;
 
-        boost::system::error_code ec;
-        beast::get_lowest_layer(*trade_ws).cancel(ec);
-        beast::get_lowest_layer(*depth_ws).cancel(ec);
-
         if(trade_thread.joinable()) trade_thread.join();
         if(depth_thread.joinable()) depth_thread.join();
 
@@ -640,11 +646,16 @@ public:
     MarketConfig& config;
     State& state;
     ExecutionEventQueue& execution_event;
-    DatasetRecorder& recorder;
     BinanceClock& clock;
 
     vector<EventRow> events;
     json orderbook_snapshot;
+
+    function<void(const Trade&)> on_trade_event;
+    function<void()> on_depth_event;
+
+    function<void(const std_string&, const int64_t&, const int64_t&, const int64_t&, const std_string&)> log_event;
+    function<void(const json&)> export_orderbook_snapshot;
 
     atomic<bool> running{false};
     atomic<bool> snapshot_aligned{false};
@@ -660,9 +671,11 @@ public:
 
     simdjson::ondemand::parser parser;
     
-    BinanceSpotReplayFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event,
-                          DatasetRecorder& recorder, BinanceClock& clock):
-        config(config), state(state), execution_event(execution_event), recorder(recorder), clock(clock) {initialize();}
+    BinanceSpotReplayFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event, BinanceClock& clock,
+                    function<void(const std_string&, const int64_t&, const int64_t&, const int64_t&, const std_string&)> log_event,
+                    function<void(const json&)> export_orderbook_snapshot):
+                    config(config), state(state), execution_event(execution_event), clock(clock), log_event(move(log_event)),
+                    export_orderbook_snapshot(move(export_orderbook_snapshot)) {initialize();}
 
     void initialize(){
         std_string orderbook_snapshot_path = config.folder_path + "/orderbook_snapshot.json";
@@ -760,7 +773,7 @@ public:
         trade.qty   = double(doc["q"].get_double_in_string());
         trade.latency = e.latency;
         
-        recorder.log_event("trade", trade.ts, trade.local_ts, trade.latency, e.msg);
+        log_event("trade", trade.ts, trade.local_ts, trade.latency, e.msg);
 
         ExecutionEvent ev;
         ev.type = ExecutionEventType::TRADE_UPDATE;
@@ -784,7 +797,7 @@ public:
         first_depth_received = true;
         cv.notify_all();
   
-        recorder.log_event("depth", depth.ts, depth.local_ts, depth.latency, e.msg);
+        log_event("depth", depth.ts, depth.local_ts, depth.latency, e.msg);
 
         if(!snapshot_aligned.load()){
             if(depth.U <= state.market_book.last_update_id + 1 && state.market_book.last_update_id + 1 <= depth.u){
@@ -835,7 +848,7 @@ public:
 
         auto [snapshot_id, snapshot] = state.market_book.initialize_from_orderbook_snapshot(orderbook_snapshot);
 
-        recorder.export_orderbook_snapshot(snapshot);
+        export_orderbook_snapshot(snapshot);
 
         replay_thread = thread(&BinanceSpotReplayFeed::run, this);
 
@@ -866,11 +879,13 @@ public:
     MarketConfig& config;
     State& state;
     ExecutionEventQueue& execution_event;
-    DatasetRecorder& recorder;
     BinanceClock& clock;
 
     vector<EventRow> events;
     json orderbook_snapshot;
+
+    function<void(const std_string&, const int64_t&, const int64_t&, const int64_t&, const std_string&)> log_event;
+    function<void(const json&)> export_orderbook_snapshot;
 
     atomic<bool> running{false};
     atomic<bool> snapshot_aligned{false};
@@ -886,9 +901,11 @@ public:
 
     simdjson::ondemand::parser parser;
     
-    BinanceFuturesReplayFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event,
-                             DatasetRecorder& recorder, BinanceClock& clock):
-        config(config), state(state), execution_event(execution_event), recorder(recorder), clock(clock) {initialize();}
+    BinanceFuturesReplayFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event, BinanceClock& clock,
+                    function<void(const std_string&, const int64_t&, const int64_t&, const int64_t&, const std_string&)> log_event,
+                    function<void(const json&)> export_orderbook_snapshot):
+                    config(config), state(state), execution_event(execution_event), clock(clock), log_event(move(log_event)),
+                    export_orderbook_snapshot(move(export_orderbook_snapshot)) {initialize();}
 
     void initialize(){
         std_string orderbook_snapshot_path = config.folder_path + "/orderbook_snapshot.json";
@@ -986,7 +1003,7 @@ public:
         trade.qty   = double(doc["q"].get_double_in_string());
         trade.latency = e.latency;
 
-        recorder.log_event("trade", trade.ts, trade.local_ts, trade.latency, e.msg);
+        log_event("trade", trade.ts, trade.local_ts, trade.latency, e.msg);
 
         ExecutionEvent ev;
         ev.type = ExecutionEventType::TRADE_UPDATE;
@@ -1011,7 +1028,7 @@ public:
         first_depth_received = true;
         cv.notify_all();
   
-        recorder.log_event("depth", depth.ts, depth.local_ts, depth.latency, e.msg);
+        log_event("depth", depth.ts, depth.local_ts, depth.latency, e.msg);
         
         if(!snapshot_aligned.load()){
             if(depth.U <= state.market_book.last_update_id && state.market_book.last_update_id <= depth.u){
@@ -1061,7 +1078,7 @@ public:
 
         auto [snapshot_id, snapshot] = state.market_book.initialize_from_orderbook_snapshot(orderbook_snapshot);
 
-        recorder.export_orderbook_snapshot(snapshot);
+        export_orderbook_snapshot(snapshot);
 
         replay_thread = thread(&BinanceFuturesReplayFeed::run, this);
 

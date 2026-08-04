@@ -99,7 +99,7 @@ public:
     SnapshotStore& snapshot_store;
     DatasetRecorder& recorder;
 
-    atomic<bool> trading_enabled = true;
+    atomic<bool> shutdown = false;
     atomic<bool> waiting_for_cancel = false;
     atomic<bool> waiting_for_flatten = false;
     atomic<bool> shutdown_complete = false;
@@ -136,6 +136,10 @@ public:
                 on_cancel_event();
                 break;
 
+            case ExecutionEventType::MARKET_UPDATE:
+                on_market_event();
+                break;
+
             case ExecutionEventType::MARK_PRICE_UPDATE:
                 on_mark_price_event(ev.stream);
                 break;
@@ -149,10 +153,6 @@ public:
             dashboard_event.signal_pending = true;
         }
         dashboard_event.signal_cv.notify_one();
-
-        if(!trading_enabled){
-            cout << "snapshot built\n";
-        }
     }
 
     void process_event_latency(const ExecutionEvent& ev){
@@ -171,6 +171,10 @@ public:
 
             case ExecutionEventType::CANCEL_UPDATE:
                 on_cancel_event();
+                break;
+
+            case ExecutionEventType::MARKET_UPDATE:
+                on_market_event();
                 break;
         }
     }
@@ -235,7 +239,7 @@ public:
         recorder.log_snapshot(signal);
         state.last_signal = signal;
 
-        if(!trading_enabled) return; // to be changed if shift to error style
+        if(shutdown) return;
 
         execution.place_quotes(signal);
     }
@@ -290,7 +294,7 @@ public:
         recorder.log_snapshot(signal);
         state.last_signal = signal;
 
-        if(!trading_enabled) return;
+        if(shutdown) return;
 
         execution.place_quotes(signal);
     }
@@ -345,7 +349,7 @@ public:
         recorder.log_snapshot(signal);
         state.last_signal = signal;
 
-        if(!trading_enabled) return;
+        if(shutdown) return;
 
         execution.place_quotes_latency(signal);
     }
@@ -400,85 +404,77 @@ public:
         recorder.log_snapshot(signal);
         state.last_signal = signal;
 
-        if(!trading_enabled) return;
+        if(shutdown) return;
 
         execution.place_quotes_latency(signal);
+    }
+
+    void stop(){
+        shutdown = true;
+
+        ExecutionEvent ev;
+        ev.type = ExecutionEventType::CANCEL_UPDATE;
+        execution_event.push(ev);
+    }
+
+    void wait_until_shutdown_complete(){
+        unique_lock lock(shutdown_mtx);
+
+        shutdown_cv.wait(lock, [&]{
+            return shutdown_complete.load();
+        });
     }
 
     void on_stream_event(const Stream& stream){
         state.time = stream.local_ts;
         execution.apply_stream_update(stream);
 
-        wait_for_cancel();
-        wait_for_flatten();
-        
-        if(!trading_enabled) return;
-        
-        execution.place_quotes(*state.last_signal);
-    }
+        cout
+        << "AFTER STREAM: inv=" << state.inventory
+        << " buy="
+        << (execution.get_open_order("BUY") != nullptr)
+        << " sell="
+        << (execution.get_open_order("SELL") != nullptr)
+        << "\n";
 
-    void on_cancel_event(){
-        cout << "CANCELLING OPEN ORDERS\n";
-        execution.cancel_all_orders();
-        waiting_for_cancel = true;
+        if(waiting_for_cancel){
+            if(!execution.get_open_order("BUY") && !execution.get_open_order("SELL")){
+                cout << "no more open orders, placing market...\n";
+                waiting_for_cancel = false;
+                waiting_for_flatten = true;
 
-        if(config.mode != "live"){
-            wait_for_cancel();
-            wait_for_flatten();
+                execution.place_market();
+            }
         }
-    }
 
-    void on_mark_price_event(const Stream& stream){
-        state.time = stream.local_ts;
-        state.mark_price = stream.price;
-    }
-
-    void wait_for_cancel(){
-        if(waiting_for_cancel && (!execution.get_open_order("BUY") && !execution.get_open_order("SELL"))){
-            
-            cout << "NO MORE OPEN ORDERS, PLACING MARKET\n";
-            waiting_for_cancel = false;
-            waiting_for_flatten = true;
-
-            execution.place_market();
-        }
-    }
-
-    void wait_for_flatten(){
         if(waiting_for_flatten && abs(state.inventory) <= 1e-9){
             waiting_for_flatten = false;
-
-            Snapshot snap = build_snapshot();
-            snapshot_store.set(move(snap));
-
-            {
-                lock_guard<mutex> lock(dashboard_event.signal_mtx);
-                dashboard_event.signal_pending = true;
-            }
-            dashboard_event.signal_cv.notify_one();
-
-            cout << "last snapshot\n";
-            
+            cout << "inv flattened...\n";
             {
                 lock_guard<mutex> lock(shutdown_mtx);
                 shutdown_complete = true;
             }
             shutdown_cv.notify_one();
         }
+        
+        if(shutdown) return;
+        
+        execution.place_quotes(*state.last_signal);
     }
 
-    void stop(){
-        cout << "STOPPING ENGINE\n";
-        trading_enabled = false;
+    void on_cancel_event(){
+        cout << "cancelling all orders...\n";
+        execution.cancel_all_orders();
+        waiting_for_cancel = true;
+    }
 
-        ExecutionEvent ev;
-        ev.type = ExecutionEventType::CANCEL_UPDATE;
-        execution_event.push(ev);
+    void on_market_event(){
+        execution.place_market();
+    }
 
-        unique_lock lock(shutdown_mtx);
-        shutdown_cv.wait(lock, [&]{return shutdown_complete.load();});
-
-        cout << "ENGINE STOPPED\n";
+    void on_mark_price_event(const Stream& stream){
+        state.time = stream.local_ts;
+        state.mark_price = stream.price;
     }
 
     std_string tradeToString(const optional<Trade>& trade){
@@ -621,14 +617,14 @@ public:
     unique_ptr<Engine> engine;
     unique_ptr<Feed> feed;
 
-    atomic<bool> execution_loop_running{false};
-    atomic<bool> dashboard_loop_running{false};
-    atomic<bool> shutdown_requested{false};
-
     asio::io_context ioc;
     asio::signal_set signals;
     mutex shutdown_mtx;
     condition_variable shutdown_cv;
+
+    atomic<bool> engine_running{false};
+    atomic<bool> dashboard_running{false};
+    atomic<bool> shutdown_requested{false};
 
     vector<thread> threads;
 
@@ -648,28 +644,46 @@ public:
             execution = make_unique<PaperExecution>(config, state, recorder, clock);
         }
 
+        engine = make_unique<Engine>(config, state, strategy, *execution, clock, execution_event, dashboard_event, snapshot_store, recorder);
+
+        auto log_event = [this](const std_string& type, const int64_t& ts, const int64_t& local_ts, 
+            const int64_t& latency, const std_string& msg) {recorder.log_event(type, ts, local_ts, latency, msg);};
+        auto export_orderbook_snapshot = [this](const json& snapshot) {recorder.export_orderbook_snapshot(snapshot);};
+
         if(config.exchange == "binance" && config.market == "spot" && config.mode != "replay"){
-            feed = make_unique<BinanceSpotFeed>(config, state, execution_event, recorder, clock);
+            feed = make_unique<BinanceSpotFeed>(config, state, execution_event, clock, log_event, export_orderbook_snapshot);
         }
 
         else if(config.exchange == "binance" && config.market == "futures" && config.mode != "replay"){
-            feed = make_unique<BinanceFuturesFeed>(config, state, execution_event, recorder, clock);
+            feed = make_unique<BinanceFuturesFeed>(config, state, execution_event, clock, log_event, export_orderbook_snapshot);
         }
 
         else if(config.exchange == "binance" && config.market == "spot" && config.mode == "replay"){
-            feed = make_unique<BinanceSpotReplayFeed>(config, state, execution_event, recorder, clock);
+            feed = make_unique<BinanceSpotReplayFeed>(config, state, execution_event, clock, log_event, export_orderbook_snapshot);
         }
 
         else if(config.exchange == "binance" && config.market == "futures" && config.mode == "replay"){
-            feed = make_unique<BinanceFuturesReplayFeed>(config, state, execution_event, recorder, clock);
+            feed = make_unique<BinanceFuturesReplayFeed>(config, state, execution_event, clock, log_event, export_orderbook_snapshot);
         }
+    }
 
-        engine = make_unique<Engine>(config, state, strategy, *execution, clock, execution_event, dashboard_event, snapshot_store, recorder);
+    void start_signal_handler(){
+        signals.async_wait([this](const boost::system::error_code& ec, int signal){
+            if(ec) return;
+
+            cout << "Signal received: " << signal << "\n";
+            {
+                lock_guard<mutex> lock(shutdown_mtx);
+                shutdown_requested = true;
+            }
+            shutdown_cv.notify_one();
+            }
+        );
     }
 
     void start(){
-        execution_loop_running = true;
-        dashboard_loop_running = true;
+        engine_running = true;
+        dashboard_running = true;
 
         start_signal_handler();
         threads.emplace_back([this](){ioc.run();});
@@ -695,33 +709,15 @@ public:
         }
     }
 
-    // void start_dashboard_loop(){
-    //     threads.emplace_back([this](){
-    //         while(dashboard_running){
-    //             {
-    //                 unique_lock<mutex> lock(dashboard_event.signal_mtx);
-    //                 dashboard_event.signal_cv.wait(lock, [this]{
-    //                     return dashboard_event.signal_pending || !dashboard_running;});
-
-    //                 if(!dashboard_running) break;
-    //                 dashboard_event.signal_pending = false;
-    //             }
-
-    //             // dashboard_terminal.refresh();
-    //             dashboard_server.publish();
-    //         }
-    //     });
-    // }
-
     void start_dashboard_loop(){
         threads.emplace_back([this](){
-            while(true){
+            while(dashboard_running){
                 {
                     unique_lock<mutex> lock(dashboard_event.signal_mtx);
                     dashboard_event.signal_cv.wait(lock, [this]{
-                        return dashboard_event.signal_pending || !dashboard_loop_running;});
+                        return dashboard_event.signal_pending || !dashboard_running;});
 
-                    if(!dashboard_loop_running) break;
+                    if(!dashboard_running) break;
                     dashboard_event.signal_pending = false;
                 }
 
@@ -731,70 +727,28 @@ public:
         });
     }
 
-    // void start_execution_loop(){
-    //     threads.emplace_back([this](){
-    //         while(execution_loop_running){
-    //             ExecutionEvent ev;
-
-    //             if(!execution_event.pop(ev, execution_loop_running)) break;
-
-    //             engine->process_event(ev);
-    //         }
-    //     });
-    // }
-
     void start_execution_loop(){
         threads.emplace_back([this](){
-            while(true){
+            while(engine_running){
                 ExecutionEvent ev;
 
-                if(!execution_event.pop(ev, execution_loop_running)) break;
+                if(!execution_event.pop(ev, engine_running)) break;
 
                 engine->process_event(ev);
             }
         });
     }
 
-    // void start_execution_latency_loop(){ //polling driven
-    //     threads.emplace_back([this](){
-    //         while(execution_loop_running){
-    //             ExecutionEvent ev;
-    //             bool state_changed = false;
-
-    //             if(execution_event.pop_timeout(ev, execution_loop_running, 1ms)){
-    //                 engine->process_event_latency(ev);
-    //                 state_changed = true;
-    //             }
-
-    //             if(execution->process_latency_queue()){
-    //                 state_changed = true;
-    //             }
-
-    //             if(state_changed){
-    //                 Snapshot snap = engine->build_snapshot();
-    //                 snapshot_store.set(move(snap));
-
-    //                 {
-    //                     lock_guard<mutex> lock(dashboard_event.signal_mtx);
-    //                     dashboard_event.signal_pending = true;
-    //                 }
-    //                 dashboard_event.signal_cv.notify_one();
-    //             }
-    //         }
-    //     });
-    // }
-
     void start_execution_latency_loop(){ //polling driven
         threads.emplace_back([this](){
-            while(true){
+            while(engine_running){
                 ExecutionEvent ev;
                 bool state_changed = false;
 
-                if(execution_event.pop_timeout(ev, execution_loop_running, 1ms)){
+                if(execution_event.pop_timeout(ev, engine_running, 1ms)){
                     engine->process_event_latency(ev);
                     state_changed = true;
                 }
-                else if(!execution_loop_running) break;
 
                 if(execution->process_latency_queue()){
                     state_changed = true;
@@ -814,61 +768,91 @@ public:
         });
     }
 
-    void start_signal_handler(){
-        signals.async_wait([this](const boost::system::error_code& ec, int signal){
-            if(ec) return;
-
-            {
-                lock_guard<mutex> lock(shutdown_mtx);
-                shutdown_requested = true;
-            }
-            shutdown_cv.notify_one();
-            }
-        );
-    }
-
     void wait_for_shutdown(){
         unique_lock<mutex> lock(shutdown_mtx);
-        shutdown_cv.wait(lock, [this]{return shutdown_requested.load();});
+
+        shutdown_cv.wait(lock, [this]{
+            return shutdown_requested.load();
+        });
 
         shutdown();
     }
 
     void shutdown(){
         cout << "INTERRUPT RECEIVED - SHUTTING DOWN\n";
+        cout << "no more new quotes placed\n";
+        engine->stop();
+
         feed->stop();
 
         //--------------------------------------------------
-        // engine
+        // cancel orders
         //--------------------------------------------------
-        engine->stop();
+        cout << "CLOSING OPEN POSITIONS\n";
 
+        // engine->stop;
+        // execution->cancel_all_orders();
+
+        // ExecutionEvent ev;
+        // ev.type = ExecutionEventType::CANCEL_UPDATE;
+        // execution_event.push(ev);
+
+        // cout << "CLOSING OPEN POSITIONS1\n";
+        // while(execution->get_open_order("BUY") || execution->get_open_order("SELL")){
+        //     this_thread::sleep_for(milliseconds(5000));
+        // }
+        // this_thread::sleep_for(milliseconds(3000));
         //--------------------------------------------------
-        // execution loop
+        // flatten inventory
         //--------------------------------------------------
-        execution_loop_running = false;
-        execution_event.cv.notify_all();
+        cout << "market\n";
+
+        // ev.type = ExecutionEventType::MARKET_UPDATE;
+        // execution_event.push(ev);
+        engine->wait_until_shutdown_complete();
+
+        // while(abs(state.inventory) > 1e-9){
+        //     this_thread::sleep_for(milliseconds(3000));
+        // }
+        cout << "\n";
 
         //--------------------------------------------------
         // dashboards
         //--------------------------------------------------
-        cout << "STOPPING DASH\n";
-        dashboard_loop_running = false;
+        cout << "dash\n";
+        dashboard_running = false;
         dashboard_event.signal_cv.notify_all();
 
         // dashboard_terminal.stop();
         dashboard_server.stop();
 
+        //--------------------------------------------------
+        // now stop engine
+        //--------------------------------------------------
+        cout << "execution_event\n";
+        engine_running = false;
+
+        // wake execution thread if it is blocked in cv.wait()
+        execution_event.wake();
+
+        cout << "clock\n";
         clock.stop();
 
-        if(broker) broker->stop();
-
+        cout << "broker\n";
+        if(broker) broker->stop_keepalive();
+        cout << "broker1\n";
+        cout << "user_stream\n";
         if(user_stream) user_stream->stop();
 
+        cout << "ioc\n";
         ioc.stop();
 
-        for(auto& t: threads) if(t.joinable()) t.join();
+        cout << "threads\n";
+        for(auto& t: threads){
+            if(t.joinable()) t.join();
+        }
 
+        cout << "recorder\n";
         recorder.stop();
     }
 };

@@ -151,6 +151,7 @@ enum class ExecutionEventType{
     DEPTH_UPDATE_SPOT,
     DEPTH_UPDATE_FUTURES,
     STREAM_UPDATE,
+    CANCEL_UPDATE,
     MARK_PRICE_UPDATE
 };
 
@@ -200,10 +201,6 @@ struct ExecutionEventQueue {
         queue.pop();
 
         return true;
-    }
-
-    void wake(){
-        cv.notify_all();
     }
 };
 
