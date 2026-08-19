@@ -25,6 +25,7 @@
 #include <optional>
 #include <iostream>
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <filesystem>
 #include <unordered_map>
@@ -79,6 +80,7 @@ namespace beast = boost::beast;
 namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
+namespace fs = filesystem;
 using tcp = asio::ip::tcp;
 using ssl_stream = asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
@@ -396,8 +398,6 @@ public:
 
         std_string side = (trade.side == "BUY") ? "SELL" : "BUY";
         int64_t price_tick = config.to_tick(trade.price);
-
-        // state.hawkes.update(depletion, trade.ts); // hawkes process
 
         Order* order = get_fill_candidate_order(side, price_tick);
 

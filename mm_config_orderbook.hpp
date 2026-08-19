@@ -16,6 +16,7 @@
 #include <cctype>
 #include <memory>
 #include <chrono>
+#include <csignal>
 #include <iomanip>
 #include <sstream>
 #include <fstream>
@@ -24,6 +25,7 @@
 #include <optional>
 #include <iostream>
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <filesystem>
 #include <unordered_map>
@@ -74,6 +76,7 @@ namespace beast = boost::beast;
 namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
+namespace fs = filesystem;
 using tcp = asio::ip::tcp;
 using ssl_stream = asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;

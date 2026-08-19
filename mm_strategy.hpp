@@ -25,6 +25,7 @@
 #include <optional>
 #include <iostream>
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <filesystem>
 #include <unordered_map>
@@ -77,6 +78,7 @@ namespace beast = boost::beast;
 namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
+namespace fs = filesystem;
 using tcp = asio::ip::tcp;
 using ssl_stream = asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
@@ -779,6 +781,7 @@ public:
         signal.realized_pnl = state.realized_pnl;
         signal.unrealized_pnl = state.get_unrealized_pnl(mid);
         signal.total_pnl = state.get_pnl(mid);
+        signal.fees_paid = state.fees_paid;
         signal.equity = state.cash + state.inventory * mid;
 
         signal.fair = features.fair;

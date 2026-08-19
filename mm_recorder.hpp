@@ -25,6 +25,7 @@
 #include <optional>
 #include <iostream>
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <filesystem>
 #include <unordered_map>
@@ -77,6 +78,7 @@ namespace beast = boost::beast;
 namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
+namespace fs = filesystem;
 using tcp = asio::ip::tcp;
 using ssl_stream = asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
@@ -274,6 +276,7 @@ public:
             {"sortino", round(performance.sortino * 10000.0) / 10000.0},
             {"sortino", round(performance.annualized_sortino * 10000.0) / 10000.0},
             {"fees_paid", round(state.fees_paid * 10000.0) / 10000.0},
+            {"notional_traded", round(state.notional_traded) / 10000.0},
             {"fees_per_fill", state.fees_paid / (fills.size() + 1e-9)},
             {"pnl_per_fill", state.get_pnl(state.market_book.mid()) / (fills.size() + 1e-9)}
         };
@@ -314,6 +317,7 @@ public:
         row.realized_pnl = signal.realized_pnl;
         row.unrealized_pnl = signal.unrealized_pnl;
         row.total_pnl = signal.total_pnl;
+        row.fees_paid = signal.fees_paid;
         row.equity = signal.equity;
 
         row.fair = signal.fair;
@@ -394,6 +398,7 @@ public:
         DoubleBuilder realized_pnl_b(pool);
         DoubleBuilder unrealized_pnl_b(pool);
         DoubleBuilder total_pnl_b(pool);
+        DoubleBuilder fees_paid_b(pool);
         DoubleBuilder equity_b(pool);
 
         DoubleBuilder fair_b(pool);
@@ -463,6 +468,7 @@ public:
             realized_pnl_b.Append(r.realized_pnl);
             unrealized_pnl_b.Append(r.unrealized_pnl);
             total_pnl_b.Append(r.total_pnl);
+            fees_paid_b.Append(r.fees_paid);
             equity_b.Append(r.equity);
 
             fair_b.Append(r.fair);
@@ -509,7 +515,7 @@ public:
         shared_ptr<Array> best_bid_arr, best_ask_arr, best_bid_tick_arr, best_ask_tick_arr;
         shared_ptr<Array> order_imbalance_arr, trade_imbalance_arr, volatility_arr;
         shared_ptr<Array> queue_ahead_bid_arr, queue_ahead_ask_arr;
-        shared_ptr<Array> inventory_arr, realized_pnl_arr, unrealized_pnl_arr, total_pnl_arr, equity_arr;
+        shared_ptr<Array> inventory_arr, realized_pnl_arr, unrealized_pnl_arr, total_pnl_arr, fees_paid_arr, equity_arr;
         shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr;
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
         shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
@@ -548,6 +554,7 @@ public:
         realized_pnl_b.Finish(&realized_pnl_arr);
         unrealized_pnl_b.Finish(&unrealized_pnl_arr);
         total_pnl_b.Finish(&total_pnl_arr);
+        fees_paid_b.Finish(&fees_paid_arr);
         equity_b.Finish(&equity_arr);
 
         fair_b.Finish(&fair_arr);
@@ -617,6 +624,7 @@ public:
             field("realized_pnl", float64()),
             field("unrealized_pnl", float64()),
             field("total_pnl", float64()),
+            field("fees_paid", float64()),
             field("equity", float64()),
 
             field("fair", float64()),
@@ -664,7 +672,7 @@ public:
             best_bid_arr, best_ask_arr, best_bid_tick_arr, best_ask_tick_arr,
             order_imbalance_arr, trade_imbalance_arr, volatility_arr,
             queue_ahead_bid_arr, queue_ahead_ask_arr,
-            inventory_arr, realized_pnl_arr, unrealized_pnl_arr, total_pnl_arr, equity_arr,
+            inventory_arr, realized_pnl_arr, unrealized_pnl_arr, total_pnl_arr, fees_paid_arr, equity_arr,
             fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr,
             regime_arr, regime_id_arr, regime_prob_arr,
             alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,

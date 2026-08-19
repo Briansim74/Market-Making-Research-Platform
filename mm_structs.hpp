@@ -25,6 +25,7 @@
 #include <optional>
 #include <iostream>
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <filesystem>
 #include <unordered_map>
@@ -73,6 +74,7 @@ namespace beast = boost::beast;
 namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
+namespace fs = filesystem;
 using tcp = asio::ip::tcp;
 using ssl_stream = asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
@@ -279,6 +281,7 @@ struct Signal {
     double realized_pnl;
     double unrealized_pnl;
     double total_pnl;
+    double fees_paid;
     double equity;
 
     double fair;
@@ -488,6 +491,7 @@ struct SnapshotRow {
     double realized_pnl;
     double unrealized_pnl;
     double total_pnl;
+    double fees_paid;
     double equity;
 
     double fair;

@@ -25,6 +25,7 @@
 #include <optional>
 #include <iostream>
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <filesystem>
 #include <unordered_map>
@@ -59,6 +60,9 @@
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 
+#include "mm_structs.hpp" //structs
+#include "mm_config_orderbook.hpp" //market config & orderbook
+
 using std::cout;
 using json = nlohmann::json;
 using std_string = std::string;
@@ -73,12 +77,10 @@ namespace beast = boost::beast;
 namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
+namespace fs = filesystem;
 using tcp = asio::ip::tcp;
 using ssl_stream = asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
-
-#include "mm_structs.hpp" //structs
-#include "mm_config_orderbook.hpp" //market config & orderbook
 
 class BinanceMarkPriceStream {
 public:

@@ -25,6 +25,7 @@
 #include <optional>
 #include <iostream>
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <filesystem>
 #include <unordered_map>
@@ -77,6 +78,7 @@ namespace beast = boost::beast;
 namespace http = boost::beast::http;
 namespace websocket = beast::websocket;
 namespace ssl = asio::ssl;
+namespace fs = filesystem;
 using tcp = asio::ip::tcp;
 using ssl_stream = asio::ssl::stream<tcp::socket>;
 using ws_stream  = websocket::stream<ssl_stream>;
@@ -103,8 +105,10 @@ public:
     deque<double> return_history;
     double last_equity = 0.0;
     double fees_paid = 0.0;
+    double notional_traded = 0.0;
 
-    Hawkes hawkes;
+    Hawkes bid_hawkes;
+    Hawkes ask_hawkes;
     pair<int64_t, double> bid_queue_ahead = {-1, 0.0}; // 1 price_tick per side only, init with -1 price_tick
     pair<int64_t, double> ask_queue_ahead = {-1, 0.0}; // 1 price_tick per side only
 
@@ -145,10 +149,11 @@ public:
                     double depletion = max(0.0, old_qty - new_qty);
                     
                     if(depletion > 0.0){
-                        hawkes.update(depletion, entry.ts); // hawkes process
+                        bid_hawkes.update(depletion, entry.ts); // hawkes process
 
-                        bid_queue_ahead.second = max(0.0, bid_queue_ahead.second - hawkes.beta * depletion);
-                        cout << "bid order queue_ahead @ " << price_tick << ": " << bid_queue_ahead.second << ", hawkes.beta * depletion: " << hawkes.beta * depletion << "\n";
+                        bid_queue_ahead.second = max(0.0, bid_queue_ahead.second - bid_hawkes.beta * depletion);
+                        cout << "bid order queue_ahead @ " << price_tick << ": "
+                        << bid_queue_ahead.second << ", bid_hawkes.beta * depletion: " << bid_hawkes.beta * depletion << "\n";
                     }
                 }
                 break; // no need to continue scanning
@@ -165,10 +170,11 @@ public:
                     double depletion = max(0.0, old_qty - new_qty);
 
                     if(depletion > 0.0){
-                        hawkes.update(depletion, entry.ts); // hawkes process
+                        ask_hawkes.update(depletion, entry.ts); // hawkes process
 
-                        ask_queue_ahead.second = max(0.0, ask_queue_ahead.second - hawkes.beta * depletion);
-                        cout << "ask order queue_ahead @ " << price_tick << ": " << ask_queue_ahead.second << ", hawkes.beta * depletion: " << hawkes.beta * depletion << "\n";
+                        ask_queue_ahead.second = max(0.0, ask_queue_ahead.second - ask_hawkes.beta * depletion);
+                        cout << "ask order queue_ahead @ " << price_tick << ": "
+                        << ask_queue_ahead.second << ", ask_hawkes.beta * depletion: " << ask_hawkes.beta * depletion << "\n";
                     }
                 }
                 break; // no need to continue scanning
@@ -365,6 +371,7 @@ public:
         double fee_rate = is_maker ? config.maker_fee_rate : config.taker_fee_rate;
         double fee = fill_value * fee_rate;
         fees_paid += fee;
+        notional_traded += fill_value;
 
         if(side == "BUY"){
             if(old_inv < 0){
