@@ -1,4 +1,4 @@
-# Market-Making-Research-Platform
+# Market-Making-Trading-System
 Research framework for market making as a coupled system of alpha, execution, inventory, and regime-dependent liquidity provision.
 
 Built for live L2 market data, deterministic replay, and execution-aware signal evaluation.
@@ -17,6 +17,9 @@ Most theoretical edge is lost through execution and adverse selection, not predi
 
 ## System Overview
 ```
+Market Discovery
+        │
+        ▼
 Market Data / Replay
         │
         ▼
@@ -51,6 +54,53 @@ Supports:
 - live trading
 - paper trading
 - full historical replay
+
+## Market Discovery
+Market discovery identifies markets where market making has sufficient structural edge to justify quoting.
+
+The objective is not to select markets based on headline spread alone, but to find markets where net spread, liquidity, activity, and execution quality combine to create favorable conditions for passive liquidity provision.
+
+### Market Selection
+The discovery layer continuously evaluates:
+- transaction fees
+- gross and net spread
+- bid/ask liquidity
+- trade activity
+- order-book depth
+
+A wide spread is only attractive if it is executable and persistent.
+
+For example:
+```
+Net Spread = Gross Spread − Fees − Expected Execution Costs
+```
+
+Liquidity is evaluated conservatively using the smaller side of the book:
+- L_min = min(Bid Liquidity, Ask Liquidity)
+
+and relative balance:
+- Balance = min(Bid, Ask) / max(Bid, Ask)
+
+This avoids prioritizing markets where apparent spread is supported by only one side of a thin or unstable order book.
+
+#### Candidate Ranking
+Markets are ranked using a combination of:
+```
+Net Spread
+× Liquidity
+× Liquidity Balance
+× Transaction Fees
+× Market Activity
+```
+The resulting candidates are passed into the trading stack.
+
+#### Market discovery therefore answers:
+Where should we trade?
+
+#### While the downstream models determine:
+When should we quote, which side should we favor, and how much should we trade?
+
+This separation prevents high displayed spreads from being mistaken for genuine trading opportunities and focuses capital on markets where the realized spread has the highest probability of surviving fees, adverse selection, queue dynamics, and execution latency.
 
 ## Regime Model
 Unsupervised Gaussian Mixture Model (GMM) using:
@@ -281,7 +331,7 @@ Below are sample outputs illustrating the engine decision mechanics.
 <details>
 <summary><strong>Detailed Implementation & Usage</strong></summary>
 
-# Market-Making-Research-Platform
+# Market-Making-Trading-System
 A research framework for studying how alpha generation, execution quality, inventory risk, and market regime interact in electronic liquidity provision.
 
 The project combines live market data ingestion, deterministic replay simulation, market microstructure research, and event-driven execution modeling within a unified architecture.
