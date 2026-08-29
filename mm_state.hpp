@@ -152,8 +152,8 @@ public:
                         bid_hawkes.update(depletion, entry.ts); // hawkes process
 
                         bid_queue_ahead.second = max(0.0, bid_queue_ahead.second - bid_hawkes.beta * depletion);
-                        cout << "bid order queue_ahead @ " << price_tick << ": "
-                        << bid_queue_ahead.second << ", bid_hawkes.beta * depletion: " << bid_hawkes.beta * depletion << "\n";
+                        // cout << "bid order queue_ahead @ " << price_tick << ": "
+                        // << bid_queue_ahead.second << ", bid_hawkes.beta * depletion: " << bid_hawkes.beta * depletion << "\n";
                     }
                 }
                 break; // no need to continue scanning
@@ -173,8 +173,8 @@ public:
                         ask_hawkes.update(depletion, entry.ts); // hawkes process
 
                         ask_queue_ahead.second = max(0.0, ask_queue_ahead.second - ask_hawkes.beta * depletion);
-                        cout << "ask order queue_ahead @ " << price_tick << ": "
-                        << ask_queue_ahead.second << ", ask_hawkes.beta * depletion: " << ask_hawkes.beta * depletion << "\n";
+                        // cout << "ask order queue_ahead @ " << price_tick << ": "
+                        // << ask_queue_ahead.second << ", ask_hawkes.beta * depletion: " << ask_hawkes.beta * depletion << "\n";
                     }
                 }
                 break; // no need to continue scanning

@@ -2,27 +2,6 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
-			"type": "cppbuild",
-			"label": "Build with g++",
-			"command": "D:\\msys64\\mingw64\\bin\\g++.exe",
-			"args": [
-				"-std=c++23",
-				"-fdiagnostics-color=always",
-				"-g",
-				"${file}",
-				"-o",
-				"${fileDirname}\\${fileBasenameNoExtension}.exe"
-			],
-			"options": {
-				"cwd": "D:\\msys64\\mingw64\\bin"
-			},
-			"problemMatcher": [
-				"$gcc"
-			],
-			"group": "build",
-			"detail": "compiler: D:\\msys64\\mingw64\\bin\\g++.exe"
-		},
-		{
 		"label": "Build mmpy with MSVC",
 		"type": "shell",
 		"command": "D:\\OneDrive\\Trading\\Market Making\\build\\build_msvc.bat",
@@ -58,6 +37,27 @@
 			"kind": "build"
 		},
 		"problemMatcher": []
+		},
+		{
+			"type": "cppbuild",
+			"label": "Build with g++",
+			"command": "D:\\msys64\\mingw64\\bin\\g++.exe",
+			"args": [
+				"-std=c++23",
+				"-fdiagnostics-color=always",
+				"-g",
+				"${file}",
+				"-o",
+				"${fileDirname}\\${fileBasenameNoExtension}.exe"
+			],
+			"options": {
+				"cwd": "D:\\msys64\\mingw64\\bin"
+			},
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build",
+			"detail": "compiler: D:\\msys64\\mingw64\\bin\\g++.exe"
 		},
 		{
 			"type": "cppbuild",

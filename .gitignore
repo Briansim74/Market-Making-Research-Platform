@@ -21,6 +21,9 @@ x86/
 # *.parquet
 *.bin
 
+# Manifest files
+manifest.json
+
 # OS junk
 .DS_Store
 Thumbs.db

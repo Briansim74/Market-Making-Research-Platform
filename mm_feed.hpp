@@ -92,6 +92,252 @@ public:
     virtual ~Feed() = default;
 };
 
+class PolymarketFeed : public Feed {
+public:
+    MarketConfig& config;
+    State& state;
+    ExecutionEventQueue& execution_event;
+    DatasetRecorder& recorder;
+    BinanceClock& clock;
+
+    unique_ptr<ws_stream> market_ws;
+    unique_ptr<ws_stream> depth_ws;
+
+    atomic<bool> running{false};
+    atomic<bool> buffering{true};
+    atomic<bool> first_depth_received{false};
+
+    vector<Depth> depth_buffer;
+    mutex cv_mtx; //condition variable lock
+    mutex buffer_mtx;
+    condition_variable cv;
+
+    thread depth_thread;
+    thread market_thread;
+
+    PolymarketFeed(MarketConfig& config, State& state, ExecutionEventQueue& execution_event, 
+                    DatasetRecorder& recorder, BinanceClock& clock):
+        config(config), state(state), recorder(recorder), execution_event(execution_event), clock(clock) {}
+
+    void parse_book(simdjson::ondemand::object obj, Depth& entry){
+
+        for(auto b: obj["b"]){
+            auto arr = b.get_array();
+
+            double p = double(arr.at(0).get_double_in_string());
+            double q = double(arr.at(1).get_double_in_string());
+
+            entry.bid_delta.emplace_back(config.to_tick(p), q);
+        }
+
+        for(auto a: obj["a"]){
+            auto arr = a.get_array();
+
+            double p = double(arr.at(0).get_double_in_string());
+            double q = double(arr.at(1).get_double_in_string());
+
+            entry.ask_delta.emplace_back(config.to_tick(p), q);
+        }
+    }
+
+    // void parse_book(
+    //     simdjson::ondemand::object obj,
+    //     Depth& depth
+    // ) {
+    //     depth.asset_id =
+    //         string(obj["asset_id"].get_string());
+
+    //     for (auto b : obj["bids"]) {
+
+    //         auto arr = b.get_object();
+
+    //         double p =
+    //             arr["price"].get_double_in_string();
+
+    //         double q =
+    //             arr["size"].get_double_in_string();
+
+    //         depth.bids.emplace_back(
+    //             config.to_tick(p),
+    //             q
+    //         );
+    //     }
+
+    //     for (auto a : obj["asks"]) {
+
+    //         auto arr = a.get_object();
+
+    //         double p =
+    //             arr["price"].get_double_in_string();
+
+    //         double q =
+    //             arr["size"].get_double_in_string();
+
+    //         depth.asks.emplace_back(
+    //             config.to_tick(p),
+    //             q
+    //         );
+    //     }
+
+    //     depth.last_trade_price =
+    //         obj["last_trade_price"]
+    //             .get_double_in_string();
+    // }
+
+    void market_loop() {
+        string hostname = "ws-subscriptions-clob.polymarket.com";
+        asio::io_context ioc;
+
+        ssl::context ctx(ssl::context::tlsv12_client);
+        ctx.set_default_verify_paths();
+
+        tcp::resolver resolver(ioc);
+        auto results = resolver.resolve(hostname, "443");
+
+        tcp::socket socket(ioc);
+        asio::connect(socket, results);
+
+        ssl_stream ssl_sock(std::move(socket), ctx);
+
+        SSL_set_tlsext_host_name(
+            ssl_sock.native_handle(),
+            hostname.c_str()
+        );
+
+        ssl_sock.handshake(ssl::stream_base::client);
+
+        market_ws = make_unique<ws_stream>(std::move(ssl_sock));
+
+        market_ws->handshake(
+            hostname,
+            "/ws/market"
+        );
+
+        // Subscribe
+        json sub = {
+            {"type", "market"},
+            {"assets_ids", {
+                "95640549996905293510297955529586737178285694064878854803914367446504739764113",
+                "43681720319477188597878188429504394796986333625436226983885469009299707562545",
+            }}
+        };
+
+        market_ws->write(asio::buffer(sub.dump()));
+
+        beast::flat_buffer buffer;
+        simdjson::ondemand::parser parser;
+
+        while(running){
+            boost::system::error_code ec;
+            market_ws->read(buffer, ec);
+
+            if(ec) break;
+            string msg = beast::buffers_to_string(buffer.data());
+            cout << msg << "\n";
+            // buffer.consume(buffer.size());
+
+            // simdjson::padded_string json(msg);
+
+            // auto doc = parser.iterate(json);
+
+            // parse_market_event(doc.get_object(), msg);
+        }
+    }
+
+    void start() override {
+        running = true;
+        buffering = true;
+
+        depth_buffer.clear();
+        first_depth_received = false;
+
+        market_thread = thread(&PolymarketFeed::market_loop, this);
+
+        cout << "LIVE SPOT SOCKETS STARTED\n";
+
+        // // wait for first message
+        // {
+        //     unique_lock<mutex> lock(cv_mtx);
+        //     cv.wait_for(lock, 5s, [&]{ return first_depth_received.load(); });
+        // }
+
+        // auto [snapshot_id, snapshot] = state.market_book.initialize_from_binance();
+
+        // recorder.export_orderbook_snapshot(snapshot);
+
+        // // -------------------------
+        // // WAIT FOR STREAM ALIGNMENT (YOUR GATE FIX)
+        // // -------------------------
+        // bool valid = false;
+
+        // for(int i = 0; i < 500; i++){
+        //     {
+        //         lock_guard<mutex> lock(buffer_mtx);
+
+        //         if(!depth_buffer.empty() && depth_buffer.back().u > snapshot_id){
+        //             valid = true;
+        //             break;
+        //         }
+        //     }
+        //     this_thread::sleep_for(milliseconds(10));
+        // }
+
+        // if(!valid) throw runtime_error("Stream not aligned (no post-snapshot events)");
+        
+        // vector<Depth> buffered;
+        // {
+        //     lock_guard lock(buffer_mtx);
+        //     buffered = depth_buffer;   // copy, don't swap
+        // }
+        
+        // sort(buffered.begin(), buffered.end(), [](const auto& a, const auto& b) {return a.U < b.U;});
+
+        // auto it = find_if(buffered.begin(), buffered.end(), [&](const Depth& d){
+        //     return d.U <= snapshot_id + 1 && snapshot_id + 1 <= d.u;});
+
+        // if(it == buffered.end()) throw runtime_error("Couldn't synchronize order book");
+        
+        // // -------------------------
+        // // APPLY REPLAY
+        // // -------------------------
+        // for(; it != buffered.end(); ++it){
+        //     cout << "BUFFER U: " << it->U << " snapshot_id + 1: " << snapshot_id + 1 << " u: " << it->u << "\n";
+
+        //     state.market_book.apply_delta(*it);
+        //     state.market_book.last_update_id = it->u;
+        //     state.update_vol();
+        // }
+
+        // cout << "BOOK SYNCHRONIZED\n";
+        
+        // // -------------------------
+        // // LIVE MODE
+        // // -------------------------
+        // {
+        //     lock_guard<mutex> lock(buffer_mtx);
+        //     buffering = false;
+        // }
+        // state.initialized = true;
+
+        // cout << "LIVE BOOK RUNNING\n";
+    }
+
+    void stop() override {
+        cout << "STOPPING BINANCE FEED\n";
+
+        running = false;
+
+        boost::system::error_code ec;
+        beast::get_lowest_layer(*market_ws).cancel(ec);
+        // beast::get_lowest_layer(*depth_ws).cancel(ec);
+
+        if(market_thread.joinable()) market_thread.join();
+        // if(depth_thread.joinable()) depth_thread.join();
+
+        cout << "BINANCE FEED STOPPED\n";
+    }
+};
+
 class BinanceSpotFeed : public Feed {
 public:
     MarketConfig& config;

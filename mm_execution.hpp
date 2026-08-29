@@ -354,7 +354,7 @@ public:
         // -------------------------
         // BID ORDERS
         // -------------------------
-        if(!bid_order && bid_size > 0.0){ // if no bid order
+        if(!bid_order){ // if no bid order
             if(bid_size > 0.0){
                 place_limit("BUY", desired_bid, bid_size, signal);
                 last_bid = desired_bid;
@@ -363,7 +363,7 @@ public:
         
         // if bid change
         else if(abs(desired_bid - config.from_tick(bid_order->price_tick)) >= tick && !bid_order->pending_cancel &&
-        (bid_order->status == "LIVE" || bid_order->status == "PARTIALLY_FILLED")){
+            (bid_order->status == "LIVE" || bid_order->status == "PARTIALLY_FILLED")){
             cancel_order(bid_order);
 
             if(bid_size > 0.0){
@@ -375,7 +375,7 @@ public:
         // -------------------------
         // ASK ORDERS
         // -------------------------
-        if(!ask_order && ask_size > 0.0){ // if no ask order
+        if(!ask_order){ // if no ask order
             if(ask_size > 0.0){
                 place_limit("SELL", desired_ask, ask_size, signal);
                 last_ask = desired_ask;
@@ -384,7 +384,7 @@ public:
 
         // else if ask change
         else if(abs(desired_ask - config.from_tick(ask_order->price_tick)) >= tick && !ask_order->pending_cancel &&
-        (ask_order->status == "LIVE" || ask_order->status == "PARTIALLY_FILLED")){
+            (ask_order->status == "LIVE" || ask_order->status == "PARTIALLY_FILLED")){
             cancel_order(ask_order);
 
             if(ask_size > 0.0){
@@ -409,7 +409,7 @@ public:
 
         auto& queue_ahead = (side == "BUY") ? state.bid_queue_ahead : state.ask_queue_ahead;
 
-        cout << "match side order queue ahead before: " << queue_ahead.second << "\n";
+        // cout << "match side order queue ahead before: " << queue_ahead.second << "\n";
 
         if(queue_ahead.second > 0.0){
             double removed_qty = min(queue_ahead.second, trade.qty);
@@ -435,13 +435,13 @@ public:
             fill_qty = min(order->remaining, trade.qty); // update fills
         }
 
-        cout << "fill_qty: " << fill_qty << "\n";
+        // cout << "fill_qty: " << fill_qty << "\n";
 
         if(fill_qty > 0.0){
             order->remaining = max(0.0, order->remaining - fill_qty);
 
             state.on_fill(trade.price, fill_qty, order->side, true);
-            cout << "order->side: " << " side: " << side << "\n";
+            // cout << "order->side: " << " side: " << side << "\n";
 
             if(order->remaining > 0.0) order->status = "PARTIALLY_FILLED";
             else order->status = "FILLED";
@@ -449,7 +449,7 @@ public:
             recorder.log_fill(*order, fill_qty, trade.ts + clock.offset_ms.load(), true);
         }
 
-        cout << "match side order queue ahead after: " << queue_ahead.second << "\n";
+        // cout << "match side order queue ahead after: " << queue_ahead.second << "\n";
 
         state.last_order_update = *order;
 
@@ -1067,7 +1067,7 @@ public:
         }
 
         else if(abs(desired_bid - config.from_tick(bid_order->price_tick)) >= tick && !bid_order->pending_cancel &&
-        (bid_order->status == "LIVE" || bid_order->status == "PARTIALLY_FILLED")){
+            (bid_order->status == "LIVE" || bid_order->status == "PARTIALLY_FILLED")){
             cancel_order(bid_order);
         }
 
@@ -1079,7 +1079,7 @@ public:
         }
 
         else if(abs(desired_ask - config.from_tick(ask_order->price_tick)) >= tick && !ask_order->pending_cancel &&
-        (ask_order->status == "LIVE" || ask_order->status == "PARTIALLY_FILLED")){
+            (ask_order->status == "LIVE" || ask_order->status == "PARTIALLY_FILLED")){
             cancel_order(ask_order);
         }
     }

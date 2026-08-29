@@ -104,11 +104,11 @@ public:
     std_string quotes_path;
     std_string fills_path;
 
-    static constexpr size_t EVENTS_CHUNK = 10000;
-    static constexpr size_t SNAPSHOT_CHUNK = 10000;
-    static constexpr size_t TRADE_CHUNK = 10000;
-    static constexpr size_t QUOTE_CHUNK = 10000;
-    static constexpr size_t FILL_CHUNK  = 5000; // usually smaller
+    static constexpr size_t EVENTS_CHUNK = 1000;
+    static constexpr size_t SNAPSHOT_CHUNK = 1000;
+    static constexpr size_t TRADE_CHUNK = 300;
+    static constexpr size_t QUOTE_CHUNK = 200;
+    static constexpr size_t FILL_CHUNK  = 20; // usually smaller
 
     int events_id = 0;
     int snapshots_id = 0;
@@ -270,13 +270,20 @@ public:
         manifest["run_id"] = run_id;
         manifest["folder_path"] = folder_path;
         manifest["performance"] = {
-            {"pnl", round(state.get_pnl(state.market_book.mid()) * 10000.0) / 10000.0},
-            {"sharpe", round(performance.sharpe * 10000.0) / 10000.0},
-            {"annualized_sharpe", round(performance.annualized_sharpe * 10000.0) / 10000.0},
-            {"sortino", round(performance.sortino * 10000.0) / 10000.0},
-            {"sortino", round(performance.annualized_sortino * 10000.0) / 10000.0},
-            {"fees_paid", round(state.fees_paid * 10000.0) / 10000.0},
-            {"notional_traded", round(state.notional_traded) / 10000.0},
+            // {"pnl", round(state.get_pnl(state.market_book.mid()) * 10000.0) / 10000.0},
+            // {"sharpe", round(performance.sharpe * 10000.0) / 10000.0},
+            // {"annualized_sharpe", round(performance.annualized_sharpe * 10000.0) / 10000.0},
+            // {"sortino", round(performance.sortino * 10000.0) / 10000.0},
+            // {"sortino", round(performance.annualized_sortino * 10000.0) / 10000.0},
+            // {"fees_paid", round(state.fees_paid * 10000.0) / 10000.0},
+            // {"notional_traded", round(state.notional_traded) / 10000.0},
+            {"pnl", state.get_pnl(state.market_book.mid())},
+            {"sharpe", performance.sharpe},
+            {"annualized_sharpe", performance.annualized_sharpe},
+            {"sortino", performance.sortino},
+            {"sortino", performance.annualized_sortino},
+            {"fees_paid", state.fees_paid},
+            {"notional_traded", state.notional_traded},
             {"fees_per_fill", state.fees_paid / (fills.size() + 1e-9)},
             {"pnl_per_fill", state.get_pnl(state.market_book.mid()) / (fills.size() + 1e-9)}
         };

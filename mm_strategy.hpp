@@ -480,8 +480,9 @@ public:
     
         double sigma = features.volatility;
 
-        double base = 0.03; // keep base spread 0.03, since testnet futures have unusually wide spread
-        double vol_component = 3.0 * sigma;
+        // double base = 0.03; // keep base spread 0.03, since testnet futures have unusually wide spread
+        double base = features.spread;
+        double vol_component = 3.0 * sigma * features.mid; // added dimension change to mid price
 
         double raw_spread = max(base, vol_component);
         double spread = raw_spread * policy.spread_multiplier * (1.0 + toxicity.k1 * toxicity.tox);
@@ -737,16 +738,17 @@ public:
         double center = mid + struct_delta + micro_signal_delta + residual_delta;
         Toxicity toxicity = compute_toxicity(features);
 
-        double spread = compute_spread(features, policy, toxicity);
+        // double spread = compute_spread(features, policy, toxicity);
+        double spread = features.spread; // using base spread for now
         double half = spread / 2.0;
-
+        
         double bid = center - half;
         double ask = center + half;
         double tick = config.tick_size;
 
         bid = min(bid, best_bid);
         ask = max(ask, best_ask);
-
+        
         if(bid >= ask){
             bid = best_bid - tick;
             ask = best_ask + tick;

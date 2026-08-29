@@ -44,7 +44,7 @@ export default function Dashboard() {
         <span style={styles.italic}>
           {"pnl="}
           {t.pnl_pct > 0 ? "+" : ""}
-          {t.pnl_pct.toFixed(4)}%
+          {t.pnl_pct.toFixed(10)}%
         </span>
       </div>
 
@@ -71,27 +71,27 @@ export default function Dashboard() {
 
           <Row
             label="Mid"
-            value={m.mid.toFixed(4)}
+            value={m.mid.toFixed(10)}
           />
 
           <Row
             label="Microprice"
-            value={m.microprice.toFixed(4)}
+            value={m.microprice.toFixed(10)}
           />
 
           <Row
             label="Spread"
-            value={m.spread.toFixed(4)}
+            value={m.spread.toFixed(10)}
           />
 
           <Row
             label="Best Bid / Size"
-            value={`${m.best_bid.toFixed(4)} (${m.bid_size.toFixed(4)})`}
+            value={`${m.best_bid.toFixed(10)} (${m.bid_size.toFixed(4)})`}
           />
 
           <Row
             label="Best Ask / Size"
-            value={`${m.best_ask.toFixed(4)} (${m.ask_size.toFixed(4)})`}
+            value={`${m.best_ask.toFixed(10)} (${m.ask_size.toFixed(4)})`}
           />
 
           <Row
@@ -185,12 +185,12 @@ export default function Dashboard() {
 
           <Row
             label="My Bid / Size"
-            value={`${q.my_bid.toFixed(4)} (${q.current_bid_size.toFixed(4)})`}
+            value={`${q.my_bid.toFixed(10)} (${q.current_bid_size.toFixed(4)})`}
           />
 
           <Row
             label="My Ask / Size"
-            value={`${q.my_ask.toFixed(4)} (${q.current_ask_size.toFixed(4)})`}
+            value={`${q.my_ask.toFixed(10)} (${q.current_ask_size.toFixed(4)})`}
           />
 
 
@@ -199,22 +199,22 @@ export default function Dashboard() {
 
           <Row
             label="Queue Ahead / Bid"
-            value={`${q.my_bid.toFixed(4)} (${e.bid_queue.toFixed(4)})`}
+            value={`${q.my_bid.toFixed(10)} (${e.bid_queue.toFixed(4)})`}
           />
 
           <Row
             label="Queue Ahead / Ask"
-            value={`${q.my_ask.toFixed(4)} (${e.ask_queue.toFixed(4)})`}
+            value={`${q.my_ask.toFixed(10)} (${e.ask_queue.toFixed(4)})`}
           />
 
           <Row
             label="Queue Pressure / Bid"
-            value={`${q.my_bid.toFixed(4)} (${e.bid_pressure.toFixed(4)})`}
+            value={`${q.my_bid.toFixed(10)} (${e.bid_pressure.toFixed(4)})`}
           />
 
           <Row
             label="Queue Pressure / Ask"
-            value={`${q.my_ask.toFixed(4)} (${e.ask_pressure.toFixed(4)})`}
+            value={`${q.my_ask.toFixed(10)} (${e.ask_pressure.toFixed(4)})`}
           />
 
           <Row
@@ -379,7 +379,7 @@ function PnL({ value }) {
       }}
     >
       {prefix}
-      {value.toFixed(4)}
+      {value.toFixed(10)}
     </span>
   );
 }

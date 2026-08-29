@@ -152,9 +152,9 @@ public:
         }
         dashboard_event.signal_cv.notify_one();
 
-        if(!trading_enabled){
-            cout << "snapshot built\n";
-        }
+        // if(!trading_enabled){
+        //     cout << "snapshot built\n";
+        // }
     }
 
     void process_event_latency(const ExecutionEvent& ev){
@@ -457,9 +457,8 @@ public:
                 lock_guard<mutex> lock(dashboard_event.signal_mtx);
                 dashboard_event.signal_pending = true;
             }
-            dashboard_event.signal_cv.notify_one();
 
-            cout << "last snapshot\n";
+            dashboard_event.signal_cv.notify_one();
             
             {
                 lock_guard<mutex> lock(shutdown_mtx);
@@ -484,16 +483,16 @@ public:
     }
 
     std_string tradeToString(const optional<Trade>& trade){
-        return trade ? format("{:<5} | {:>10.4f} | {:>8.6f}", trade->side, trade->price, trade->qty) : "—";
+        return trade ? format("{:<5} | {:>10.10f} | {:>8.6f}", trade->side, trade->price, trade->qty) : "—";
     }
 
     std_string orderPointerToString(Order* order){
-        return order ? format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
+        return order ? format("{:<5} | {:>10.10f} | {:>8.6f} [{}]", 
             order->side, config.from_tick(order->price_tick), order->remaining, order->status) : "—";
     }
 
     std_string orderOptionalToString(const optional<Order>& order){
-        return order ? format("{:<5} | {:>10.4f} | {:>8.6f} [{}]", 
+        return order ? format("{:<5} | {:>10.10f} | {:>8.6f} [{}]", 
             order->side, config.from_tick(order->price_tick), order->remaining, order->status) : "—";
     }
 
@@ -664,6 +663,10 @@ public:
 
         else if(config.exchange == "binance" && config.market == "futures" && config.mode == "replay"){
             feed = make_unique<BinanceFuturesReplayFeed>(config, state, execution_event, recorder, clock);
+        }
+
+        else if(config.exchange == "polymarket"){
+            feed = make_unique<PolymarketFeed>(config, state, execution_event, recorder, clock);
         }
 
         engine = make_unique<Engine>(config, state, strategy, *execution, clock, execution_event, dashboard_event, snapshot_store, recorder);
@@ -882,7 +885,8 @@ int main(){
     // getline(cin, path);
     // path = path.substr(1, path.size() - 2);
 
-    std_string path = "D:\\OneDrive\\Trading\\manifest.json";
+    std_string path = "D://OneDrive//Trading//Market Making//manifest.json";
+    // std_string path = "C://Users//brian//OneDrive//Trading//Market Making//manifest.json";
     
     ifstream f(path);
 
