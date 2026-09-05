@@ -23,6 +23,8 @@ x86/
 
 # Manifest files
 manifest.json
+manifest_live.json
+manifest - Copy.json
 
 # OS junk
 .DS_Store

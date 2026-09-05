@@ -64,6 +64,7 @@
 
 using std::cout;
 using json = nlohmann::json;
+using ordered_json = nlohmann::ordered_json;
 using std_string = std::string;
 
 using namespace std;
@@ -123,9 +124,9 @@ public:
     }
 
     Element color_pnl(const double& value){
-        if(value > 0) return text("▲ " + format("{:.4f}", value)) | color(Color::Green);
-        else if(value < 0) return text("▼ " + format("{:.4f}", abs(value))) | color(Color::Red);
-        else return text(format("{:.4f}", value));
+        if(value > 0) return text("▲ " + format("{:.10f}", value)) | color(Color::Green);
+        else if(value < 0) return text("▼ " + format("{:.10f}", abs(value))) | color(Color::Red);
+        else return text(format("{:.10f}", value));
     }
 
     Element color_risk(const double& inventory, const double& limit = 10.0) {
@@ -220,11 +221,11 @@ public:
 
             auto market = vbox({
                 row_title("MARKET", ""),
-                row_text("Mid", format("{:<15.4f}", snap.market.mid)),
-                row_text("Microprice", format("{:<15.4f}", snap.market.microprice)),
-                row_text("Spread", format("{:<15.4f}", snap.market.spread)),
-                row_text("Best Bid / Size", format("{:<10.4f}", snap.market.best_bid) + " (" + format("{:<6.4f}", snap.market.bid_size) + ")"),
-                row_text("Best Ask / Size", format("{:<10.4f}", snap.market.best_ask) + " (" + format("{:<6.4f}", snap.market.bid_size) + ")"),
+                row_text("Mid", format("{:<15.10f}", snap.market.mid)),
+                row_text("Microprice", format("{:<15.10f}", snap.market.microprice)),
+                row_text("Spread", format("{:<15.10f}", snap.market.spread)),
+                row_text("Best Bid / Size", format("{:<10.10f}", snap.market.best_bid) + " (" + format("{:<6.4f}", snap.market.bid_size) + ")"),
+                row_text("Best Ask / Size", format("{:<10.10f}", snap.market.best_ask) + " (" + format("{:<6.4f}", snap.market.bid_size) + ")"),
                 row_text("EWMA Vol", format("{:.2e}", snap.market.ewma_vol)),
                 row_text("Order Imbalance", format("{:<15.4f}", snap.market.order_imbalance)),
                 row_text("Trade Imbalance", format("{:<15.4f}", snap.market.trade_imbalance)),
@@ -243,11 +244,11 @@ public:
                 row_title("SIGNALS", ""),
                 row_text("Spread Multiplier", format("{:<15.4f}", snap.signals.spread_multiplier)),
                 row_text("Inventory Target", format("{:<15.2f}", snap.signals.inventory_target)),
-                row_text("Alpha Order Imb", format("{:<15.2f}", snap.signals.alpha_order_imb)),
                 row_text("Alpha Trade Imb", format("{:<15.2f}", snap.signals.alpha_trade_imb)),
                 row_text("Alpha Struct", format("{:<15.2f}", snap.signals.alpha_struct)),
-                row_text("Fair Value", format("{:<15.4f}", snap.signals.fair)),
-                row_text("Inventory Skew", format("{:<15.4f}", snap.signals.skew)),
+                row_text("Alpha Residual", format("{:<15.2f}", snap.signals.alpha_residual)),
+                row_text("Fair Value", format("{:<15.10f}", snap.signals.fair)),
+                row_text("Inventory Skew", format("{:<15.10f}", snap.signals.skew)),
                 row_text("Residual Signal Quality", format("{:<15.2f}", snap.signals.residual_signal_quality)),
                 row_text("Toxicity", format("{:<15.2f}", snap.signals.tox)),
                 row_text("Reservation", format("{:<15.4f}", snap.signals.reservation)),
@@ -257,17 +258,18 @@ public:
             
             auto quotes = vbox({
                 row_title("QUOTES", ""),
-                row_text("My Bid / Size", format("{:<10.4f}", snap.quotes.my_bid) + " (" + format("{:<6.4f}", snap.quotes.current_bid_size) + ")"),
-                row_text("My Ask / Size", format("{:<10.4f}", snap.quotes.my_ask) + " (" + format("{:<6.4f}", snap.quotes.current_ask_size) + ")"),
+                row_text("My Spread", format("{:<10.10f}", snap.quotes.my_spread)),
+                row_text("My Bid / Size", format("{:<10.10f}", snap.quotes.my_bid) + " (" + format("{:<6.4f}", snap.quotes.current_bid_size) + ")"),
+                row_text("My Ask / Size", format("{:<10.10f}", snap.quotes.my_ask) + " (" + format("{:<6.4f}", snap.quotes.current_ask_size) + ")"),
                 row_text("", "")
             });
 
             auto execution = vbox({
                 row_title("EXECUTION", ""),
-                row_text("Queue Ahead / Bid", format("{:<10.4f}", snap.market.best_bid) + " (" + format("{:<6.4f}", snap.execution.bid_queue) + ")"),
-                row_text("Queue Ahead / Ask", format("{:<10.4f}", snap.market.best_ask) + " (" + format("{:<6.4f}", snap.execution.ask_queue) + ")"),
-                row_text("Queue Pressure / Bid", format("{:<10.4f}", snap.market.best_bid) + " (" + format("{:<6.4f}", snap.execution.bid_pressure) + ")"),
-                row_text("Queue Pressure / Ask", format("{:<10.4f}", snap.market.best_ask) + " (" + format("{:<6.4f}", snap.execution.ask_pressure) + ")"),
+                row_text("Queue Ahead / Bid", format("{:<10.10f}", snap.market.best_bid) + " (" + format("{:<6.4f}", snap.execution.bid_queue) + ")"),
+                row_text("Queue Ahead / Ask", format("{:<10.10f}", snap.market.best_ask) + " (" + format("{:<6.4f}", snap.execution.ask_queue) + ")"),
+                row_text("Queue Pressure / Bid", format("{:<10.10f}", snap.market.best_bid) + " (" + format("{:<6.4f}", snap.execution.bid_pressure) + ")"),
+                row_text("Queue Pressure / Ask", format("{:<10.10f}", snap.market.best_ask) + " (" + format("{:<6.4f}", snap.execution.ask_pressure) + ")"),
                 row_text("Open Orders", snap.execution.buy_order),
                 row_text("", snap.execution.sell_order),
                 row_text("Last Fill Candidate", snap.execution.last_fill_candidate),
@@ -280,7 +282,7 @@ public:
                 row_elem("Inventory", color_risk(snap.risk.inventory)),
                 row_elem("Realized PnL", color_pnl(snap.risk.realized_pnl)),
                 row_elem("Unrealized PnL", color_pnl(snap.risk.unrealized_pnl)),
-                row_elem("Fees Paid", color_pnl(snap.risk.fees_paid)),
+                row_elem("Fees Paid", color_pnl(-snap.risk.fees_paid)),
                 row_elem("Total PnL", color_pnl(snap.risk.total_pnl)),
                 row_elem("Risk", centered_inventory_bar(snap.risk.inventory)),
                 row_text("", "")
@@ -452,18 +454,18 @@ public:
                 {"fair", snap.signals.fair},
                 {"skew", snap.signals.skew},
                 {"reservation", snap.signals.reservation},
-                {"alpha_order_imb", snap.signals.alpha_order_imb},
                 {"alpha_trade_imb", snap.signals.alpha_trade_imb},
                 {"alpha_struct", snap.signals.alpha_struct},
-                {"k0", snap.signals.k0},
+                {"alpha_residual", snap.signals.alpha_residual},
                 {"spread_multiplier", snap.signals.spread_multiplier},
                 {"inventory_target", snap.signals.inventory_target},
                 {"residual_signal_quality", snap.signals.residual_signal_quality},
                 {"tox", snap.signals.tox},
-                {"k1", snap.signals.k1},
-                {"k2", snap.signals.k2},
+                {"k_spread", snap.signals.k_spread},
+                {"k_order_size", snap.signals.k_order_size},
             }},
             {"quotes", {
+                {"my_spread", snap.quotes.my_spread},
                 {"my_bid", snap.quotes.my_bid},
                 {"my_ask", snap.quotes.my_ask},
                 {"current_bid_size", snap.quotes.current_bid_size},

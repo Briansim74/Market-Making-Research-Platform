@@ -44,7 +44,7 @@ export default function Dashboard() {
         <span style={styles.italic}>
           {"pnl="}
           {t.pnl_pct > 0 ? "+" : ""}
-          {t.pnl_pct.toFixed(10)}%
+          {t.pnl_pct.toFixed(4)}%
         </span>
       </div>
 
@@ -141,11 +141,6 @@ export default function Dashboard() {
           />
 
           <Row
-            label="Alpha Order Imb"
-            value={s.alpha_order_imb.toFixed(2)}
-          />
-
-          <Row
             label="Alpha Trade Imb"
             value={s.alpha_trade_imb.toFixed(2)}
           />
@@ -156,8 +151,13 @@ export default function Dashboard() {
           />
 
           <Row
+            label="Alpha Residual"
+            value={s.alpha_residual.toFixed(2)}
+          />
+
+          <Row
             label="Fair Value"
-            value={s.fair.toFixed(4)}
+            value={s.fair.toFixed(10)}
           />
 
           <Row
@@ -177,11 +177,16 @@ export default function Dashboard() {
 
           <Row
             label="Reservation"
-            value={s.reservation.toFixed(4)}
+            value={s.reservation.toFixed(10)}
           />
 
           {/* QUOTES */}
           <Section title="QUOTES" />
+
+          <Row
+            label="My Spread"
+            value={`${q.my_spread.toFixed(10)}`}
+          />
 
           <Row
             label="My Bid / Size"

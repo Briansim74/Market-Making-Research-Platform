@@ -64,6 +64,7 @@
 
 using std::cout;
 using json = nlohmann::json;
+using ordered_json = nlohmann::ordered_json;
 using std_string = std::string;
 
 using namespace std;
@@ -114,6 +115,11 @@ public:
     size_t qty_precision = 0;
 
     std_string folder_path;
+    size_t EVENTS_CHUNK;
+    size_t SNAPSHOTS_CHUNK;
+    size_t TRADES_CHUNK;
+    size_t QUOTES_CHUNK;
+    size_t FILLS_CHUNK;
     double speed_multiplier;
     std_string host;
     int16_t port;
@@ -124,7 +130,7 @@ public:
     std_string endpoint;
     std_string hostname;
 
-    MarketConfig(const json& params) {initialize(params);}
+    MarketConfig(const ordered_json& params) {initialize(params);}
 
     int get_precision(double step){
         int precision = 0;
@@ -136,7 +142,7 @@ public:
         return precision;
     }
 
-    void initialize(const json& params){
+    void initialize(const ordered_json& params){
         exchange = params["exchange"].get<std_string>();
         mode = params["mode"].get<std_string>();
         market = params["market"].get<std_string>();
@@ -155,29 +161,33 @@ public:
         gamma = params["gamma"].get<double>();
         base_size = params["base_size"].get<double>();
         max_inv = params["max_inv"].get<double>();
-
         initial_cash = params["initial_cash"].get<double>();
-        maker_fee_rate = params["fees"]["maker_fee_rate"].get<double>();
-        taker_fee_rate = params["fees"]["taker_fee_rate"].get<double>();
 
         folder_path = params["folder_path"].get<std_string>();
+        EVENTS_CHUNK = params["dataset"]["events_chunk"].get<size_t>();
+        SNAPSHOTS_CHUNK = params["dataset"]["snapshots_chunk"].get<size_t>();
+        TRADES_CHUNK = params["dataset"]["trades_chunk"].get<size_t>();
+        QUOTES_CHUNK = params["dataset"]["quotes_chunk"].get<size_t>();
+        FILLS_CHUNK = params["dataset"]["fills_chunk"].get<size_t>();
         speed_multiplier = params["speed_multiplier"].get<double>();
         host = params["server_config"]["host"].get<std_string>();
         port = params["server_config"]["port"].get<int16_t>();
 
-        api_key = params["api"]["api_key"].get<std_string>();
-        api_secret = params["api"]["api_secret"].get<std_string>();
+        api_key = (mode == "live" && market == "spot" && instrument == "pepeusdt") ? params["api"]["api_key_live"].get<std_string>() : params["api"]["api_key"].get<std_string>();
+        api_secret = (mode == "live" && market == "spot" && instrument == "pepeusdt") ? params["api"]["api_secret_live"].get<std_string>() : params["api"]["api_secret"].get<std_string>();
         hostname = params["api"]["hostname_" + market].get<std_string>();
         base_url = params["api"]["base_url_" + market].get<std_string>();
         endpoint = params["api"]["endpoint_" + market].get<std_string>();
-        
+
         cout << "exchange: " << exchange + "_" + market << ", mode: " << mode << ", instrument: " << instrument << ", instrument_upper: " << instrument_upper << "\n";
         cout << "exchange_latency: " << exchange_latency << ", gamma: " << gamma << ", base_size: " << base_size << ", max_inv: " << max_inv << "\n";
-        cout << "initial_cash: " << initial_cash << ", maker_fee_rate: " << maker_fee_rate << ", taker_fee_rate: " << taker_fee_rate << "\n";
-        cout << "folder_path: " << folder_path << ", host: " << host << ", port: " << port << "\n";
+        cout << "initial_cash: " << initial_cash << "\n";
+        cout << "folder_path: " << folder_path << ", events_chunk: " << EVENTS_CHUNK << ", snapshots_chunk: " << SNAPSHOTS_CHUNK << "\n";
+        cout << "trades_chunk: " << TRADES_CHUNK << ", quotes_chunk: " << QUOTES_CHUNK << ", fills_chunk: " << FILLS_CHUNK << "\n";
+        cout << "host: " << host << ", port: " << port << "\n";
         cout << "hostname: " << hostname << ", base_url: " << base_url << ", endpoint: " << endpoint << "\n";
 
-        std_string url = "https://" + base_url + endpoint + "/exchangeInfo?symbol=" + instrument_upper;
+        std_string url = "https://" + base_url + "/" + endpoint + "/exchangeInfo?symbol=" + instrument_upper;
 
         auto r = cpr::Get(cpr::Url{url});
         auto data = json::parse(r.text);
@@ -193,7 +203,25 @@ public:
             if(f["filterType"] == "LOT_SIZE"){
                 step_size = stod(f["stepSize"].get<std_string>());
                 qty_precision   = get_precision(step_size);
+
+                double min_qty = stod(f["minQty"].get<std_string>());
+                double max_qty = stod(f["maxQty"].get<std_string>());
+
                 cout << "step_size: " << step_size << ", qty_precision: " << qty_precision << "\n";
+                cout << "min_qty: " << min_qty << ", max_qty: " << max_qty << "\n";
+            }
+
+            if(f["filterType"] == "NOTIONAL") { // spot
+                double min_notional = stod(f["minNotional"].get<std_string>());
+                bool apply_min_to_market = f["applyMinToMarket"].get<bool>();
+
+                cout << "min_notional_USDT: " << min_notional << ", apply_min_to_market: " << boolalpha << apply_min_to_market << "\n";
+            }
+
+            if(f["filterType"] == "MIN_NOTIONAL") { // futures
+                double min_notional = stod(f["notional"].get<std_string>());
+
+                cout << "min_notional_USDT: " << min_notional << "\n";
             }
         }
     }
@@ -207,7 +235,7 @@ public:
     }
 
     double normalize_qty(const double& qty) const {
-        double rounded = floor(qty / step_size) * step_size;
+        double rounded = ceil(qty / step_size) * step_size;
 
         if(rounded < step_size) return 0.0;
 
@@ -262,13 +290,13 @@ public:
         auto [bid_tick, bid_size] = best_bid();
         auto [ask_tick, ask_size] = best_ask();
 
-        return config.from_tick((bid_tick + ask_tick) / 2);
+        return config.from_tick((bid_tick + ask_tick) / 2.0);
     }
 
     pair<int64_t, json> initialize_from_binance(int limit = 1000){
 
-        std_string url = "https://" + config.base_url + config.endpoint + "/depth?symbol=" + config.instrument_upper + "&limit=" + to_string(limit);
-        cout << "initialize_from_binance url: " << url << "\n";
+        std_string url = "https://" + config.base_url + "/" + config.endpoint + "/depth?symbol=" + config.instrument_upper + "&limit=" + to_string(limit);
+
         auto r = cpr::Get(cpr::Url{url});
         auto snapshot = json::parse(r.text);
 

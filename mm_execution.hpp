@@ -68,6 +68,7 @@
 
 using std::cout;
 using json = nlohmann::json;
+using ordered_json = nlohmann::ordered_json;
 using std_string = std::string;
 
 using namespace std;
@@ -202,39 +203,49 @@ public:
     }
 
     pair<double, double> compute_order_size(const Signal& signal){
-        double inv = state.inventory;
-        double vol = state.get_vol();
 
-        double vol_penalty = 1.0 / (1.0 + 50.0 * vol);
+        // Convert inventory to USDT notional for risk calculations.
+        double inv_usdt = signal.inventory * signal.mid; // USDT per PEPE
 
-        double inv_scale = 5.0;
-        double inv_signal = tanh(inv / inv_scale);
+        // Inventory scale should be in USDT, not PEPE quantity.
+        double inv_scale_usdt = 1.0; // strongly reduce bid/ask size at 1usdt long/short to go to flat inv
+        double inv_signal = tanh(inv_usdt / inv_scale_usdt);
 
         double bid_multiplier = exp(-inv_signal);
         double ask_multiplier = exp(inv_signal);
 
-        double risk_penalty = exp(-0.2 * inv * inv);
+        // Also preferably make this USDT-based.
+        double vol_penalty = 1.0 / (1.0 + 50.0 * signal.volatility);
+        double risk_penalty = exp(-0.2 * pow(inv_usdt / inv_scale_usdt, 2));
+        double toxicity_penalty = exp(-signal.toxicity.k_order_size * signal.toxicity.tox); //negative markout translates into positive exp
 
-        double toxicity_penalty = exp(-signal.toxicity.k2 * signal.toxicity.tox); //negative markout translates into positive exp
+        // Size is USDT notional.
+        double size_usdt = config.base_size * vol_penalty * risk_penalty * toxicity_penalty;
 
-        double base = config.base_size * vol_penalty * risk_penalty;
-        double size = base * toxicity_penalty;
+        // Exchange minimum is 1 USDT.
+        size_usdt = max(config.base_size, min(size_usdt, 1.5 * config.base_size)); // max 1.5 base size usdt per order
 
-        size = max(0.05, min(size, 2.0));
+        double bid_size_usdt = size_usdt * bid_multiplier;
+        double ask_size_usdt = size_usdt * ask_multiplier;
 
-        double bid_size = size * bid_multiplier;
-        double ask_size = size * ask_multiplier;
+        // Inventory limits in USDT.
+        double max_buy_usdt = max(0.0, config.max_inv - inv_usdt); // NEW RISK GUARD HERE, PREVENT EXCEEDING MARGIN
+        double max_sell_usdt = max(0.0, config.max_inv + inv_usdt);
 
-        // inventory limits
-        double max_buy = max(0.0, config.max_inv - inv); // NEW RISK GUARD HERE, PREVENT EXCEEDING MARGIN
-        double max_sell = max(0.0, config.max_inv + inv);
+        bid_size_usdt = min(bid_size_usdt, max_buy_usdt);
+        ask_size_usdt = min(ask_size_usdt, max_sell_usdt);
 
-        bid_size = min(bid_size, max_buy);
-        ask_size = min(ask_size, max_sell);
+        // Convert USDT notional -> PEPE quantity.
+        double bid_size = bid_size_usdt / signal.mid;
+        double ask_size = ask_size_usdt / signal.mid;
 
         // exchange LOT_SIZE normalization
         bid_size = config.normalize_qty(bid_size);
         ask_size = config.normalize_qty(ask_size);
+
+        // Re-check actual notional AFTER normalization.
+        if(bid_size_usdt < config.base_size) bid_size = 0.0;
+        if(ask_size_usdt < config.base_size) ask_size = 0.0;
 
         return {bid_size, ask_size};
     }
@@ -440,8 +451,9 @@ public:
         if(fill_qty > 0.0){
             order->remaining = max(0.0, order->remaining - fill_qty);
 
+            // bool is_maker = false;
+
             state.on_fill(trade.price, fill_qty, order->side, true);
-            // cout << "order->side: " << " side: " << side << "\n";
 
             if(order->remaining > 0.0) order->status = "PARTIALLY_FILLED";
             else order->status = "FILLED";
@@ -546,12 +558,11 @@ public:
                 const vector<string>& headers = {}, const string& body = ""){
 
         lock_guard<mutex> lock(mtx);
-
         http::request<http::string_body> req{method, target, 11};
 
         req.set(http::field::host, config.base_url);
-        req.set(http::field::user_agent, "mm-engine");
-
+        req.set(http::field::user_agent, config.struct_model);
+        
         for(const auto& h: headers){
             auto pos = h.find(":");
 
@@ -590,6 +601,167 @@ public:
 
 class BinanceBroker {
 public:
+    virtual std_string open_user_stream() = 0;
+    virtual void stop() = 0;
+    virtual std_string sign(const std_string&) = 0;
+    virtual double get_position() = 0;
+    virtual json place_limit(const Order&, const double&, const double&) = 0;
+    virtual json place_market(const Order&) = 0;
+    virtual json cancel_order(const Order&) = 0;
+    virtual ~BinanceBroker() = default;
+};
+
+class BinanceSpotBroker : public BinanceBroker {
+public:
+    MarketConfig& config;
+    BinanceClock& clock;
+    HttpClient http;
+
+    BinanceSpotBroker(MarketConfig& config, BinanceClock& clock)
+        : config(config), clock(clock), http(config)
+        {
+            http.initialize();
+            get_fee_rates();
+        }
+
+    std_string open_user_stream(){
+        return "";
+    }
+
+    void stop(){}
+
+    // -------------------------
+    // SIGNING
+    // -------------------------
+    std_string sign(const std_string& query){
+        unsigned char* digest;
+        digest = HMAC(EVP_sha256(), config.api_secret.c_str(), config.api_secret.size(),
+                      (unsigned char*)query.c_str(), query.size(), NULL, NULL);
+
+        char mdString[65];
+        for(int i = 0; i < 32; i++)
+            sprintf(&mdString[i * 2], "%02x", (unsigned int)digest[i]);
+
+        return std_string(mdString);
+    }
+
+    // -------------------------
+    // ACCOUNT BALANCE
+    // -------------------------
+    void get_fee_rates(){
+
+        int64_t ts = clock.now_ms();
+        ostringstream q;
+        q << "symbol=" << config.instrument_upper
+        << "&timestamp=" << ts
+        << "&recvWindow=5000";
+
+        std_string query = q.str();
+        std_string signature = sign(query);
+
+        std_string url = "https://" + config.base_url + "/" + config.endpoint + "/account/commission?" + query + "&signature=" + signature;
+        vector<std_string> headers = {"X-MBX-APIKEY: " + config.api_key};
+
+        auto res = http.request(http::verb::get, url, headers);
+        auto arr = json::parse(res);
+
+        config.maker_fee_rate = stod(arr["standardCommission"]["maker"].get<std_string>());
+        config.taker_fee_rate = stod(arr["standardCommission"]["taker"].get<std_string>());
+
+        cout << "maker_fee_rate: " << config.maker_fee_rate << " (" << config.maker_fee_rate * 100 << "%)\n";
+        cout << "taker_fee_rate: " << config.taker_fee_rate << " (" << config.taker_fee_rate * 100 << "%)\n";
+    }
+
+    double get_position(){
+        std_string asset = "PEPE";
+        // std_string asset = = config.instrument_upper.substr(0, config.instrument_upper.size() - 4);
+
+        int64_t ts = clock.now_ms();
+        ostringstream q;
+        q << "timestamp=" << ts << "&recvWindow=5000";
+
+        std_string query = q.str();
+        std_string signature = sign(query);
+
+        std_string url = "/" + config.endpoint + "/account?" + query + "&signature=" + signature;
+        vector<std_string> headers = {"X-MBX-APIKEY: " + config.api_key};
+
+        auto res = http.request(http::verb::get, url, headers);
+        auto arr = json::parse(res);
+
+        for(auto& balance: arr["balances"]){
+            if(balance["asset"] == asset) return stod(balance["free"].get<std_string>());
+        }
+
+        return 0.0;
+    }
+
+    // -------------------------
+    // ORDER PLACEMENT
+    // -------------------------
+    json place_limit(const Order& order, const double& price, const double& size){
+        
+        ostringstream q;
+        q << "newClientOrderId=" << order.client_oid
+          << "&symbol=" << config.instrument_upper
+          << "&side=" << order.side
+          << "&type=LIMIT"
+          << "&timeInForce=GTC"
+          << "&quantity=" << fixed << setprecision(config.qty_precision) << size
+          << "&price=" << fixed << setprecision(config.price_precision) << price
+          << "&timestamp=" << order.ts
+          << "&recvWindow=5000";
+
+        std_string query = q.str();
+        std_string signature = sign(query);
+
+        std_string url = "/" + config.endpoint + "/order?" + query + "&signature=" + signature;
+        vector<std_string> headers = {"X-MBX-APIKEY: " + config.api_key};
+
+        auto res = http.request(http::verb::post, url, headers);
+        return json::parse(res);
+    }
+
+    json place_market(const Order& order){
+
+        ostringstream q;
+        q << "&newClientOrderId=" << order.client_oid
+          << "&symbol=" << config.instrument_upper
+          << "&side=" << order.side
+          << "&type=MARKET"
+          << "&quantity=" << fixed << setprecision(config.qty_precision) << order.qty
+          << "&timestamp=" << order.ts
+          << "&recvWindow=5000";
+
+        std_string query = q.str();
+        std_string signature = sign(query);
+
+        std_string url = "/" + config.endpoint + "/order?" + query + "&signature=" + signature;
+        vector<std_string> headers = {"X-MBX-APIKEY: " + config.api_key};
+
+        auto res = http.request(http::verb::post, url, headers);
+        return json::parse(res);
+    }
+
+    json cancel_order(const Order& order){
+        
+        ostringstream q;
+        q << "origClientOrderId=" << order.client_oid
+          << "&symbol=" << config.instrument_upper << "&timestamp=" << order.ts;
+
+        std_string query = q.str();
+        std_string signature = sign(query);
+
+        std_string url = "/" + config.endpoint + "/order?" + query + "&signature=" + signature;
+        vector<std_string> headers = {"X-MBX-APIKEY: " + config.api_key};
+
+        auto res = http.request(http::verb::delete_, url, headers);
+        return json::parse(res);
+    }
+};
+
+class BinanceFuturesBroker : public BinanceBroker {
+public:
     MarketConfig& config;
     BinanceClock& clock;
     HttpClient http;
@@ -602,52 +774,36 @@ public:
 
     thread keepalive_thread;
 
-    BinanceBroker(MarketConfig& config, BinanceClock& clock)
-        : config(config), clock(clock), http(config) {http.initialize();}
+    BinanceFuturesBroker(MarketConfig& config, BinanceClock& clock)
+        : config(config), clock(clock), http(config)
+        {
+            http.initialize();
+            get_fee_rates();
+        }
 
     // -------------------------
     // USER STREAM
     // -------------------------
     std_string open_user_stream(){
-        std_string url = config.endpoint + "/listenKey";
+
+        std_string url = "/" + config.endpoint + "/listenKey";
         vector<std_string> headers = {"X-MBX-APIKEY: " + config.api_key};
 
         auto res = http.request(http::verb::post, url, headers);
         auto j = json::parse(res);
 
         listen_key = j["listenKey"];
-
         start_keepalive_loop();
         return listen_key;
     }
 
     void keepalive_listen_key(){
-        std_string url = config.endpoint + "/listenKey?listenKey=" + listen_key;
+
+        std_string url = "/" + config.endpoint + "/listenKey?listenKey=" + listen_key;
         vector<std_string> headers = {"X-MBX-APIKEY: " + config.api_key};
 
         http.request(http::verb::put, url, headers);
     }
-
-    // void start_keepalive_loop(){
-    //     keepalive_running = true;
-
-    //     keepalive_thread = thread([this](){
-    //         unique_lock<mutex> lock(keepalive_mtx);
-
-    //         while(keepalive_running){
-    //             if(keepalive_cv.wait_for(lock, minutes(20),
-    //             [this]{return !keepalive_running.load();})) break;
-
-    //             try{
-    //                 keepalive_listen_key();
-    //                 cout << "[keepalive sent]\n";
-    //             }
-    //             catch(...){
-    //                 cout << "[keepalive error]\n";
-    //             }
-    //         }
-    //     });
-    // }
 
     void start_keepalive_loop(){
         keepalive_running = true;
@@ -693,8 +849,32 @@ public:
     }
 
     // -------------------------
-    // ORDER PLACEMENT
+    // ACCOUNT BALANCE
     // -------------------------
+    void get_fee_rates(){
+
+        int64_t ts = clock.now_ms();
+        ostringstream q;
+        q << "symbol=" << config.instrument_upper
+        << "&timestamp=" << ts
+        << "&recvWindow=5000";
+
+        std_string query = q.str();
+        std_string signature = sign(query);
+
+        std_string url = "https://" + config.base_url + "/" + config.endpoint + "/commissionRate?" + query + "&signature=" + signature;
+        vector<std_string> headers = {"X-MBX-APIKEY: " + config.api_key};
+
+        auto res = http.request(http::verb::get, url, headers);
+        auto arr = json::parse(res);
+
+        config.maker_fee_rate = stod(arr["makerCommissionRate"].get<std_string>());
+        config.taker_fee_rate = stod(arr["takerCommissionRate"].get<std_string>());
+
+        cout << "maker_fee_rate: " << config.maker_fee_rate << " (" << config.maker_fee_rate * 100 << "%)\n";
+        cout << "taker_fee_rate: " << config.taker_fee_rate << " (" << config.taker_fee_rate * 100 << "%)\n";
+    }
+
     double get_position(){
 
         int64_t ts = clock.now_ms();
@@ -716,9 +896,12 @@ public:
         return 0.0;
     }
 
+    // -------------------------
+    // ORDER PLACEMENT
+    // -------------------------
     json place_limit(const Order& order, const double& price, const double& size){
         
-        ostringstream q;        
+        ostringstream q;
         q << "newClientOrderId=" << order.client_oid
           << "&symbol=" << config.instrument_upper
           << "&side=" << order.side
@@ -732,7 +915,7 @@ public:
         std_string query = q.str();
         std_string signature = sign(query);
 
-        std_string url = config.endpoint + "/order?" + query + "&signature=" + signature;
+        std_string url = "/" + config.endpoint + "/order?" + query + "&signature=" + signature;
         vector<std_string> headers = {"X-MBX-APIKEY: " + config.api_key};
 
         auto res = http.request(http::verb::post, url, headers);
@@ -754,7 +937,7 @@ public:
         std_string query = q.str();
         std_string signature = sign(query);
 
-        std_string url = config.endpoint + "/order?" + query + "&signature=" + signature;
+        std_string url = "/" + config.endpoint + "/order?" + query + "&signature=" + signature;
         vector<std_string> headers = {"X-MBX-APIKEY: " + config.api_key};
         
         auto res = http.request(http::verb::post, url, headers);
@@ -770,7 +953,7 @@ public:
         std_string query = q.str();
         std_string signature = sign(query);
 
-        std_string url = config.endpoint + "/order?" + query + "&signature=" + signature;
+        std_string url = "/" + config.endpoint + "/order?" + query + "&signature=" + signature;
         vector<std_string> headers = {"X-MBX-APIKEY: " + config.api_key};
 
         auto res = http.request(http::verb::delete_, url, headers);
@@ -855,39 +1038,52 @@ public:
     }
 
     pair<double, double> compute_order_size(const Signal& signal){
-        double inv = state.inventory;
-        double vol = state.get_vol();
 
-        double vol_penalty = 1.0 / (1.0 + 50.0 * vol);
+        // Convert inventory to USDT notional for risk calculations.
+        double inv_usdt = signal.inventory * signal.mid; // USDT per PEPE
 
-        double inv_scale = 5.0;
-        double inv_signal = tanh(inv / inv_scale);
+        // Inventory scale should be in USDT, not PEPE quantity.
+        double inv_scale_usdt = 1.0; // strongly reduce bid/ask size at 1usdt long/short to go to flat inv
+        double inv_signal = tanh(inv_usdt / inv_scale_usdt);
 
         double bid_multiplier = exp(-inv_signal);
         double ask_multiplier = exp(inv_signal);
 
-        double risk_penalty = exp(-0.2 * inv * inv);
+        // Also preferably make this USDT-based.
+        double vol_penalty = 1.0 / (1.0 + 50.0 * signal.volatility);
+        double risk_penalty = exp(-0.2 * pow(inv_usdt / inv_scale_usdt, 2));
+        double toxicity_penalty = exp(-signal.toxicity.k_order_size * signal.toxicity.tox); //negative markout translates into positive exp
 
-        double toxicity_penalty = exp(-signal.toxicity.k2 * signal.toxicity.tox); //negative markout translates into positive exp
+        // Size is USDT notional.
+        double size_usdt = config.base_size * vol_penalty * risk_penalty * toxicity_penalty;
 
-        double base = config.base_size * vol_penalty * risk_penalty;
-        double size = base * toxicity_penalty;
+        // Exchange minimum is 1 USDT.
+        size_usdt = max(config.base_size, min(size_usdt, 1.5 * config.base_size)); // max 1.5 base size usdt per order
 
-        size = max(0.05, min(size, 2.0));
+        double bid_size_usdt = size_usdt * bid_multiplier;
+        double ask_size_usdt = size_usdt * ask_multiplier;
+        
+        // Inventory limits in USDT.
+        double max_buy_usdt = max(0.0, config.max_inv - inv_usdt); // NEW RISK GUARD HERE, PREVENT EXCEEDING MARGIN
+        double max_sell_usdt = max(0.0, config.max_inv + inv_usdt);
 
-        double bid_size = size * bid_multiplier;
-        double ask_size = size * ask_multiplier;
+        bid_size_usdt = min(bid_size_usdt, max_buy_usdt);
+        ask_size_usdt = min(ask_size_usdt, max_sell_usdt);
 
-        // inventory limits
-        double max_buy = max(0.0, config.max_inv - inv); // NEW RISK GUARD HERE, PREVENT EXCEEDING MARGIN
-        double max_sell = max(0.0, config.max_inv + inv);
-
-        bid_size = min(bid_size, max_buy);
-        ask_size = min(ask_size, max_sell);
+        // Convert USDT notional -> PEPE quantity.
+        double bid_size = bid_size_usdt / signal.mid;
+        double ask_size = ask_size_usdt / signal.mid;
 
         // exchange LOT_SIZE normalization
         bid_size = config.normalize_qty(bid_size);
         ask_size = config.normalize_qty(ask_size);
+
+        // Re-check actual notional AFTER normalization.
+        if(bid_size_usdt < config.base_size) bid_size = 0.0;
+        if(ask_size_usdt < config.base_size) ask_size = 0.0;
+
+        // cout << "bid_size: " << bid_size << "\n";
+        // cout << "ask_size: " << ask_size << "\n";
 
         return {bid_size, ask_size};
     }
@@ -1100,8 +1296,10 @@ public:
     // -------------------------
     void apply_stream_update(const Stream& stream) override {
 
+        cout << "stream.client_oid: " << stream.client_oid << ", stream.exec_type: " << stream.exec_type << "\n";
+        
         Order* order = get_order(stream.client_oid);
-
+        
         if(!order) return;
 
         // -------------------------
@@ -1109,12 +1307,12 @@ public:
         // -------------------------
         order->exchange_latency = clock.compute_exchange_latency(stream.exchange_ts, order->ts);
         state.exchange_latency = order->exchange_latency;
- 
+
         // -------------------------
         // NEW
         // -------------------------
         if(stream.exec_type == "NEW"){
-            
+
             order->live_ts = stream.exchange_ts;
             order->status = "LIVE";
             order->queue_ahead_at_join = state.set_queue_position(stream.side, order->price_tick);
@@ -1124,13 +1322,13 @@ public:
 
             orderToString(order, stream, "PLACE");
             recorder.log_quote(*order, (stream.side == "BUY") ? "BID" : "ASK", "NEW");
+            cout << "stream NEW1\n";
         }
 
         // -------------------------
         // CANCELED
         // -------------------------
         else if(stream.exec_type == "CANCELED"){
-            
             order->status = "CANCELED";
 
             state.reset_queue_position(stream.side);
@@ -1147,7 +1345,7 @@ public:
         // EXPIRED - FOR EXPIRED_IN_MATCH, IF EXCHANGE LAGS BEHIND NEW QUOTES
         // -------------------------
         else if(stream.exec_type == "EXPIRED"){
-            
+
             order->status = "EXPIRED";
 
             state.reset_queue_position(stream.side);
@@ -1180,43 +1378,54 @@ public:
 
             //     state.market_feature_state.toxicity_predictions.push_back(move(p));
             // }
-
-            state.on_fill(stream.fill_price, stream.fill_qty, stream.side, true);
+            cout << "stream TRADE\n";
+            state.on_fill(stream.fill_price, stream.fill_qty, stream.side, stream.is_maker);
             
             if(stream.status == "PARTIALLY_FILLED"){
+                cout << "stream PARTIALLY FILLED\n";
                 order->status = "PARTIALLY_FILLED";
                 order->remaining = max(0.0, order->remaining - stream.fill_qty);
 
                 (stream.side == "BUY") ? state.bid_queue_ahead.second = 0.0 : state.ask_queue_ahead.second = 0.0;
 
                 orderToString(order, stream, "PARTIALLY_FILLED");
+                cout << "stream PARTIALLY FILLED 1\n";
             }
 
             else if(stream.status == "FILLED"){
+                cout << "stream FILLED\n";
                 order->status = "FILLED";
                 order->remaining = 0.0;
                 
                 state.reset_queue_position(stream.side);
 
                 orderToString(order, stream, "FILLED");
+                cout << "stream FILLED 1\n";
             }
 
-            // if(stream.order_type == "MARKET") orderMarketToString(order, stream);
-
-            recorder.log_fill(*order, stream.fill_qty, stream.exchange_ts, (stream.order_type != "MARKET"));
+            recorder.log_fill(*order, stream.fill_qty, stream.exchange_ts, stream.is_maker);
 
             state.last_order_update = *order;
        
             if(stream.status == "FILLED") open_orders.erase(order->client_oid);
+            cout << "stream TRADE 1\n";
         }
         else{
             cout << "UNKNOWN ORDER UPDATE " << stream.exec_type << "\n";
             throw runtime_error("unknown order update");            
         }
+        cout << "stream END\n";
     }
 };
 
 class BinanceUserStream {
+public:
+    virtual void start() = 0;
+    virtual void stop() = 0;
+    virtual ~BinanceUserStream() = default;
+};
+
+class BinanceSpotUserStream : public BinanceUserStream {
 public:
     MarketConfig& config;
     BinanceBroker& broker;
@@ -1234,7 +1443,7 @@ public:
     mutex connection_mtx;
     condition_variable connection_cv;
 
-    BinanceUserStream(MarketConfig& config, BinanceBroker& broker, ExecutionEventQueue& execution_event, BinanceClock& clock)
+    BinanceSpotUserStream(MarketConfig& config, BinanceBroker& broker, ExecutionEventQueue& execution_event, BinanceClock& clock)
         : config(config), broker(broker), execution_event(execution_event), clock(clock) {}
 
     void start(){
@@ -1249,7 +1458,207 @@ public:
     }
 
     void run(){
-        broker.open_user_stream();
+        const string hostname = "ws-" + config.base_url;
+        const string target = "/ws-" + config.endpoint;
+
+        cout << "[USER STREAM] resolving " << hostname << "\n";
+
+        asio::io_context ioc;
+        ssl::context ctx(ssl::context::tlsv12_client);
+        ctx.set_default_verify_paths();
+
+        tcp::resolver resolver(ioc);
+        auto results = resolver.resolve(hostname, "443");
+
+        // -------------------------
+        // STEP 1: TCP SOCKET
+        // -------------------------
+        tcp::socket socket(ioc);
+        asio::connect(socket, results);
+
+        // -------------------------
+        // STEP 2: TLS LAYER
+        // -------------------------
+        ssl_stream ssl_sock(move(socket), ctx);
+        SSL_set_tlsext_host_name(ssl_sock.native_handle(), hostname.c_str());
+        ssl_sock.handshake(ssl::stream_base::client);
+
+        // -------------------------
+        // STEP 3: WEBSOCKET LAYER
+        // -------------------------
+        ws = make_unique<ws_stream>(move(ssl_sock));
+        ws->handshake(hostname, target);
+
+        // -------------------------------------------------
+        // SUBSCRIBE
+        // -------------------------------------------------
+        subscribe_user_data_stream();
+
+        {
+            lock_guard<mutex> lock(connection_mtx);
+            connected = true;
+        }
+        connection_cv.notify_one();
+
+        // -------------------------------------------------
+        // READ LOOP
+        // -------------------------------------------------
+        beast::flat_buffer buffer;
+
+        while(running){
+            boost::system::error_code ec;
+            ws->read(buffer, ec);
+            if(ec){
+                if(running) cerr << "[USER STREAM] read error: " << ec.message() << "\n";
+                break;
+            }
+
+            string msg = beast::buffers_to_string(buffer.data());
+            buffer.consume(buffer.size());
+
+            on_message(msg);
+        }
+    }
+
+    // ---------------------------------------------------------
+    // USER DATA STREAM SUBSCRIPTION
+    // ---------------------------------------------------------
+    void subscribe_user_data_stream(){
+
+        int64_t ts = clock.now_ms();
+        ostringstream q;
+        q << "apiKey=" << config.api_key
+          << "&recvWindow=5000"
+          << "&timestamp=" << ts;
+
+        string query = q.str();
+        string signature = broker.sign(query);
+
+        json request = {
+            {"id", config.struct_model},
+            {"method", "userDataStream.subscribe.signature"},
+            {"params", {
+                {"apiKey", config.api_key},
+                {"timestamp", ts},
+                {"recvWindow", 5000},
+                {"signature", signature}
+            }}
+        };
+
+        string msg = request.dump();
+        ws->write(asio::buffer(msg));
+
+        // -----------------------------------------------------
+        // Wait for subscription response
+        // -----------------------------------------------------
+        beast::flat_buffer buffer;
+
+        while(running){
+            boost::system::error_code ec;
+            ws->read(buffer, ec);
+            if(ec) throw runtime_error("subscription read failed: " + ec.message());
+
+            string msg = beast::buffers_to_string(buffer.data());
+            buffer.consume(buffer.size());
+
+            cout << "[USER STREAM] subscription response: " << msg << "\n";
+
+            auto resp = json::parse(msg);
+
+            if(!resp.contains("status")) continue;
+
+            int status = resp["status"].get<int>();
+
+            if(status != 200){
+                throw runtime_error("userDataStream subscription failed: " + msg);
+            }
+
+            if(resp.contains("result") && resp["result"].contains("subscriptionId")){
+                cout << "[USER STREAM] subscribed, subscriptionId=" << resp["result"]["subscriptionId"] << "\n";
+                return;
+            }
+        }
+
+        throw runtime_error("userDataStream subscription aborted");
+    }
+
+    void stop(){
+        cout << "STOPPING USER STREAM\n";
+        running = false;
+
+        boost::system::error_code ec;
+        beast::get_lowest_layer(*ws).cancel(ec);
+
+        if(stream_thread.joinable()) stream_thread.join();
+
+        cout << "USER STREAM STOPPED\n";
+    }
+
+    void on_message(const std_string& msg){
+        simdjson::padded_string json(msg);
+        auto doc = parser.iterate(json);
+
+        simdjson::ondemand::object o = doc["event"].get_object();
+
+        if(std_string(o["e"]) != "executionReport") return;
+        cout << msg << "\n";
+
+        Stream stream;
+        stream.client_oid = (!std_string(o["C"]).empty()) ? std_string(o["C"]) : std_string(o["c"]);
+        stream.side = std_string(o["S"]);
+        stream.status = std_string(o["X"]);
+        stream.exec_type = std_string(o["x"]);
+        stream.order_type = std_string(o["o"]);
+        stream.price = double(o["p"].get_double_in_string());
+        stream.qty = double(o["q"].get_double_in_string());
+        stream.fill_price = double(o["L"].get_double_in_string());
+        stream.fill_qty = double(o["l"].get_double_in_string());
+        stream.fees_paid = double(o["n"].get_double_in_string());
+        stream.exchange_ts = int64_t(o["T"]);
+        stream.local_ts = clock.now_ms();
+        stream.is_maker = o["m"].get<bool>();
+
+        ExecutionEvent ev;
+        ev.type = ExecutionEventType::STREAM_UPDATE;
+        ev.stream = stream;
+        execution_event.push(ev);
+    }
+};
+
+class BinanceFuturesUserStream : public BinanceUserStream {
+public:
+    MarketConfig& config;
+    BinanceBroker& broker;
+    ExecutionEventQueue& execution_event;
+    BinanceClock& clock;
+    
+    atomic<bool> running{false};
+    atomic<bool> connected{false};
+    
+    thread stream_thread;
+    simdjson::ondemand::parser parser;
+
+    unique_ptr<ws_stream> ws;
+
+    mutex connection_mtx;
+    condition_variable connection_cv;
+
+    BinanceFuturesUserStream(MarketConfig& config, BinanceBroker& broker, ExecutionEventQueue& execution_event, BinanceClock& clock)
+        : config(config), broker(broker), execution_event(execution_event), clock(clock) {}
+
+    void start(){
+        running = true;
+        stream_thread = thread([this](){run();});
+        wait_until_connected();
+    }
+
+    void wait_until_connected(){
+        unique_lock<mutex> lock(connection_mtx);
+        connection_cv.wait(lock, [this]{return connected.load();});
+    }
+
+    void run(){
+        std_string listen_key = broker.open_user_stream();
 
         asio::io_context ioc;
         ssl::context ctx(ssl::context::tlsv12_client);
@@ -1275,7 +1684,7 @@ public:
         // STEP 3: WEBSOCKET LAYER
         // -------------------------
         ws = make_unique<ws_stream>(move(ssl_sock));
-        ws->handshake(config.hostname, "/ws/" + broker.listen_key);
+        ws->handshake(config.hostname, "/ws/" + listen_key);
 
         {
             lock_guard<mutex> lock(connection_mtx);
@@ -1314,7 +1723,7 @@ public:
         auto doc = parser.iterate(json);
 
         if(std_string(doc["e"]) != "ORDER_TRADE_UPDATE") return;
-        cout << msg << endl;
+        cout << msg << "\n";
 
         simdjson::ondemand::object o = doc["o"].get_object();
 
@@ -1331,6 +1740,7 @@ public:
         stream.fees_paid = double(o["n"].get_double_in_string());
         stream.exchange_ts = int64_t(o["T"]);
         stream.local_ts = clock.now_ms();
+        stream.is_maker = o["m"].get<bool>();
 
         ExecutionEvent ev;
         ev.type = ExecutionEventType::STREAM_UPDATE;

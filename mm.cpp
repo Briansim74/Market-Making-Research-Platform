@@ -72,6 +72,7 @@
 
 using std::cout;
 using json = nlohmann::json;
+using ordered_json = nlohmann::ordered_json;
 using std_string = std::string;
 
 using namespace std;
@@ -151,10 +152,6 @@ public:
             dashboard_event.signal_pending = true;
         }
         dashboard_event.signal_cv.notify_one();
-
-        // if(!trading_enabled){
-        //     cout << "snapshot built\n";
-        // }
     }
 
     void process_event_latency(const ExecutionEvent& ev){
@@ -423,11 +420,11 @@ public:
         cout << "CANCELLING OPEN ORDERS\n";
         execution.cancel_all_orders();
         waiting_for_cancel = true;
-
-        if(config.mode != "live"){
+        if(config.mode == "stochastic" || config.mode == "replay"){
             wait_for_cancel();
             wait_for_flatten();
         }
+        cout << "CANCELLING OPEN ORDERS1\n";
     }
 
     void on_mark_price_event(const Stream& stream){
@@ -536,17 +533,17 @@ public:
         snap.signals.fair = state.last_signal ? state.last_signal->fair : 0.0;
         snap.signals.skew = state.last_signal ? state.last_signal->skew : 0.0;
         snap.signals.reservation = state.last_signal ? state.last_signal->reservation : 0.0;
-        snap.signals.alpha_order_imb = state.last_signal ? state.last_signal->alpha_order_imb : 0.0;
         snap.signals.alpha_trade_imb = state.last_signal ? state.last_signal->alpha_trade_imb : 0.0;
         snap.signals.alpha_struct = state.last_signal ? state.last_signal->alpha_struct : 0.0;
-        snap.signals.k0 = state.last_signal ? state.last_signal->k0 : 0.0;
+        snap.signals.alpha_residual = state.last_signal ? state.last_signal->alpha_residual : 0.0;
         snap.signals.spread_multiplier = state.last_signal ? state.last_signal->spread_multiplier : 0.0;
         snap.signals.inventory_target = state.last_signal ? state.last_signal->inventory_target : 0.0;
         snap.signals.residual_signal_quality = state.last_signal ? state.last_signal->residual_signal_quality : 0.0;
         snap.signals.tox = state.last_signal ? state.last_signal->toxicity.tox : 0.0;
-        snap.signals.k1 = state.last_signal ? state.last_signal->toxicity.k1 : 0.0;
-        snap.signals.k2 = state.last_signal ? state.last_signal->toxicity.k2 : 0.0;
-
+        snap.signals.k_spread = state.last_signal ? state.last_signal->toxicity.k_spread : 0.0;
+        snap.signals.k_order_size = state.last_signal ? state.last_signal->toxicity.k_order_size : 0.0;
+        
+        snap.quotes.my_spread = state.last_signal ? state.last_signal->my_spread : 0.0;
         snap.quotes.my_bid = execution.get_last_bid();
         snap.quotes.my_ask = execution.get_last_ask();
         snap.quotes.current_bid_size = execution.get_current_bid_size();
@@ -562,7 +559,8 @@ public:
         snap.execution.last_fill_candidate = orderOptionalToString(state.last_fill_candidate);
         snap.execution.last_order_update = orderOptionalToString(state.last_order_update);
         
-        snap.risk.inventory = state.inventory;
+        // snap.risk.inventory = state.inventory;
+        snap.risk.inventory = state.inventory * mid; // USDT normalized
         snap.risk.realized_pnl = state.realized_pnl;
         snap.risk.unrealized_pnl = state.get_unrealized_pnl(mid);
         snap.risk.fees_paid = state.fees_paid;
@@ -602,7 +600,7 @@ public:
 
 class TradingSystem {
 public:
-    const json& params;
+    const ordered_json& params;
     MarketConfig config;
     State state;
     MarketMakingStrategy strategy;
@@ -633,16 +631,22 @@ public:
 
     vector<thread> threads;
 
-    TradingSystem(const json& params) :
+    TradingSystem(const ordered_json& params) :
         params(params), config(params), state(config), strategy(config), recorder(config, state, params),
         clock(config), dashboard_terminal(snapshot_store), dashboard_server(config, snapshot_store),
         signals(ioc, SIGINT, SIGTERM) {initialize();}
 
     void initialize(){
-        if(config.mode == "live"){
-            broker = make_unique<BinanceBroker>(config, clock);
+        if(config.mode == "live" && config.market == "spot" && config.instrument == "pepeusdt"){
+            broker = make_unique<BinanceSpotBroker>(config, clock);
             execution = make_unique<LiveExecution>(config, state, recorder, *broker, clock);
-            user_stream = make_unique<BinanceUserStream>(config, *broker, execution_event, clock);
+            user_stream = make_unique<BinanceSpotUserStream>(config, *broker, execution_event, clock);
+        }
+
+        else if((config.mode == "testnet" || config.mode == "live") && config.market == "futures"){
+            broker = make_unique<BinanceFuturesBroker>(config, clock);
+            execution = make_unique<LiveExecution>(config, state, recorder, *broker, clock);
+            user_stream = make_unique<BinanceFuturesUserStream>(config, *broker, execution_event, clock);
         }
         
         else if(config.mode != "live"){
@@ -700,24 +704,6 @@ public:
         }
     }
 
-    // void start_dashboard_loop(){
-    //     threads.emplace_back([this](){
-    //         while(dashboard_running){
-    //             {
-    //                 unique_lock<mutex> lock(dashboard_event.signal_mtx);
-    //                 dashboard_event.signal_cv.wait(lock, [this]{
-    //                     return dashboard_event.signal_pending || !dashboard_running;});
-
-    //                 if(!dashboard_running) break;
-    //                 dashboard_event.signal_pending = false;
-    //             }
-
-    //             // dashboard_terminal.refresh();
-    //             dashboard_server.publish();
-    //         }
-    //     });
-    // }
-
     void start_dashboard_loop(){
         threads.emplace_back([this](){
             while(true){
@@ -736,18 +722,6 @@ public:
         });
     }
 
-    // void start_execution_loop(){
-    //     threads.emplace_back([this](){
-    //         while(execution_loop_running){
-    //             ExecutionEvent ev;
-
-    //             if(!execution_event.pop(ev, execution_loop_running)) break;
-
-    //             engine->process_event(ev);
-    //         }
-    //     });
-    // }
-
     void start_execution_loop(){
         threads.emplace_back([this](){
             while(true){
@@ -759,35 +733,6 @@ public:
             }
         });
     }
-
-    // void start_execution_latency_loop(){ //polling driven
-    //     threads.emplace_back([this](){
-    //         while(execution_loop_running){
-    //             ExecutionEvent ev;
-    //             bool state_changed = false;
-
-    //             if(execution_event.pop_timeout(ev, execution_loop_running, 1ms)){
-    //                 engine->process_event_latency(ev);
-    //                 state_changed = true;
-    //             }
-
-    //             if(execution->process_latency_queue()){
-    //                 state_changed = true;
-    //             }
-
-    //             if(state_changed){
-    //                 Snapshot snap = engine->build_snapshot();
-    //                 snapshot_store.set(move(snap));
-
-    //                 {
-    //                     lock_guard<mutex> lock(dashboard_event.signal_mtx);
-    //                     dashboard_event.signal_pending = true;
-    //                 }
-    //                 dashboard_event.signal_cv.notify_one();
-    //             }
-    //         }
-    //     });
-    // }
 
     void start_execution_latency_loop(){ //polling driven
         threads.emplace_back([this](){
@@ -879,24 +824,23 @@ public:
 };
 
 int main(){
-    // std_string path;
-    
-    // cout << "Enter manifest path: ";
-    // getline(cin, path);
-    // path = path.substr(1, path.size() - 2);
+    std_string path1 = "D://OneDrive//Trading//Market Making//manifest.json";
+    std_string path2 = "C://Users//brian//OneDrive//Trading//Market Making//manifest.json";
 
-    std_string path = "D://OneDrive//Trading//Market Making//manifest.json";
-    // std_string path = "C://Users//brian//OneDrive//Trading//Market Making//manifest.json";
-    
-    ifstream f(path);
+    ifstream f(path1);
+
+    if(!f.is_open()){
+        f.open(path2);
+        cout << path2 << "\n";
+    }
+    else cout << path1 << "\n";
 
     if(!f.is_open()){
         cerr << "Cannot open manifest\n";
         return 1;
     }
 
-    cout << path << "\n";
-    json params;
+    ordered_json params;
     f >> params;
 
     TradingSystem system(params);

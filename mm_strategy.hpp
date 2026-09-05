@@ -66,6 +66,7 @@
 
 using std::cout;
 using json = nlohmann::json;
+using ordered_json = nlohmann::ordered_json;
 using std_string = std::string;
 
 using namespace std;
@@ -117,21 +118,21 @@ public:
     static constexpr double LOG_2PI = 1.8378770664093453;
 
     RegimeModel(const json& artifact){
-        model_name = artifact["model_name"].get<std_string>();
-        target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<int64_t>();
+        model_name    = artifact["model_name"].get<std_string>();
+        target        = artifact["target"].get<std_string>();
+        horizon_ms    = artifact["horizon_ms"].get<int64_t>();
 
-        means = artifact["means"].get<Mat>();
-        cov_inv = artifact["cov_inv"].get<vector<Mat>>();
+        means         = artifact["means"].get<Mat>();
+        cov_inv       = artifact["cov_inv"].get<vector<Mat>>();
 
-        log_det_cov = artifact["log_det_cov"].get<Vec>();
-        log_weights = artifact["log_weights"].get<Vec>();
+        log_det_cov   = artifact["log_det_cov"].get<Vec>();
+        log_weights   = artifact["log_weights"].get<Vec>();
    
-        scaler_mean = artifact["scaler_mean"].get<Vec>();
-        scaler_scale = artifact["scaler_scale"].get<Vec>();
+        scaler_mean   = artifact["scaler_mean"].get<Vec>();
+        scaler_scale  = artifact["scaler_scale"].get<Vec>();
 
-        n_regimes = artifact["n_regimes"].get<int>();
-        feature_cols = artifact["feature_cols"].get<vector<std_string>>();
+        n_regimes     = artifact["n_regimes"].get<int>();
+        feature_cols  = artifact["feature_cols"].get<vector<std_string>>();
         regime_labels = artifact["regime_labels"].get<vector<std_string>>();
 
         K = means.size();
@@ -231,12 +232,12 @@ public:
 
     MicroSignalModel(const json& artifact){
         model_name = artifact["model_name"].get<std_string>();
-        target = artifact["target"].get<std_string>();
+        target     = artifact["target"].get<std_string>();
         horizon_ms = artifact["horizon_ms"].get<int64_t>();
-        intercept = artifact["intercept"].get<double>();
-        beta = artifact["beta"].get<double>();
-        ic = artifact["ic"].get<double>();
-        rank_ic = artifact["rank_ic"].get<double>();
+        intercept  = artifact["intercept"].get<double>();
+        beta       = artifact["beta"].get<double>();
+        ic         = artifact["ic"].get<double>();
+        rank_ic    = artifact["rank_ic"].get<double>();
 
         cout << "INITIALIZED: " << model_name << " target: " << target << "\n";
     }
@@ -267,11 +268,11 @@ public:
 
     ResidualModel(const json& artifact){
 
-        model_name = artifact["model_name"].get<std_string>();
-        target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<int64_t>();
+        model_name   = artifact["model_name"].get<std_string>();
+        target       = artifact["target"].get<std_string>();
+        horizon_ms   = artifact["horizon_ms"].get<int64_t>();
         feature_cols = artifact["feature_cols"].get<vector<std_string>>();
-        D = artifact["feature_dim"].get<int>();
+        D            = artifact["feature_dim"].get<int>();
 
         if(D < 7) throw runtime_error("feature_dim too small");
         x_input.resize(D);
@@ -334,11 +335,11 @@ public:
 
     ToxicityModel(const json& artifact){
 
-        model_name = artifact["model_name"].get<std_string>();
-        target = artifact["target"].get<std_string>();
-        horizon_ms = artifact["horizon_ms"].get<int64_t>();
+        model_name   = artifact["model_name"].get<std_string>();
+        target       = artifact["target"].get<std_string>();
+        horizon_ms   = artifact["horizon_ms"].get<int64_t>();
         feature_cols = artifact["feature_cols"].get<vector<std_string>>();
-        D = artifact["feature_dim"].get<int>();
+        D            = artifact["feature_dim"].get<int>();
         
         if(D < 7) throw runtime_error("feature_dim too small");
         x_input.resize(D);
@@ -426,28 +427,25 @@ public:
         policy.regime_id = regime_id;
         policy.regime_prob = prob;
 
-        if(pred_regime == "trending"){
-            policy.alpha_order_imb = 0.6;
+        if(pred_regime == "directional"){
             policy.alpha_trade_imb = 0.2;
             policy.alpha_struct = 0.8;
-            policy.spread_multiplier = 2.0;
-            policy.k0 = 1.2;
-            policy.inventory_target = (regime.trade_imbalance > 0) ? 1.0 : -1.0;
+            policy.alpha_residual = 1.2;
+            policy.spread_multiplier = 1.5;
+            policy.inventory_target = 0.3; // in percentage terms (% of max_inv), not absolute USDT
         }
-        else if(pred_regime == "toxic"){
-            policy.alpha_order_imb = 0.05;
+        else if(pred_regime == "high_vol"){
             policy.alpha_trade_imb = 0.01;
             policy.alpha_struct = 0.4;
-            policy.spread_multiplier = 1.5;
-            policy.k0 = 0.5;
+            policy.alpha_residual = 0.5;
+            policy.spread_multiplier = 3;
             policy.inventory_target = 0.0;
         }
         else{ // low_vol / normal / competitive
-            policy.alpha_order_imb = 0.15;
             policy.alpha_trade_imb = 0.05;
             policy.alpha_struct = 0.2;
-            policy.spread_multiplier = 0.7;
-            policy.k0 = 1.0;
+            policy.alpha_residual = 1.0;
+            policy.spread_multiplier = 1.0;
             policy.inventory_target = 0.0;
         }
 
@@ -467,45 +465,65 @@ public:
         double best_bid = config.from_tick(bid_tick);
         double best_ask = config.from_tick(ask_tick);
 
+        double mid = (best_bid + best_ask) / 2.0;
         double microprice = (best_ask * bid_size + best_bid * ask_size) / (bid_size + ask_size + 1e-9);
 
-        double fair = microprice
-            + policy.alpha_order_imb * state.order_imbalance // order imbalance, resting flow
-            + policy.alpha_trade_imb * state.trade_imbalance; // trade imbalance, aggressive trade flow
+        double fair = mid + policy.alpha_trade_imb * state.trade_imbalance * mid; // trade imbalance, aggressive trade flow (order_imb and microprice are now incorporated in microsignal_delta)
 
         return {fair, microprice};
     }
 
-    double compute_spread(const Features& features, const Policy& policy, const Toxicity& toxicity){
-    
-        double sigma = features.volatility;
-
-        // double base = 0.03; // keep base spread 0.03, since testnet futures have unusually wide spread
-        double base = features.spread;
-        double vol_component = 3.0 * sigma * features.mid; // added dimension change to mid price
-
-        double raw_spread = max(base, vol_component);
-        double spread = raw_spread * policy.spread_multiplier * (1.0 + toxicity.k1 * toxicity.tox);
-
-        return spread;
-    }
-
-    double compute_skew(State& state, const Policy& policy){
+    // pair<double, double> compute_fair_and_micro(State& state, const Policy& policy){
         
+    //     auto& book = state.market_book;
+
+    //     auto [bid_tick, bid_size] = book.best_bid();
+    //     auto [ask_tick, ask_size] = book.best_ask();
+
+    //     double best_bid = config.from_tick(bid_tick);
+    //     double best_ask = config.from_tick(ask_tick);
+
+    //     double microprice = (best_ask * bid_size + best_bid * ask_size) / (bid_size + ask_size + 1e-9);
+
+    //     double fair = microprice
+    //         + policy.alpha_order_imb * state.order_imbalance // order imbalance, resting flow
+    //         + policy.alpha_trade_imb * state.trade_imbalance; // trade imbalance, aggressive trade flow
+
+    //     return {fair, microprice};
+    // }
+
+    // double compute_skew(State& state, const Policy& policy){ // old currency specific inv target skew
+        
+    //     double sigma = state.get_vol();
+    //     double mid = state.market_book.mid();
+
+    //     double effective_inventory = state.inventory - policy.inventory_target;
+        
+    //     return -effective_inventory * config.gamma * sigma * mid;
+    // }
+
+    double compute_skew(State& state, const Policy& policy){ // new USDT inv target based skew
+
         double sigma = state.get_vol();
         double mid = state.market_book.mid();
 
-        double effective_inventory = state.inventory - policy.inventory_target;
-        
-        return -effective_inventory * config.gamma * sigma * mid;
+        // Actual inventory expressed in USDT
+        double inventory_usdt = state.inventory * mid;
+
+        double target_inventory_usdt = policy.inventory_target * config.max_inv; // target inventory, as percentage of max_inv USDT
+
+        double effective_inventory_usdt = inventory_usdt - target_inventory_usdt; // how far am i from target in USDT
+        double effective_inventory_ratio = effective_inventory_usdt / config.max_inv; // dimensionless percentage of max_inv
+
+        return -effective_inventory_ratio * config.gamma * sigma * mid; // in btcusdt/pepeusdt
     }
 
     double compute_signal_quality(const auto& log){
 
         const size_t n = log.size();
 
-        if(n < 20) return 1.0;
-        // if(n < 10) return 0.0; trust or no trust?
+        // if(n < 20) return 1.0;
+        if(n < 10) return 0.0; // trust or no trust?
 
         vector<double> pred_arr, realized_arr;
         pred_arr.reserve(n);
@@ -634,9 +652,7 @@ public:
 
     double compute_struct_delta(const Features& features, const Policy& policy){
         
-        if(struct_model != "blended_AS"){
-            return 0.0;
-        }
+        if(struct_model != "blended_AS") return 0.0;
 
         // Move my current mid price toward the structural fair so value by some fraction.
         double reservation = features.fair + features.skew;
@@ -668,7 +684,7 @@ public:
         state.mfs.residual_predictions.push_back(residual_pred);
 
         double residual_signal_quality = compute_signal_quality(state.mfs.residual_signal_log);
-        double effective_k = policy.k0 * residual_signal_quality;
+        double effective_k = policy.alpha_residual * residual_signal_quality;
 
         double residual_center = reservation * exp(expected_log_return * effective_k); //scale log return by effective_k
         return {residual_center - reservation, residual_signal_quality};
@@ -684,11 +700,25 @@ public:
         // double toxicity_signal_quality = compute_toxicity_signal_quality(state.mfs.toxicity_signal_log);
 
         toxicity.tox = -prediction; //trained on future markout, negative markout = toxic
-        // toxicity.k1 *= toxicity_signal_quality;
-        // toxicity.k2 *= toxicity_signal_quality;
+        // toxicity.k_spread *= toxicity_signal_quality;
+        // toxicity.k_order_size *= toxicity_signal_quality;
         // toxicity.pred = prediction;
 
         return toxicity;
+    }
+
+    double compute_spread(const Features& features, const Policy& policy, const Toxicity& toxicity){
+    
+        double sigma = features.volatility;
+
+        double base = features.spread;
+        double vol_component = 3.0 * sigma * features.mid; // added dimension change to mid price
+
+        double raw_spread = max(base, vol_component);
+        // double spread = raw_spread * policy.spread_multiplier * (1.0 + toxicity.k_spread * toxicity.tox);
+        double spread = base * policy.spread_multiplier * (1.0 + toxicity.k_spread * toxicity.tox); // temp adjustment
+
+        return spread;
     }
 
     // -------------------------
@@ -738,8 +768,7 @@ public:
         double center = mid + struct_delta + micro_signal_delta + residual_delta;
         Toxicity toxicity = compute_toxicity(features);
 
-        // double spread = compute_spread(features, policy, toxicity);
-        double spread = features.spread; // using base spread for now
+        double spread = compute_spread(features, policy, toxicity);
         double half = spread / 2.0;
         
         double bid = center - half;
@@ -796,10 +825,9 @@ public:
         signal.regime = policy.regime;
         signal.regime_id = policy.regime_id;
         signal.regime_prob = policy.regime_prob;
-        signal.alpha_order_imb = policy.alpha_order_imb;
         signal.alpha_trade_imb = policy.alpha_trade_imb;
         signal.alpha_struct = policy.alpha_struct;
-        signal.k0 = policy.k0;
+        signal.alpha_residual = policy.alpha_residual;
         signal.spread_multiplier = policy.spread_multiplier;
         signal.inventory_target = policy.inventory_target;
         signal.residual_signal_quality = residual_signal_quality;
@@ -809,6 +837,7 @@ public:
         signal.ask_delta = ask_delta;
         signal.quote_churn = bid_delta + ask_delta;
 
+        signal.my_spread = spread;
         signal.my_bid = bid;
         signal.my_ask = ask;
 

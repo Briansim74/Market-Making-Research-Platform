@@ -66,6 +66,7 @@
 
 using std::cout;
 using json = nlohmann::json;
+using ordered_json = nlohmann::ordered_json;
 using std_string = std::string;
 
 using namespace std;
@@ -87,7 +88,7 @@ class DatasetRecorder {
 public:
     MarketConfig& config;
     State& state;
-    const json& params;
+    const ordered_json& params;
 
     vector<EventRow> events;
     vector<SnapshotRow> snapshots;
@@ -104,19 +105,13 @@ public:
     std_string quotes_path;
     std_string fills_path;
 
-    static constexpr size_t EVENTS_CHUNK = 1000;
-    static constexpr size_t SNAPSHOT_CHUNK = 1000;
-    static constexpr size_t TRADE_CHUNK = 300;
-    static constexpr size_t QUOTE_CHUNK = 200;
-    static constexpr size_t FILL_CHUNK  = 20; // usually smaller
-
     int events_id = 0;
     int snapshots_id = 0;
     int trades_id = 0;
     int quotes_id = 0;
     int fills_id = 0;
 
-    DatasetRecorder(MarketConfig& config, State& state, const json& params)
+    DatasetRecorder(MarketConfig& config, State& state, const ordered_json& params)
         : config(config), state(state), params(params) {initialize();}
 
     std_string build_file_path(const std_string& file, const int& file_id){
@@ -164,7 +159,7 @@ public:
 
         events.push_back(move(row));
 
-        if(events.size() >= EVENTS_CHUNK){
+        if(events.size() >= config.EVENTS_CHUNK){
             events_path = build_file_path("events", events_id++);
             export_event_parquet(events);
             events.clear();
@@ -263,25 +258,22 @@ public:
         }
 
         // manifest
-        json manifest = params;
+        ordered_json manifest = params;
         std_string manifest_path = folder_path + "/manifest.json";
         PerformanceMetrics performance = state.compute_performance();
 
         manifest["run_id"] = run_id;
+        manifest["fees"] = {
+            {"maker_fee_rate", config.maker_fee_rate},
+            {"taker_fee_rate", config.taker_fee_rate}
+        };
         manifest["folder_path"] = folder_path;
         manifest["performance"] = {
-            // {"pnl", round(state.get_pnl(state.market_book.mid()) * 10000.0) / 10000.0},
-            // {"sharpe", round(performance.sharpe * 10000.0) / 10000.0},
-            // {"annualized_sharpe", round(performance.annualized_sharpe * 10000.0) / 10000.0},
-            // {"sortino", round(performance.sortino * 10000.0) / 10000.0},
-            // {"sortino", round(performance.annualized_sortino * 10000.0) / 10000.0},
-            // {"fees_paid", round(state.fees_paid * 10000.0) / 10000.0},
-            // {"notional_traded", round(state.notional_traded) / 10000.0},
             {"pnl", state.get_pnl(state.market_book.mid())},
             {"sharpe", performance.sharpe},
             {"annualized_sharpe", performance.annualized_sharpe},
             {"sortino", performance.sortino},
-            {"sortino", performance.annualized_sortino},
+            {"annualized_sortino", performance.annualized_sortino},
             {"fees_paid", state.fees_paid},
             {"notional_traded", state.notional_traded},
             {"fees_per_fill", state.fees_paid / (fills.size() + 1e-9)},
@@ -337,16 +329,15 @@ public:
         row.regime = signal.regime;
         row.regime_id = signal.regime_id;
         row.regime_prob = signal.regime_prob;
-        row.alpha_order_imb = signal.alpha_order_imb;
         row.alpha_trade_imb = signal.alpha_trade_imb;
         row.alpha_struct = signal.alpha_struct;
-        row.k0 = signal.k0;
+        row.alpha_residual = signal.alpha_residual;
         row.spread_multiplier = signal.spread_multiplier;
         row.inventory_target = signal.inventory_target;
         row.residual_signal_quality = signal.residual_signal_quality;
         row.tox = signal.toxicity.tox;
-        row.k1 = signal.toxicity.k1;
-        row.k2 = signal.toxicity.k2;
+        row.k_spread = signal.toxicity.k_spread;
+        row.k_order_size = signal.toxicity.k_order_size;
 
         row.my_bid = signal.my_bid;
         row.my_ask = signal.my_ask;
@@ -364,7 +355,7 @@ public:
     
         snapshots.push_back(move(row));
 
-        if(snapshots.size() >= SNAPSHOT_CHUNK){
+        if(snapshots.size() >= config.SNAPSHOTS_CHUNK){
             snapshots_path = build_file_path("snapshots", snapshots_id++);
             export_snapshot_parquet(snapshots);
             snapshots.clear();
@@ -418,16 +409,15 @@ public:
         StringBuilder regime_b(pool);
         Int32Builder regime_id_b(pool);
         DoubleBuilder regime_prob_b(pool);
-        DoubleBuilder alpha_order_imb_b(pool);
         DoubleBuilder alpha_trade_imb_b(pool);
         DoubleBuilder alpha_struct_b(pool);
-        DoubleBuilder k0_b(pool);
+        DoubleBuilder alpha_residual_b(pool);
         DoubleBuilder spread_multiplier_b(pool);
         DoubleBuilder inventory_target_b(pool);
         DoubleBuilder residual_signal_quality_b(pool);
         DoubleBuilder tox_b(pool);
-        DoubleBuilder k1_b(pool);
-        DoubleBuilder k2_b(pool);
+        DoubleBuilder k_spread_b(pool);
+        DoubleBuilder k_order_size_b(pool);
 
         DoubleBuilder my_bid_b(pool);
         DoubleBuilder my_ask_b(pool);
@@ -488,16 +478,15 @@ public:
             regime_b.Append(r.regime);
             regime_id_b.Append(r.regime_id);
             regime_prob_b.Append(r.regime_prob);
-            alpha_order_imb_b.Append(r.alpha_order_imb);
             alpha_trade_imb_b.Append(r.alpha_trade_imb);
             alpha_struct_b.Append(r.alpha_struct);
-            k0_b.Append(r.k0);
+            alpha_residual_b.Append(r.alpha_residual);
             spread_multiplier_b.Append(r.spread_multiplier);
             inventory_target_b.Append(r.inventory_target);
             residual_signal_quality_b.Append(r.residual_signal_quality);
             tox_b.Append(r.tox);
-            k1_b.Append(r.k1);
-            k2_b.Append(r.k2);
+            k_spread_b.Append(r.k_spread);
+            k_order_size_b.Append(r.k_order_size);
 
             my_bid_b.Append(r.my_bid);
             my_ask_b.Append(r.my_ask);
@@ -525,9 +514,9 @@ public:
         shared_ptr<Array> inventory_arr, realized_pnl_arr, unrealized_pnl_arr, total_pnl_arr, fees_paid_arr, equity_arr;
         shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr;
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
-        shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
-        shared_ptr<Array> k0_arr, spread_multiplier_arr, inventory_target_arr;
-        shared_ptr<Array> residual_signal_quality_arr, tox_arr, k1_arr, k2_arr;
+        shared_ptr<Array> alpha_trade_imb_arr, alpha_struct_arr, alpha_residual_arr;
+        shared_ptr<Array> spread_multiplier_arr, inventory_target_arr;
+        shared_ptr<Array> residual_signal_quality_arr, tox_arr, k_spread_arr, k_order_size_arr;
         shared_ptr<Array> my_bid_arr, my_ask_arr, my_bid_tick_arr, my_ask_tick_arr;
         shared_ptr<Array> bid_distance_touch_arr, ask_distance_touch_arr;
         shared_ptr<Array> bid_distance_spread_arr, ask_distance_spread_arr;
@@ -574,16 +563,15 @@ public:
         regime_b.Finish(&regime_arr);
         regime_id_b.Finish(&regime_id_arr);
         regime_prob_b.Finish(&regime_prob_arr);
-        alpha_order_imb_b.Finish(&alpha_order_imb_arr);
         alpha_trade_imb_b.Finish(&alpha_trade_imb_arr);
         alpha_struct_b.Finish(&alpha_struct_arr);
-        k0_b.Finish(&k0_arr);
+        alpha_residual_b.Finish(&alpha_residual_arr);
         spread_multiplier_b.Finish(&spread_multiplier_arr);
         inventory_target_b.Finish(&inventory_target_arr);
         residual_signal_quality_b.Finish(&residual_signal_quality_arr);
         tox_b.Finish(&tox_arr);
-        k1_b.Finish(&k1_arr);
-        k2_b.Finish(&k2_arr);
+        k_spread_b.Finish(&k_spread_arr);
+        k_order_size_b.Finish(&k_order_size_arr);
 
         my_bid_b.Finish(&my_bid_arr);
         my_ask_b.Finish(&my_ask_arr);
@@ -644,16 +632,15 @@ public:
             field("regime", utf8()),
             field("regime_id", int32()),
             field("regime_prob", float64()),
-            field("alpha_order_imb", float64()),
             field("alpha_trade_imb", float64()),
             field("alpha_struct", float64()),
-            field("k0", float64()),
+            field("alpha_residual", float64()),
             field("spread_multiplier", float64()),
             field("inventory_target", float64()),
             field("residual_signal_quality", float64()),
             field("tox", float64()),
-            field("k1", float64()),
-            field("k2", float64()),
+            field("k_spread", float64()),
+            field("k_order_size", float64()),
 
             field("my_bid", float64()),
             field("my_ask", float64()),
@@ -682,9 +669,9 @@ public:
             inventory_arr, realized_pnl_arr, unrealized_pnl_arr, total_pnl_arr, fees_paid_arr, equity_arr,
             fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr,
             regime_arr, regime_id_arr, regime_prob_arr,
-            alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,
-            k0_arr, spread_multiplier_arr, inventory_target_arr,
-            residual_signal_quality_arr, tox_arr, k1_arr, k2_arr,
+            alpha_trade_imb_arr, alpha_struct_arr, alpha_residual_arr,
+            spread_multiplier_arr, inventory_target_arr,
+            residual_signal_quality_arr, tox_arr, k_spread_arr, k_order_size_arr,
             my_bid_arr, my_ask_arr, my_bid_tick_arr, my_ask_tick_arr,
             bid_distance_touch_arr, ask_distance_touch_arr,
             bid_distance_spread_arr, ask_distance_spread_arr,
@@ -751,7 +738,7 @@ public:
 
         trades.push_back(move(row));
 
-        if(trades.size() >= TRADE_CHUNK){
+        if(trades.size() >= config.TRADES_CHUNK){
             trades_path = build_file_path("trades", trades_id++);
             export_trade_parquet(trades);
             trades.clear();
@@ -997,20 +984,19 @@ public:
         row.regime = order.signal.regime;
         row.regime_id = order.signal.regime_id;
         row.regime_prob = order.signal.regime_prob;
-        row.alpha_order_imb = order.signal.alpha_order_imb;
         row.alpha_trade_imb = order.signal.alpha_trade_imb;
         row.alpha_struct = order.signal.alpha_struct;
-        row.k0 = order.signal.k0;
+        row.alpha_residual = order.signal.alpha_residual;
         row.spread_multiplier = order.signal.spread_multiplier;
         row.inventory_target = order.signal.inventory_target;
         row.residual_signal_quality = order.signal.residual_signal_quality;
         row.tox = order.signal.toxicity.tox;
-        row.k1 = order.signal.toxicity.k1;
-        row.k2 = order.signal.toxicity.k2;
+        row.k_spread = order.signal.toxicity.k_spread;
+        row.k_order_size = order.signal.toxicity.k_order_size;
         
         quotes.push_back(move(row));
 
-        if(quotes.size() >= QUOTE_CHUNK){
+        if(quotes.size() >= config.QUOTES_CHUNK){
             quotes_path = build_file_path("quotes", quotes_id++);
             export_quote_parquet(quotes);
             quotes.clear();
@@ -1065,16 +1051,15 @@ public:
         StringBuilder regime_b(pool);
         Int32Builder regime_id_b(pool);
         DoubleBuilder regime_prob_b(pool);
-        DoubleBuilder alpha_order_imb_b(pool);
         DoubleBuilder alpha_trade_imb_b(pool);
         DoubleBuilder alpha_struct_b(pool);
-        DoubleBuilder k0_b(pool);
+        DoubleBuilder alpha_residual_b(pool);
         DoubleBuilder spread_multiplier_b(pool);
         DoubleBuilder inventory_target_b(pool);
         DoubleBuilder residual_signal_quality_b(pool);
         DoubleBuilder tox_b(pool);
-        DoubleBuilder k1_b(pool);
-        DoubleBuilder k2_b(pool);
+        DoubleBuilder k_spread_b(pool);
+        DoubleBuilder k_order_size_b(pool);
 
         // -------------------------
         // FILL
@@ -1121,16 +1106,15 @@ public:
             regime_b.Append(r.regime);
             regime_id_b.Append(r.regime_id);
             regime_prob_b.Append(r.regime_prob);
-            alpha_order_imb_b.Append(r.alpha_order_imb);
             alpha_trade_imb_b.Append(r.alpha_trade_imb);
             alpha_struct_b.Append(r.alpha_struct);
-            k0_b.Append(r.k0);
+            alpha_residual_b.Append(r.alpha_residual);
             spread_multiplier_b.Append(r.spread_multiplier);
             inventory_target_b.Append(r.inventory_target);
             residual_signal_quality_b.Append(r.residual_signal_quality);
             tox_b.Append(r.tox);
-            k1_b.Append(r.k1);
-            k2_b.Append(r.k2);
+            k_spread_b.Append(r.k_spread);
+            k_order_size_b.Append(r.k_order_size);
         }
 
         // -------------------------
@@ -1153,9 +1137,9 @@ public:
         shared_ptr<Array> micro_signal_delta_arr, residual_delta_arr, reservation_arr;
         
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
-        shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
-        shared_ptr<Array> k0_arr, spread_multiplier_arr, inventory_target_arr;
-        shared_ptr<Array> residual_signal_quality_arr, tox_arr, k1_arr, k2_arr;
+        shared_ptr<Array> alpha_trade_imb_arr, alpha_struct_arr, alpha_residual_arr;
+        shared_ptr<Array> spread_multiplier_arr, inventory_target_arr;
+        shared_ptr<Array> residual_signal_quality_arr, tox_arr, k_spread_arr, k_order_size_arr;
 
         ts_b.Finish(&ts_arr);
         exchange_latency_b.Finish(&exchange_latency_arr);
@@ -1198,16 +1182,15 @@ public:
         regime_b.Finish(&regime_arr);
         regime_id_b.Finish(&regime_id_arr);
         regime_prob_b.Finish(&regime_prob_arr);
-        alpha_order_imb_b.Finish(&alpha_order_imb_arr);
         alpha_trade_imb_b.Finish(&alpha_trade_imb_arr);
         alpha_struct_b.Finish(&alpha_struct_arr);
-        k0_b.Finish(&k0_arr);
+        alpha_residual_b.Finish(&alpha_residual_arr);
         spread_multiplier_b.Finish(&spread_multiplier_arr);
         inventory_target_b.Finish(&inventory_target_arr);
         residual_signal_quality_b.Finish(&residual_signal_quality_arr);
         tox_b.Finish(&tox_arr);
-        k1_b.Finish(&k1_arr);
-        k2_b.Finish(&k2_arr);
+        k_spread_b.Finish(&k_spread_arr);
+        k_order_size_b.Finish(&k_order_size_arr);
 
         // -------------------------
         // SCHEMA
@@ -1254,16 +1237,15 @@ public:
             field("regime", utf8()),
             field("regime_id", int32()),
             field("regime_prob", float64()),
-            field("alpha_order_imb", float64()),
             field("alpha_trade_imb", float64()),
             field("alpha_struct", float64()),
-            field("k0", float64()),
+            field("alpha_residual", float64()),
             field("spread_multiplier", float64()),
             field("inventory_target", float64()),
             field("residual_signal_quality", float64()),
             field("tox", float64()),
-            field("k1", float64()),
-            field("k2", float64())
+            field("k_spread", float64()),
+            field("k_order_size", float64())
         });
 
         // -------------------------
@@ -1281,9 +1263,9 @@ public:
             fair_arr, skew_arr, struct_delta_arr,
             micro_signal_delta_arr, residual_delta_arr, reservation_arr,
             regime_arr, regime_id_arr, regime_prob_arr,
-            alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,
-            k0_arr, spread_multiplier_arr, inventory_target_arr,
-            residual_signal_quality_arr, tox_arr, k1_arr, k2_arr
+            alpha_trade_imb_arr, alpha_struct_arr, alpha_residual_arr,
+            spread_multiplier_arr, inventory_target_arr,
+            residual_signal_quality_arr, tox_arr, k_spread_arr, k_order_size_arr
         });
 
         // -------------------------
@@ -1294,7 +1276,7 @@ public:
         parquet::arrow::WriteTable(*table, pool, out, 1024);
     }
 
-    void log_fill(const Order& order, const double& fill_qty, const int64_t& fill_ts, bool is_maker){
+    void log_fill(const Order& order, const double& fill_qty, const int64_t& fill_ts, const bool& is_maker){
         FillRow row;
 
         auto& book = state.market_book;
@@ -1364,16 +1346,15 @@ public:
         row.regime = order.signal.regime;
         row.regime_id = order.signal.regime_id;
         row.regime_prob = order.signal.regime_prob;
-        row.alpha_order_imb = order.signal.alpha_order_imb;
         row.alpha_trade_imb = order.signal.alpha_trade_imb;
         row.alpha_struct = order.signal.alpha_struct;
-        row.k0 = order.signal.k0;
+        row.alpha_residual = order.signal.alpha_residual;
         row.spread_multiplier = order.signal.spread_multiplier;
         row.inventory_target = order.signal.inventory_target;
         row.residual_signal_quality = order.signal.residual_signal_quality;
         row.tox = order.signal.toxicity.tox;
-        row.k1 = order.signal.toxicity.k1;
-        row.k2 = order.signal.toxicity.k2;
+        row.k_spread = order.signal.toxicity.k_spread;
+        row.k_order_size = order.signal.toxicity.k_order_size;
 
         row.my_bid = order.signal.my_bid;
         row.my_ask = order.signal.my_ask;
@@ -1387,7 +1368,7 @@ public:
 
         fills.push_back(move(row));
 
-        if(fills.size() >= FILL_CHUNK){
+        if(fills.size() >= config.FILLS_CHUNK){
             fills_path = build_file_path("fills", fills_id++);
             export_fill_parquet(fills);
             fills.clear();
@@ -1454,16 +1435,15 @@ public:
         StringBuilder regime_b(pool);
         Int32Builder regime_id_b(pool);
         DoubleBuilder regime_prob_b(pool);
-        DoubleBuilder alpha_order_imb_b(pool);
         DoubleBuilder alpha_trade_imb_b(pool);
         DoubleBuilder alpha_struct_b(pool);
-        DoubleBuilder k0_b(pool);
+        DoubleBuilder alpha_residual_b(pool);
         DoubleBuilder spread_multiplier_b(pool);
         DoubleBuilder inventory_target_b(pool);
         DoubleBuilder residual_signal_quality_b(pool);
         DoubleBuilder tox_b(pool);
-        DoubleBuilder k1_b(pool);
-        DoubleBuilder k2_b(pool);
+        DoubleBuilder k_spread_b(pool);
+        DoubleBuilder k_order_size_b(pool);
 
         DoubleBuilder my_bid_b(pool);
         DoubleBuilder my_ask_b(pool);
@@ -1533,16 +1513,15 @@ public:
             regime_b.Append(r.regime);
             regime_id_b.Append(r.regime_id);
             regime_prob_b.Append(r.regime_prob);
-            alpha_order_imb_b.Append(r.alpha_order_imb);
             alpha_trade_imb_b.Append(r.alpha_trade_imb);
             alpha_struct_b.Append(r.alpha_struct);
-            k0_b.Append(r.k0);
+            alpha_residual_b.Append(r.alpha_residual);
             spread_multiplier_b.Append(r.spread_multiplier);
             inventory_target_b.Append(r.inventory_target);
             residual_signal_quality_b.Append(r.residual_signal_quality);
             tox_b.Append(r.tox);
-            k1_b.Append(r.k1);
-            k2_b.Append(r.k2);
+            k_spread_b.Append(r.k_spread);
+            k_order_size_b.Append(r.k_order_size);
 
             my_bid_b.Append(r.my_bid);
             my_ask_b.Append(r.my_ask);
@@ -1575,9 +1554,9 @@ public:
         
         shared_ptr<Array> fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr;
         shared_ptr<Array> regime_arr, regime_id_arr, regime_prob_arr;
-        shared_ptr<Array> alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr;
-        shared_ptr<Array> k0_arr, spread_multiplier_arr, inventory_target_arr;
-        shared_ptr<Array> residual_signal_quality_arr, tox_arr, k1_arr, k2_arr;
+        shared_ptr<Array> alpha_trade_imb_arr, alpha_struct_arr, alpha_residual_arr;
+        shared_ptr<Array> spread_multiplier_arr, inventory_target_arr;
+        shared_ptr<Array> residual_signal_quality_arr, tox_arr, k_spread_arr, k_order_size_arr;
 
         shared_ptr<Array> my_bid_arr, my_ask_arr, my_bid_tick_arr, my_ask_tick_arr;
         shared_ptr<Array> bid_dist_touch_arr, ask_dist_touch_arr;
@@ -1637,16 +1616,15 @@ public:
         regime_b.Finish(&regime_arr);
         regime_id_b.Finish(&regime_id_arr);
         regime_prob_b.Finish(&regime_prob_arr);
-        alpha_order_imb_b.Finish(&alpha_order_imb_arr);
         alpha_trade_imb_b.Finish(&alpha_trade_imb_arr);
         alpha_struct_b.Finish(&alpha_struct_arr);
-        k0_b.Finish(&k0_arr);
+        alpha_residual_b.Finish(&alpha_residual_arr);
         spread_multiplier_b.Finish(&spread_multiplier_arr);
         inventory_target_b.Finish(&inventory_target_arr);
         residual_signal_quality_b.Finish(&residual_signal_quality_arr);
         tox_b.Finish(&tox_arr);
-        k1_b.Finish(&k1_arr);
-        k2_b.Finish(&k2_arr);
+        k_spread_b.Finish(&k_spread_arr);
+        k_order_size_b.Finish(&k_order_size_arr);
 
         my_bid_b.Finish(&my_bid_arr);
         my_ask_b.Finish(&my_ask_arr);
@@ -1715,16 +1693,15 @@ public:
             field("regime", utf8()),
             field("regime_id", int32()),
             field("regime_prob", float64()),
-            field("alpha_order_imb", float64()),
             field("alpha_trade_imb", float64()),
             field("alpha_struct", float64()),
-            field("k0", float64()),
+            field("alpha_residual", float64()),
             field("spread_multiplier", float64()),
             field("inventory_target", float64()),
             field("residual_signal_quality", float64()),
             field("tox", float64()),
-            field("k1", float64()),
-            field("k2", float64()),
+            field("k_spread", float64()),
+            field("k_order_size", float64()),
             
             field("my_bid", float64()),
             field("my_ask", float64()),
@@ -1753,9 +1730,9 @@ public:
             queue_ahead_bid_arr, queue_ahead_ask_arr, inventory_arr,
             fair_arr, skew_arr, struct_delta_arr, micro_signal_delta_arr, residual_delta_arr, reservation_arr,
             regime_arr, regime_id_arr, regime_prob_arr,
-            alpha_order_imb_arr, alpha_trade_imb_arr, alpha_struct_arr,
-            k0_arr, spread_multiplier_arr, inventory_target_arr,
-            residual_signal_quality_arr, tox_arr, k1_arr, k2_arr,
+            alpha_trade_imb_arr, alpha_struct_arr, alpha_residual_arr,
+            spread_multiplier_arr, inventory_target_arr,
+            residual_signal_quality_arr, tox_arr, k_spread_arr, k_order_size_arr,
             my_bid_arr, my_ask_arr, my_bid_tick_arr, my_ask_tick_arr,
             bid_dist_touch_arr, ask_dist_touch_arr,
             bid_dist_spread_arr, ask_dist_spread_arr

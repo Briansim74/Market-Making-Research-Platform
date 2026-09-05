@@ -1,0 +1,9 @@
+{
+    "model_name": "micro_signal_model_pepe",
+    "target": "(microprice - mid) / mid",
+    "horizon_ms": 5000,
+    "intercept": -9.686619690830691e-05,
+    "beta": 0.5579663725050954,
+    "ic": 0.4155566062397522,
+    "rank_ic": 0.33011631611570064
+}

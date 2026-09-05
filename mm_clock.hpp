@@ -64,6 +64,7 @@
 
 using std::cout;
 using json = nlohmann::json;
+using ordered_json = nlohmann::ordered_json;
 using std_string = std::string;
 
 using namespace std;
@@ -164,11 +165,12 @@ public:
         int64_t best_rtt = INT64_MAX;
 
         for(int i = 0; i < 5; i++){
-            http::request<http::empty_body> req{http::verb::get, config.endpoint + "/time", 11};
+            http::request<http::empty_body> req{http::verb::get, "/" + config.endpoint + "/time", 11};
 
             req.keep_alive(true);
             req.set(http::field::host, config.base_url);
-            req.set(http::field::user_agent, "mm-engine");
+            req.set(http::field::user_agent, config.struct_model);
+            // req.set(http::field::user_agent, "mm-engine");
 
             // Wall clock (for Binance comparison)
             int64_t t0_wall = now_ms();
@@ -205,7 +207,7 @@ public:
         offset_ms.store(best_offset);
         rtt_ms.store(best_rtt);
 
-        cout << "base_url: " << config.base_url << " endpoint: " << config.endpoint  + "/time" << " [CLOCK]"
+         cout << "base_url: " << config.base_url << " endpoint: " << "/" + config.endpoint  + "/time" << " [CLOCK]"
         << " best_offset: " << best_offset << " ms" << " best_rtt: " << best_rtt << " ms\n";
 
         {

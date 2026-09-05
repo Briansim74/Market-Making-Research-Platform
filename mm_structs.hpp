@@ -62,6 +62,7 @@
 
 using std::cout;
 using json = nlohmann::json;
+using ordered_json = nlohmann::ordered_json;
 using std_string = std::string;
 
 using namespace std;
@@ -112,6 +113,7 @@ struct Stream {
     double fees_paid;
     int64_t exchange_ts;
     int64_t local_ts;
+    bool is_maker;
 };
 
 struct Hawkes {
@@ -239,22 +241,18 @@ struct Policy {
     int regime_id = -1;
     double regime_prob = 0.0;
 
-    double alpha_order_imb = 0.2;
     double alpha_trade_imb = 0.05;
     double alpha_struct = 0.3;
+    double alpha_residual = 0.5;
 
     double spread_multiplier = 1.0;
-    double k0 = 0.5;
     double inventory_target = 0.0;
-
-    double residual_mid = 0.0;
-    double micro_residual = 0.0;
 };
 
 struct Toxicity {
     double tox = 0.0;
-    double k1 = 0.2;
-    double k2 = 0.357;
+    double k_spread = 0.2;
+    double k_order_size = 0.357;
     double pred = 0.0;
 };
 
@@ -294,10 +292,9 @@ struct Signal {
     std_string regime;
     int regime_id;
     double regime_prob;
-    double alpha_order_imb;
     double alpha_trade_imb;
     double alpha_struct;
-    double k0;
+    double alpha_residual;
     double spread_multiplier;
     double inventory_target;
     double residual_signal_quality;
@@ -307,6 +304,7 @@ struct Signal {
     double ask_delta;
     double quote_churn;
 
+    double my_spread;
     double my_bid;
     double my_ask;
 };
@@ -414,19 +412,19 @@ struct Snapshot {
         double fair;
         double skew;
         double reservation;
-        double alpha_order_imb;
         double alpha_trade_imb;
         double alpha_struct;
-        double k0;
+        double alpha_residual;
         double spread_multiplier;
         double inventory_target;
         double residual_signal_quality;
         double tox;
-        double k1;
-        double k2;
+        double k_spread;
+        double k_order_size;
     } signals;
 
     struct {
+        double my_spread;
         double my_bid;
         double my_ask;
         double current_bid_size;
@@ -504,16 +502,15 @@ struct SnapshotRow {
     std_string regime;
     int regime_id;
     double regime_prob;
-    double alpha_order_imb;
     double alpha_trade_imb;
     double alpha_struct;
-    double k0;
+    double alpha_residual;
     double spread_multiplier;
     double inventory_target;
     double residual_signal_quality;
     double tox;
-    double k1;
-    double k2;
+    double k_spread;
+    double k_order_size;
 
     double my_bid;
     double my_ask;
@@ -608,16 +605,15 @@ struct QuoteRow {
     std_string regime;
     int regime_id;
     double regime_prob;
-    double alpha_order_imb;
     double alpha_trade_imb;
     double alpha_struct;
-    double k0;
+    double alpha_residual;
     double spread_multiplier;
     double inventory_target;
     double residual_signal_quality;
     double tox;
-    double k1;
-    double k2;
+    double k_spread;
+    double k_order_size;
 };
 
 struct FillRow {
@@ -675,16 +671,15 @@ struct FillRow {
     std_string regime;
     int regime_id;
     double regime_prob;
-    double alpha_order_imb;
     double alpha_trade_imb;
     double alpha_struct;
-    double k0;
+    double alpha_residual;
     double spread_multiplier;
     double inventory_target;
     double residual_signal_quality;
     double tox;
-    double k1;
-    double k2;
+    double k_spread;
+    double k_order_size;
 
     double my_bid;
     double my_ask;
